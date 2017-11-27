@@ -64,5 +64,7 @@ services:
     prom:
         image: prom/prometheus:v1.8.2
         volumes:
-          - $PWD/test/prometheus/:/promconf/
+          - ./test/prometheus/:/promconf/
         command: -config.file /promconf/prometheus.yml
+        depends_on:
+          - boulder
