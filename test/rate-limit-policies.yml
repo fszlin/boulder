@@ -21,12 +21,12 @@ certificatesPerName:
   registrationOverrides:
     101: 1000
 registrationsPerIP:
-  window: 168h # 1 week
+  window: 5m
   threshold: 10000
   overrides:
     127.0.0.1: 1000000
 registrationsPerIPRange:
-  window: 168h # 1 week
+  window: 5m
   threshold: 99999
   overrides:
     127.0.0.1: 1000000
