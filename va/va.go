@@ -47,7 +47,7 @@ const (
 // before timing out. This timeout ignores the base RPC timeout and is strictly
 // used for the Dial operations that take place during an
 // HTTP-01/TLS-SNI-[01|02] challenge validation.
-var singleDialTimeout = time.Second * 5
+var singleDialTimeout = time.Second * 10
 
 // RemoteVA wraps the core.ValidationAuthority interface and adds a field containing the addresses
 // of the remote gRPC server since the interface (and the underlying gRPC client) doesn't
@@ -66,15 +66,17 @@ type vaMetrics struct {
 func initMetrics(stats metrics.Scope) *vaMetrics {
 	validationTime := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "validation_time",
-			Help: "Time taken to validate a challenge",
+			Name:    "validation_time",
+			Help:    "Time taken to validate a challenge",
+			Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 7.5, 10, 15, 30, 45},
 		},
 		[]string{"type", "result"})
 	stats.MustRegister(validationTime)
 	remoteValidationTime := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "remote_validation_time",
-			Help: "Time taken to remotely validate a challenge",
+			Name:    "remote_validation_time",
+			Help:    "Time taken to remotely validate a challenge",
+			Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 7.5, 10, 15, 30, 45},
 		},
 		[]string{"type", "result"})
 	stats.MustRegister(remoteValidationTime)
@@ -766,14 +768,34 @@ func (va *ValidationAuthorityImpl) validateDNS01(ctx context.Context, identifier
 	return nil, probs.Unauthorized("Correct value not found for DNS challenge")
 }
 
-func (va *ValidationAuthorityImpl) validateChallengeAndCAA(ctx context.Context, identifier core.AcmeIdentifier, challenge core.Challenge) ([]core.ValidationRecord, *probs.ProblemDetails) {
+// validateChallengeAndCAA performs a challenge validation and CAA validation
+// for the provided identifier and a corresponding challenge. If the validation
+// or CAA lookup fail a problem is returned along with the validation records
+// created during the validation attempt.
+func (va *ValidationAuthorityImpl) validateChallengeAndCAA(
+	ctx context.Context,
+	identifier core.AcmeIdentifier,
+	challenge core.Challenge) ([]core.ValidationRecord, *probs.ProblemDetails) {
+
+	// If the identifier is a wildcard domain we need to validate the base
+	// domain by removing the "*." wildcard prefix. We create a separate
+	// `baseIdentifier` here before starting the `va.checkCAA` goroutine with the
+	// `identifier` to avoid a data race.
+	baseIdentifier := identifier
+	if strings.HasPrefix(identifier.Value, "*.") {
+		baseIdentifier.Value = strings.TrimPrefix(identifier.Value, "*.")
+	}
+
+	// va.checkCAA accepts wildcard identifiers and handles them appropriately so
+	// we can dispatch `checkCAA` with the provided `identifier` instead of
+	// `baseIdentifier`
 	ch := make(chan *probs.ProblemDetails, 1)
 	go func() {
 		ch <- va.checkCAA(ctx, identifier)
 	}()
 
 	// TODO(#1292): send into another goroutine
-	validationRecords, err := va.validateChallenge(ctx, identifier, challenge)
+	validationRecords, err := va.validateChallenge(ctx, baseIdentifier, challenge)
 	if err != nil {
 		return validationRecords, err
 	}
@@ -879,7 +901,10 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, domain
 		go va.performRemoteValidation(ctx, domain, challenge, authz, remoteError)
 	}
 
-	records, prob := va.validateChallengeAndCAA(ctx, core.AcmeIdentifier{Type: "dns", Value: domain}, challenge)
+	records, prob := va.validateChallengeAndCAA(
+		ctx,
+		core.AcmeIdentifier{Type: "dns", Value: domain},
+		challenge)
 
 	logEvent.ValidationRecords = records
 	challenge.ValidationRecord = records
