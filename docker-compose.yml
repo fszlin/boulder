@@ -39,6 +39,7 @@ services:
         depends_on:
           - bhsm
           - bmysql
+        restart: always
     bhsm:
         # To minimize the fetching of various layers this should match
         # the FROM image and tag in boulder/Dockerfile
@@ -50,6 +51,7 @@ services:
           default:
             aliases:
               - boulder-hsm
+        restart: always
     bmysql:
         image: mariadb:10.1
         environment:
@@ -61,6 +63,7 @@ services:
           default:
             aliases:
               - boulder-mysql
+        restart: always
     prom:
         image: prom/prometheus:v1.8.2
         volumes:
@@ -68,3 +71,4 @@ services:
         command: -config.file /promconf/prometheus.yml
         depends_on:
           - boulder
+        restart: always
