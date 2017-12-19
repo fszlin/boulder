@@ -52,6 +52,7 @@ const (
 	issuerPath        = "/acme/issuer-cert"
 	buildIDPath       = "/build"
 	rolloverPath      = "/acme/key-change"
+	newNoncePath      = "/acme/new-nonce"
 	newOrderPath      = "/acme/new-order"
 	orderPath         = "/acme/order/"
 	finalizeOrderPath = "finalize-order"
@@ -316,6 +317,7 @@ func (wfe *WebFrontEndImpl) Handler() http.Handler {
 	wfe.HandleFunc(m, issuerPath, wfe.Issuer, "GET")
 	wfe.HandleFunc(m, buildIDPath, wfe.BuildID, "GET")
 	wfe.HandleFunc(m, rolloverPath, wfe.KeyRollover, "POST")
+	wfe.HandleFunc(m, newNoncePath, wfe.Nonce, "GET")
 	wfe.HandleFunc(m, newOrderPath, wfe.NewOrder, "POST")
 	wfe.HandleFunc(m, orderPath, wfe.Order, "GET", "POST")
 	// We don't use our special HandleFunc for "/" because it matches everything,
@@ -371,13 +373,18 @@ func addRequesterHeader(w http.ResponseWriter, requester int64) {
 // Directory is an HTTP request handler that provides the directory
 // object stored in the WFE's DirectoryEndpoints member with paths prefixed
 // using the `request.Host` of the HTTP request.
-func (wfe *WebFrontEndImpl) Directory(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
+func (wfe *WebFrontEndImpl) Directory(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request) {
 	directoryEndpoints := map[string]interface{}{
-		"new-account": newAcctPath,
-		"revoke-cert": revokeCertPath,
+		"newAccount": newAcctPath,
+		"newNonce":   newNoncePath,
+		"revokeCert": revokeCertPath,
+		"newOrder":   newOrderPath,
+		"keyChange":  rolloverPath,
 	}
-
-	directoryEndpoints["key-change"] = rolloverPath
 
 	// Add a random key to the directory in order to make sure that clients don't hardcode an
 	// expected set of keys. This ensures that we can properly extend the directory when we
@@ -385,10 +392,10 @@ func (wfe *WebFrontEndImpl) Directory(ctx context.Context, logEvent *web.Request
 	directoryEndpoints[core.RandomString(8)] = randomDirKeyExplanationLink
 
 	// ACME since draft-02 describes an optional "meta" directory entry. The
-	// meta entry may optionally contain a "terms-of-service" URI for the
+	// meta entry may optionally contain a "termsOfService" URI for the
 	// current ToS.
 	directoryEndpoints["meta"] = map[string]string{
-		"terms-of-service": wfe.SubscriberAgreementURL,
+		"termsOfService": wfe.SubscriberAgreementURL,
 	}
 
 	response.Header().Set("Content-Type", "application/json")
@@ -401,6 +408,17 @@ func (wfe *WebFrontEndImpl) Directory(ctx context.Context, logEvent *web.Request
 	}
 
 	response.Write(relDir)
+}
+
+// Nonce is an endpoint for getting a fresh nonce with an HTTP GET or HEAD
+// request. This endpoint only returns a no content header - the `HandleFunc`
+// wrapper ensures that a nonce is written in the correct response header.
+func (wfe *WebFrontEndImpl) Nonce(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request) {
+	response.WriteHeader(http.StatusNoContent)
 }
 
 // sendError sends an error response represented by the given ProblemDetails,
@@ -854,6 +872,22 @@ func (wfe *WebFrontEndImpl) prepAuthorizationForDisplay(request *http.Request, a
 	}
 	authz.ID = ""
 	authz.RegistrationID = 0
+
+	// Combinations are a relic of the V1 API. Since they are tagged omitempty we
+	// can set this field to nil to avoid sending it to users of the V2 API.
+	authz.Combinations = nil
+
+	// The ACME spec forbids allowing "*" in authorization identifiers. Boulder
+	// allows this internally as a means of tracking when an authorization
+	// corresponds to a wildcard request (e.g. to handle CAA properly). We strip
+	// the "*." prefix from the Authz's Identifier's Value here to respect the law
+	// of the protocol.
+	if strings.HasPrefix(authz.Identifier.Value, "*.") {
+		authz.Identifier.Value = strings.TrimPrefix(authz.Identifier.Value, "*.")
+		// Mark that the authorization corresponds to a wildcard request since we've
+		// now removed the wildcard prefix from the identifier.
+		authz.Wildcard = true
+	}
 }
 
 func (wfe *WebFrontEndImpl) getChallenge(
@@ -1379,7 +1413,7 @@ type orderJSON struct {
 	Expires        time.Time
 	Identifiers    []core.AcmeIdentifier
 	Authorizations []string
-	FinalizeURL    string
+	Finalize       string
 	Certificate    string `json:",omitempty"`
 	Error          string `json:",omitempty"`
 }
@@ -1400,7 +1434,7 @@ func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corep
 		Expires:        time.Unix(0, *order.Expires).UTC(),
 		Identifiers:    idents,
 		Authorizations: make([]string, len(order.Authorizations)),
-		FinalizeURL:    finalizeURL,
+		Finalize:       finalizeURL,
 	}
 	for i, authzID := range order.Authorizations {
 		respObj.Authorizations[i] = wfe.relativeEndpoint(request, fmt.Sprintf("%s%s", authzPath, authzID))
@@ -1428,7 +1462,7 @@ func (wfe *WebFrontEndImpl) NewOrder(
 	}
 
 	// We only allow specifying Identifiers in a new order request - we ignore the
-	// `notBefore` and `notAfter` fields described in Section 7.4 of acme-07
+	// `notBefore` and `notAfter` fields described in Section 7.4 of acme-08
 	var newOrderRequest struct {
 		Identifiers []core.AcmeIdentifier `json:"identifiers"`
 	}
@@ -1584,17 +1618,6 @@ func (wfe *WebFrontEndImpl) finalizeOrder(
 	// pretend it doesn't exist and abort.
 	if acct.ID != *order.RegistrationID {
 		wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order found for account ID %d", acct.ID)), nil)
-		return
-	}
-
-	// The account must have agreed to the subscriber agreement to finalize an
-	// order since it will result in the issuance of a certificate.
-	// Any version of the agreement is acceptable here. Version match is enforced in
-	// wfe.Registration when agreeing the first time. Agreement updates happen
-	// by mailing subscribers and don't require a registration update.
-	if acct.Agreement == "" {
-		wfe.sendError(response, logEvent,
-			probs.Unauthorized("Must agree to subscriber agreement before any further actions"), nil)
 		return
 	}
 
