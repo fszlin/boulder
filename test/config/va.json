@@ -38,7 +38,7 @@
 
   "common": {
     "dnsResolver": "127.0.0.11:53",
-    "dnsTimeout": "1s",
+    "dnsTimeout": "30s",
     "dnsAllowLoopbackAddresses": true
   }
 }
