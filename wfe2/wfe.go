@@ -1291,7 +1291,7 @@ func (wfe *WebFrontEndImpl) setCORSHeaders(response http.ResponseWriter, request
 		// For an OPTIONS request: allow all methods handled at this URL.
 		response.Header().Set("Access-Control-Allow-Methods", allowMethods)
 	}
-	response.Header().Set("Access-Control-Expose-Headers", "Link, Replay-Nonce")
+	response.Header().Set("Access-Control-Expose-Headers", "Link, Replay-Nonce, Location")
 	response.Header().Set("Access-Control-Max-Age", "86400")
 }
 
@@ -1663,6 +1663,10 @@ func (wfe *WebFrontEndImpl) finalizeOrder(
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error finalizing order"), err)
 		return
 	}
+
+	orderURL := wfe.relativeEndpoint(request,
+		fmt.Sprintf("%s%d/%d", orderPath, acct.ID, *updatedOrder.Id))
+	response.Header().Set("Location", orderURL)
 
 	respObj := wfe.orderToOrderJSON(request, updatedOrder)
 	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, respObj)
