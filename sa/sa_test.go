@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"math/big"
 	"net"
-	"os"
 	"reflect"
 	"sync"
 	"testing"
@@ -26,7 +25,6 @@ import (
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/revocation"
@@ -530,7 +528,6 @@ func TestAddCertificate(t *testing.T) {
 	test.Assert(t, certificateStatus2.OCSPLastUpdated.IsZero(), "OCSPLastUpdated should be nil")
 
 	// Test adding OCSP response with cert
-	_ = features.Set(map[string]bool{"GenerateOCSPEarly": true})
 	certDER3, err := ioutil.ReadFile("test-cert2.der")
 	test.AssertNotError(t, err, "Couldn't read example cert DER")
 	serial = "ffa0160630d618b2eb5c0510824b14274856"
@@ -1330,12 +1327,6 @@ func TestGetNewIssuancesByFQDNSet(t *testing.T) {
 }
 
 func TestNewOrder(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, _, cleanup := initSA(t)
 	defer cleanup()
 
@@ -1371,12 +1362,6 @@ func TestNewOrder(t *testing.T) {
 }
 
 func TestSetOrderProcessing(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, _, cleanup := initSA(t)
 	defer cleanup()
 
@@ -1415,12 +1400,6 @@ func TestSetOrderProcessing(t *testing.T) {
 }
 
 func TestFinalizeOrder(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, _, cleanup := initSA(t)
 	defer cleanup()
 
@@ -1462,12 +1441,6 @@ func TestFinalizeOrder(t *testing.T) {
 }
 
 func TestOrder(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, _, cleanup := initSA(t)
 	defer cleanup()
 
@@ -1498,12 +1471,6 @@ func TestOrder(t *testing.T) {
 }
 
 func TestGetOrderAuthorizations(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, _, cleanup := initSA(t)
 	defer cleanup()
 
@@ -1657,12 +1624,6 @@ func TestAddPendingAuthorizations(t *testing.T) {
 }
 
 func TestCountPendingOrders(t *testing.T) {
-	// Only run under test/config-next config where 20170731115209_AddOrders.sql
-	// has been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, fc, cleanUp := initSA(t)
 	defer cleanUp()
 
@@ -1735,12 +1696,6 @@ func TestCountPendingOrders(t *testing.T) {
 }
 
 func TestGetOrderForNames(t *testing.T) {
-	// Only run under test/config-next config where required migrations
-	// have been applied
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	sa, fc, cleanUp := initSA(t)
 	defer cleanUp()
 
