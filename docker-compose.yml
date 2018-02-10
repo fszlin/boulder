@@ -39,7 +39,6 @@ services:
         depends_on:
           - bhsm
           - bmysql
-        restart: always
     bhsm:
         # To minimize the fetching of various layers this should match
         # the FROM image and tag in boulder/Dockerfile
@@ -47,11 +46,12 @@ services:
         environment:
             PKCS11_DAEMON_SOCKET: tcp://0.0.0.0:5657
         command: /usr/local/bin/pkcs11-daemon /usr/lib/softhsm/libsofthsm2.so
+        expose:
+          - 5657
         networks:
           default:
             aliases:
               - boulder-hsm
-        restart: always
     bmysql:
         image: mariadb:10.1
         environment:
@@ -63,9 +63,10 @@ services:
           default:
             aliases:
               - boulder-mysql
-        restart: always
     prom:
         image: prom/prometheus:v1.8.2
+        ports:
+          - 9090:9090
         volumes:
           - ./test/prometheus/:/promconf/
         command: -config.file /promconf/prometheus.yml
