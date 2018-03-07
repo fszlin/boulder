@@ -855,6 +855,7 @@ func TestUpdateAuthorization(t *testing.T) {
 	authz, err := ra.NewAuthorization(ctx, AuthzRequest, Registration.ID)
 	test.AssertNotError(t, err, "NewAuthorization failed")
 
+	// Create a challenge response with a key authorization
 	response, err := makeResponse(authz.Challenges[ResponseIndex])
 	test.AssertNotError(t, err, "Unable to construct response to challenge")
 	authz, err = ra.UpdateAuthorization(ctx, authz, ResponseIndex, response)
@@ -869,6 +870,32 @@ func TestUpdateAuthorization(t *testing.T) {
 
 	// Verify that returned authz same as DB
 	dbAuthz, err := sa.GetAuthorization(ctx, authz.ID)
+	test.AssertNotError(t, err, "Could not fetch authorization from database")
+	assertAuthzEqual(t, authz, dbAuthz)
+
+	// Verify that the VA got the authz, and it's the same as the others
+	assertAuthzEqual(t, authz, vaAuthz)
+
+	// Verify that the responses are reflected
+	test.Assert(t, len(vaAuthz.Challenges) > 0, "Authz passed to VA has no challenges")
+
+	// Create another authorization
+	authz, err = ra.NewAuthorization(ctx, AuthzRequest, Registration.ID)
+	test.AssertNotError(t, err, "NewAuthorization failed")
+
+	// Update it with an empty challenge, no key authorization
+	// This should work as well based on modern key authorization semantics
+	authz, err = ra.UpdateAuthorization(ctx, authz, ResponseIndex, core.Challenge{})
+	test.AssertNotError(t, err, "UpdateAuthorization failed")
+	select {
+	case a := <-va.argument:
+		vaAuthz = a
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for DummyValidationAuthority.PerformValidation to complete")
+	}
+
+	// Verify that returned authz same as DB
+	dbAuthz, err = sa.GetAuthorization(ctx, authz.ID)
 	test.AssertNotError(t, err, "Could not fetch authorization from database")
 	assertAuthzEqual(t, authz, dbAuthz)
 
@@ -1311,7 +1338,7 @@ func TestRateLimitLiveReload(t *testing.T) {
 	test.AssertEquals(t, ra.rlPolicies.TotalCertificates().Threshold, 100000)
 	test.AssertEquals(t, ra.rlPolicies.CertificatesPerName().Overrides["le.wtf"], 10000)
 	test.AssertEquals(t, ra.rlPolicies.RegistrationsPerIP().Overrides["127.0.0.1"], 1000000)
-	test.AssertEquals(t, ra.rlPolicies.PendingAuthorizationsPerAccount().Threshold, 3)
+	test.AssertEquals(t, ra.rlPolicies.PendingAuthorizationsPerAccount().Threshold, 20)
 	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSet().Overrides["le.wtf"], 10000)
 	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSet().Threshold, 5)
 
