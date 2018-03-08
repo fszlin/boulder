@@ -43,9 +43,10 @@
     },
     "features": {
       "WildcardDomains": true,
-      "TLSSNIRevalidation": true,
+      "TLSSNIRevalidation": false,
       "ReusePendingAuthz": true,
-      "CancelCTSubmissions": false
+      "CancelCTSubmissions": false,
+      "EnforceV2ContentType": true
     },
     "CTLogGroups2": [
       {
