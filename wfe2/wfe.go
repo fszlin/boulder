@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"path"
 	"regexp"
 	"strconv"
@@ -25,6 +24,7 @@ import (
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
+	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
@@ -70,9 +70,6 @@ type WebFrontEndImpl struct {
 	clk   clock.Clock
 	stats wfe2Stats
 	scope metrics.Scope
-
-	// URL configuration parameters
-	BaseURL string
 
 	// Issuer certificate (DER) for /acme/issuer-cert
 	IssuerCert []byte
@@ -249,27 +246,6 @@ func requestProto(request *http.Request) string {
 	return proto
 }
 
-func (wfe *WebFrontEndImpl) relativeEndpoint(request *http.Request, endpoint string) string {
-	var result string
-	host := request.Host
-	proto := requestProto(request)
-
-	// Default to "localhost" when no request.Host is provided. Otherwise requests
-	// with an empty `Host` produce results like `http:///acme/new-authz`
-	if request.Host == "" {
-		host = "localhost"
-	}
-
-	if wfe.BaseURL != "" {
-		result = fmt.Sprintf("%s%s", wfe.BaseURL, endpoint)
-	} else {
-		resultUrl := url.URL{Scheme: proto, Host: host, Path: endpoint}
-		result = resultUrl.String()
-	}
-
-	return result
-}
-
 const randomDirKeyExplanationLink = "https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417"
 
 func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory map[string]interface{}) ([]byte, error) {
@@ -277,10 +253,8 @@ func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory m
 	// relative-ized result
 	relativeDir := make(map[string]interface{}, len(directory))
 
-	// Copy each entry of the provided directory into the new relative map. If
-	// `wfe.BaseURL` != "", use the old behaviour and prefix each endpoint with
-	// the `BaseURL`. Otherwise, prefix each endpoint using the request protocol
-	// & host.
+	// Copy each entry of the provided directory into the new relative map,
+	// prefixing it with the request protocol and host.
 	for k, v := range directory {
 		if v == randomDirKeyExplanationLink {
 			relativeDir[k] = v
@@ -289,7 +263,7 @@ func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory m
 		switch v := v.(type) {
 		case string:
 			// Only relative-ize top level string values, e.g. not the "meta" element
-			relativeDir[k] = wfe.relativeEndpoint(request, v)
+			relativeDir[k] = web.RelativeEndpoint(request, v)
 		default:
 			// If it isn't a string, put it into the results unmodified
 			relativeDir[k] = v
@@ -466,7 +440,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	existingAcct, err := wfe.SA.GetRegistrationByKey(ctx, key)
 	if err == nil {
 		response.Header().Set("Location",
-			wfe.relativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
+			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
 		response.WriteHeader(http.StatusOK)
 		return
 	} else if !berrors.Is(err, berrors.NotFound) {
@@ -515,7 +489,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	addRequesterHeader(response, acct.ID)
 	logEvent.Contacts = acct.Contact
 
-	acctURL := wfe.relativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, acct.ID))
+	acctURL := web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, acct.ID))
 
 	response.Header().Add("Location", acctURL)
 	if len(wfe.SubscriberAgreementURL) > 0 {
@@ -841,7 +815,7 @@ func (wfe *WebFrontEndImpl) Challenge(
 // the client by filling in its URL field and clearing its ID and URI fields.
 func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz core.Authorization, challenge *core.Challenge) {
 	// Update the challenge URL to be relative to the HTTP request Host
-	challenge.URL = wfe.relativeEndpoint(request, fmt.Sprintf("%s%s/%d", challengePath, authz.ID, challenge.ID))
+	challenge.URL = web.RelativeEndpoint(request, fmt.Sprintf("%s%s/%d", challengePath, authz.ID, challenge.ID))
 	// Ensure the challenge URI and challenge ID aren't written by setting them to
 	// values that the JSON omitempty tag considers empty
 	challenge.URI = ""
@@ -857,6 +831,12 @@ func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz
 	// challenge error type has already been prefixed with the V1ErrorNS.
 	if challenge.Error != nil && !strings.HasPrefix(string(challenge.Error.Type), probs.V1ErrorNS) {
 		challenge.Error.Type = probs.V2ErrorNS + challenge.Error.Type
+	}
+
+	// If the authz has been marked invalid, consider all challenges on that authz
+	// to be invalid as well.
+	if features.Enabled(features.ForceConsistentStatus) && authz.Status == core.StatusInvalid {
+		challenge.Status = authz.Status
 	}
 }
 
@@ -897,7 +877,7 @@ func (wfe *WebFrontEndImpl) getChallenge(
 
 	wfe.prepChallengeForDisplay(request, authz, challenge)
 
-	authzURL := wfe.relativeEndpoint(request, authzPath+string(authz.ID))
+	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
 	response.Header().Add("Location", challenge.URL)
 	response.Header().Add("Link", link(authzURL, "up"))
 
@@ -960,7 +940,7 @@ func (wfe *WebFrontEndImpl) postChallenge(
 	challenge := updatedAuthorization.Challenges[challengeIndex]
 	wfe.prepChallengeForDisplay(request, authz, &challenge)
 
-	authzURL := wfe.relativeEndpoint(request, authzPath+string(authz.ID))
+	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
 	response.Header().Add("Location", challenge.URL)
 	response.Header().Add("Link", link(authzURL, "up"))
 
@@ -1379,7 +1359,7 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 	// Check that the new key isn't already being used for an existing account
 	if existingAcct, err := wfe.SA.GetRegistrationByKey(ctx, &newKey); err == nil {
 		response.Header().Set("Location",
-			wfe.relativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
+			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
 		wfe.sendError(response, logEvent,
 			probs.Conflict("New key is already in use for a different account"), err)
 		return
@@ -1444,7 +1424,7 @@ func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corep
 	for i, name := range order.Names {
 		idents[i] = core.AcmeIdentifier{Type: core.IdentifierDNS, Value: name}
 	}
-	finalizeURL := wfe.relativeEndpoint(request,
+	finalizeURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", finalizeOrderPath, *order.RegistrationID, *order.Id))
 	respObj := orderJSON{
 		Status:         core.AcmeStatus(*order.Status),
@@ -1464,10 +1444,10 @@ func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corep
 		respObj.Error.Type = probs.V2ErrorNS + respObj.Error.Type
 	}
 	for i, authzID := range order.Authorizations {
-		respObj.Authorizations[i] = wfe.relativeEndpoint(request, fmt.Sprintf("%s%s", authzPath, authzID))
+		respObj.Authorizations[i] = web.RelativeEndpoint(request, fmt.Sprintf("%s%s", authzPath, authzID))
 	}
 	if respObj.Status == core.StatusValid {
-		certURL := wfe.relativeEndpoint(request,
+		certURL := web.RelativeEndpoint(request,
 			fmt.Sprintf("%s%s", certPath, *order.CertificateSerial))
 		respObj.Certificate = certURL
 	}
@@ -1535,7 +1515,7 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		return
 	}
 
-	orderURL := wfe.relativeEndpoint(request,
+	orderURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", orderPath, acct.ID, *order.Id))
 	response.Header().Set("Location", orderURL)
 
@@ -1693,7 +1673,7 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 		return
 	}
 
-	orderURL := wfe.relativeEndpoint(request,
+	orderURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", orderPath, acct.ID, *updatedOrder.Id))
 	response.Header().Set("Location", orderURL)
 
