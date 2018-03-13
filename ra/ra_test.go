@@ -275,10 +275,12 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 		Status:    core.StatusValid,
 	})
 
+	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, log)
+
 	ra := NewRegistrationAuthorityImpl(fc,
 		log,
 		stats,
-		1, testKeyPolicy, 0, true, false, 300*24*time.Hour, 7*24*time.Hour, nil, noopCAA{}, 0, nil)
+		1, testKeyPolicy, 0, true, false, 300*24*time.Hour, 7*24*time.Hour, nil, noopCAA{}, 0, ctp)
 	ra.SA = ssa
 	ra.VA = va
 	ra.CA = ca
@@ -3343,6 +3345,32 @@ func TestCTPolicyMeasurements(t *testing.T) {
 	}, accountID(Registration.ID), 0)
 	test.AssertNotError(t, err, "ra.issueCertificate failed when CTPolicy.GetSCTs timed out")
 	test.AssertEquals(t, test.CountHistogramSamples(ra.ctpolicyResults.With(prometheus.Labels{"result": "failure"})), 1)
+}
+
+func TestWildcardOverlap(t *testing.T) {
+	err := wildcardOverlap([]string{
+		"*.example.com",
+		"*.example.net",
+	})
+	if err != nil {
+		t.Errorf("Got error %q, expected none", err)
+	}
+	err = wildcardOverlap([]string{
+		"*.example.com",
+		"*.example.net",
+		"www.example.com",
+	})
+	if err == nil {
+		t.Errorf("Got no error, expected one")
+	}
+	err = wildcardOverlap([]string{
+		"*.foo.example.com",
+		"*.example.net",
+		"www.example.com",
+	})
+	if err != nil {
+		t.Errorf("Got error %q, expected none", err)
+	}
 }
 
 var CAkeyPEM = `

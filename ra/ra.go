@@ -1056,18 +1056,37 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 		RegistrationID: &acctIDInt,
 		OrderID:        &orderIDInt,
 	}
-	cert, err := ra.CA.IssueCertificate(ctx, issueReq)
-	if err != nil {
-		return emptyCert, err
-	}
 
-	if ra.ctpolicy != nil {
-		ra.getSCTs(ctx, cert.DER)
-	} else if ra.publisher != nil {
-		go func() {
-			// This context is limited by the gRPC timeout.
-			_ = ra.publisher.SubmitToCT(context.Background(), cert.DER)
-		}()
+	var cert core.Certificate
+	if features.Enabled(features.EmbedSCTs) {
+		precert, err := ra.CA.IssuePrecertificate(ctx, issueReq)
+		if err != nil {
+			logEvent.Error = err.Error()
+			return emptyCert, err
+		}
+		scts, err := ra.getSCTs(ctx, precert.DER)
+		if err != nil {
+			logEvent.Error = err.Error()
+			return emptyCert, err
+		}
+		cert, err = ra.CA.IssueCertificateForPrecertificate(ctx, &caPB.IssueCertificateForPrecertificateRequest{
+			DER:            precert.DER,
+			SCTs:           scts,
+			RegistrationID: &acctIDInt,
+			OrderID:        &orderIDInt,
+		})
+		if err != nil {
+			logEvent.Error = err.Error()
+			return emptyCert, err
+		}
+	} else {
+		cert, err = ra.CA.IssueCertificate(ctx, issueReq)
+		if err != nil {
+			logEvent.Error = err.Error()
+			return emptyCert, err
+		}
+
+		_, _ = ra.getSCTs(ctx, cert.DER)
 	}
 
 	parsedCertificate, err := x509.ParseCertificate([]byte(cert.DER))
@@ -1094,23 +1113,24 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	return cert, nil
 }
 
-func (ra *RegistrationAuthorityImpl) getSCTs(ctx context.Context, cert []byte) {
+func (ra *RegistrationAuthorityImpl) getSCTs(ctx context.Context, cert []byte) (core.SCTDERs, error) {
 	started := ra.clk.Now()
-	_, err := ra.ctpolicy.GetSCTs(ctx, cert)
+	scts, err := ra.ctpolicy.GetSCTs(ctx, cert)
 	took := ra.clk.Since(started)
 	// The final cert has already been issued so actually return it to the
 	// user even if this fails since we aren't actually doing anything with
 	// the SCTs yet.
-	state := "failure"
 	if err != nil {
+		state := "failure"
 		if err == context.DeadlineExceeded {
 			state = "deadlineExceeded"
 		}
 		ra.log.Warning(fmt.Sprintf("ctpolicy.GetSCTs failed: %s", err))
-	} else if err == nil {
-		state = "success"
+		ra.ctpolicyResults.With(prometheus.Labels{"result": state}).Observe(took.Seconds())
+		return nil, err
 	}
-	ra.ctpolicyResults.With(prometheus.Labels{"result": state}).Observe(took.Seconds())
+	ra.ctpolicyResults.With(prometheus.Labels{"result": "success"}).Observe(took.Seconds())
+	return scts, nil
 }
 
 // domainsForRateLimiting transforms a list of FQDNs into a list of eTLD+1's
@@ -1708,6 +1728,10 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 		}
 	}
 
+	if err := wildcardOverlap(order.Names); err != nil {
+		return nil, err
+	}
+
 	// See if there is an existing, pending, unexpired order that can be reused
 	// for this account
 	existingOrder, err := ra.SA.GetOrderForNames(ctx, &sapb.GetOrderForNamesRequest{
@@ -1840,7 +1864,7 @@ func (ra *RegistrationAuthorityImpl) createPendingAuthz(ctx context.Context, reg
 		Expires:        &expires,
 	}
 
-	if identifier.Type == core.IdentifierDNS {
+	if identifier.Type == core.IdentifierDNS && !features.Enabled(features.VAChecksGSB) {
 		isSafeResp, err := ra.VA.IsSafeDomain(ctx, &vaPB.IsSafeDomainRequest{Domain: &identifier.Value})
 		if err != nil {
 			outErr := berrors.InternalServerError("unable to determine if domain was safe")
@@ -1909,4 +1933,24 @@ func (ra *RegistrationAuthorityImpl) authzValidChallengeEnabled(authz *core.Auth
 		}
 	}
 	return false
+}
+
+// wildcardOverlap takes a slice of domain names and returns an error if any of
+// them is a non-wildcard FQDN that overlaps with a wildcard domain in the map.
+func wildcardOverlap(dnsNames []string) error {
+	nameMap := make(map[string]bool, len(dnsNames))
+	for _, v := range dnsNames {
+		nameMap[v] = true
+	}
+	for name := range nameMap {
+		if name[0] == '*' {
+			continue
+		}
+		labels := strings.Split(name, ".")
+		labels[0] = "*"
+		if nameMap[strings.Join(labels, ".")] {
+			return fmt.Errorf("Domain name %q is redundant with a wildcard domain in the same request. Remove one or the other from the certificate request.", name)
+		}
+	}
+	return nil
 }

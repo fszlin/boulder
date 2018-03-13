@@ -46,6 +46,8 @@
       "TLSSNIRevalidation": false,
       "ReusePendingAuthz": true,
       "CancelCTSubmissions": false,
+      "EmbedSCTs": true,
+      "VAChecksGSB": true,
       "EnforceV2ContentType": true
     },
     "CTLogGroups2": [
