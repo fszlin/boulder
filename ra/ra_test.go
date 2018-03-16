@@ -1184,10 +1184,6 @@ func TestAuthzRateLimiting(t *testing.T) {
 }
 
 func TestNewOrderRateLimiting(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = 5 * 24 * time.Hour
@@ -2067,10 +2063,6 @@ func TestRecheckCAAFail(t *testing.T) {
 }
 
 func TestNewOrder(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = time.Hour
@@ -2139,10 +2131,6 @@ func TestNewOrder(t *testing.T) {
 // the `new-authz` endpoint isn't reused by a V2 order created by the same
 // account.
 func TestNewOrderLegacyAuthzReuse(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = time.Hour
@@ -2205,10 +2193,6 @@ func TestNewOrderLegacyAuthzReuse(t *testing.T) {
 // an identical order results in only one order being created & subsequently
 // reused.
 func TestNewOrderReuse(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
@@ -2308,10 +2292,6 @@ func TestNewOrderReuse(t *testing.T) {
 }
 
 func TestNewOrderReuseInvalidAuthz(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
@@ -2432,10 +2412,6 @@ func (sa *mockSAUnsafeAuthzReuse) AddPendingAuthorizations(
 // for background - this safety check was previously broken!
 // https://github.com/letsencrypt/boulder/issues/3420
 func TestNewOrderAuthzReuseSafety(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	// Enable wildcard domains
 	_ = features.Set(map[string]bool{"WildcardDomains": true})
 	defer features.Reset()
@@ -2468,10 +2444,6 @@ func TestNewOrderAuthzReuseSafety(t *testing.T) {
 }
 
 func TestNewOrderWildcard(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = time.Hour
@@ -2665,10 +2637,6 @@ func TestNewOrderWildcard(t *testing.T) {
 }
 
 func TestFinalizeOrder(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, sa, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = time.Hour
@@ -2924,10 +2892,6 @@ func TestFinalizeOrder(t *testing.T) {
 }
 
 func TestFinalizeOrderWithMixedSANAndCN(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, sa, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.orderLifetime = time.Hour
@@ -3009,10 +2973,6 @@ func TestFinalizeOrderWithMixedSANAndCN(t *testing.T) {
 }
 
 func TestFinalizeOrderWildcard(t *testing.T) {
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		return
-	}
-
 	_, sa, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
@@ -3348,6 +3308,8 @@ func TestCTPolicyMeasurements(t *testing.T) {
 }
 
 func TestWildcardOverlap(t *testing.T) {
+	_ = features.Set(map[string]bool{"EnforceOverlappingWildcards": true})
+	defer features.Reset()
 	err := wildcardOverlap([]string{
 		"*.example.com",
 		"*.example.net",
@@ -3362,6 +3324,13 @@ func TestWildcardOverlap(t *testing.T) {
 	})
 	if err == nil {
 		t.Errorf("Got no error, expected one")
+	}
+	berr, ok := err.(*berrors.BoulderError)
+	if !ok {
+		t.Errorf("Error was wrong type: %T", err)
+	}
+	if berr.Type != berrors.Malformed {
+		t.Errorf("Error was wrong BoulderError type: %d", berr.Type)
 	}
 	err = wildcardOverlap([]string{
 		"*.foo.example.com",
