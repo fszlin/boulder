@@ -264,8 +264,9 @@ func (d *ConfigDuration) UnmarshalYAML(unmarshal func(interface{}) error) error 
 // LogDescription contains the information needed to submit certificates
 // to a CT log and verify returned receipts
 type LogDescription struct {
-	URI string
-	Key string
+	URI             string
+	Key             string
+	SubmitFinalCert bool
 }
 
 // GRPCClientConfig contains the information needed to talk to the gRPC service
@@ -281,6 +282,12 @@ type GRPCServerConfig struct {
 	// (SANs). The server will reject clients that do not present a certificate
 	// with a SAN present on the `ClientNames` list.
 	ClientNames []string `json:"clientNames"`
+	// gRPC multiplexes RPCs across HTTP/2 streams in a single TCP connection.
+	// HTTP/2 servers are allowed to set a limit on the number of streams a client
+	// will create. In Go by default that limit is 250. We can override that for
+	// our servers with this config value. In practice this is a limit on how many
+	// concurrent requests we can handle.
+	MaxConcurrentStreams int
 }
 
 // PortConfig specifies what ports the VA should call to on the remote

@@ -186,7 +186,7 @@ func tlssni02Srv(t *testing.T, chall core.Challenge) *httptest.Server {
 	return tlssniSrvWithNames(t, chall, sanAName, sanBName)
 }
 
-func tlssniSrvWithNames(t *testing.T, chall core.Challenge, names ...string) *httptest.Server {
+func makeACert(names []string) *tls.Certificate {
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1337),
 		Subject: pkix.Name{
@@ -203,19 +203,18 @@ func tlssniSrvWithNames(t *testing.T, chall core.Challenge, names ...string) *ht
 	}
 
 	certBytes, _ := x509.CreateCertificate(rand.Reader, template, template, &TheKey.PublicKey, &TheKey)
-	cert := &tls.Certificate{
+	return &tls.Certificate{
 		Certificate: [][]byte{certBytes},
 		PrivateKey:  &TheKey,
 	}
+}
 
+func tlssniSrvWithNames(t *testing.T, chall core.Challenge, names ...string) *httptest.Server {
+	cert := makeACert(names)
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		ClientAuth:   tls.NoClientCert,
 		GetCertificate: func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			if clientHello.ServerName != names[0] {
-				time.Sleep(time.Second * 10)
-				return nil, nil
-			}
 			return cert, nil
 		},
 		NextProtos: []string{"http/1.1"},
@@ -338,23 +337,84 @@ func TestHTTPTimeout(t *testing.T) {
 
 	setChallengeToken(&chall, pathWaitLong)
 	started := time.Now()
+
+	timeout := 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	_, prob := va.validateHTTP01(ctx, dnsi("localhost"), chall)
-	took := time.Since(started)
-	// Check that the HTTP connection does't return before a timeout, and times
-	// out after the expected time
-	test.Assert(t,
-		(took > (time.Second * singleDialTimeout)),
-		fmt.Sprintf("HTTP timed out before %d seconds", singleDialTimeout))
-	test.Assert(t,
-		(took < (time.Second * (singleDialTimeout * 2))),
-		fmt.Sprintf("HTTP connection didn't timeout after %d seconds",
-			singleDialTimeout))
 	if prob == nil {
 		t.Fatalf("Connection should've timed out")
 	}
+	took := time.Since(started)
+	// Check that the HTTP connection doesn't return before a timeout, and times
+	// out after the expected time
+	if took < timeout {
+		t.Fatalf("HTTP timed out before %s: %s with %s", timeout, took, prob)
+	}
+	if took > 2*timeout {
+		t.Fatalf("HTTP connection didn't timeout after %s", timeout)
+	}
 	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
 	expectMatch := regexp.MustCompile(
-		"Fetching http://localhost:\\d+/.well-known/acme-challenge/wait-long: Timeout")
+		"Fetching http://localhost:\\d+/.well-known/acme-challenge/wait-long: Timeout after connect")
+	if !expectMatch.MatchString(prob.Detail) {
+		t.Errorf("Problem details incorrect. Got %q, expected to match %q",
+			prob.Detail, expectMatch)
+	}
+}
+
+// dnsMockReturnsUnroutable is a DNSClient mock that always returns an
+// unroutable address for LookupHost. This is useful in testing connect
+// timeouts.
+type dnsMockReturnsUnroutable struct {
+	*bdns.MockDNSClient
+}
+
+func (mock dnsMockReturnsUnroutable) LookupHost(_ context.Context, hostname string) ([]net.IP, error) {
+	return []net.IP{net.ParseIP("198.51.100.1")}, nil
+}
+
+// TestHTTPDialTimeout tests that we give the proper "Timeout during connect"
+// error when dial fails. We do this by using a mock DNS client that resolves
+// everything to an unroutable IP address.
+func TestHTTPDialTimeout(t *testing.T) {
+	va, _ := setup(nil, 0)
+
+	started := time.Now()
+	timeout := 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
+	// The only method I've found so far to trigger a connect timeout is to
+	// connect to an unrouteable IP address. This usuall generates a connection
+	// timeout, but will rarely return "Network unreachable" instead. If we get
+	// that, just retry until we get something other than "Network unreachable".
+	var prob *probs.ProblemDetails
+	for i := 0; i < 20; i++ {
+		_, prob = va.validateHTTP01(ctx, dnsi("unroutable.invalid"), core.HTTPChallenge01())
+		if prob != nil && strings.Contains(prob.Detail, "Network unreachable") {
+			continue
+		} else {
+			break
+		}
+	}
+	if prob == nil {
+		t.Fatalf("Connection should've timed out")
+	}
+	took := time.Since(started)
+	// Check that the HTTP connection doesn't return too fast, and times
+	// out after the expected time
+	if took < timeout/2 {
+		t.Fatalf("HTTP returned before %s (%s) with %#v", timeout, took, prob)
+	}
+	if took > 2*timeout {
+		t.Fatalf("HTTP connection didn't timeout after %s seconds", timeout)
+	}
+	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	expectMatch := regexp.MustCompile(
+		"Fetching http://unroutable.invalid/.well-known/acme-challenge/.*: Timeout during connect")
 	if !expectMatch.MatchString(prob.Detail) {
 		t.Errorf("Problem details incorrect. Got %q, expected to match %q",
 			prob.Detail, expectMatch)
@@ -476,11 +536,9 @@ func getPort(hs *httptest.Server) int {
 	return int(port)
 }
 
-func TestTLSSNI01(t *testing.T) {
+func TestTLSSNI01Success(t *testing.T) {
 	chall := createChallenge(core.ChallengeTypeTLSSNI01)
-
 	hs := tlssni01Srv(t, chall)
-
 	va, log := setup(hs, 0)
 
 	_, prob := va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
@@ -492,10 +550,15 @@ func TestTLSSNI01(t *testing.T) {
 		t.Errorf("Didn't get log message with validated certificate. Instead got:\n%s",
 			strings.Join(log.GetAllMatching(".*"), "\n"))
 	}
+}
 
-	log.Clear()
+func TestTLSSNI01FailIP(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssni01Srv(t, chall)
+	va, _ := setup(hs, 0)
+
 	port := getPort(hs)
-	_, prob = va.validateTLSSNI01(ctx, core.AcmeIdentifier{
+	_, prob := va.validateTLSSNI01(ctx, core.AcmeIdentifier{
 		Type:  core.IdentifierType("ip"),
 		Value: net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", port)),
 	}, chall)
@@ -503,55 +566,166 @@ func TestTLSSNI01(t *testing.T) {
 		t.Fatalf("IdentifierType IP shouldn't have worked.")
 	}
 	test.AssertEquals(t, prob.Type, probs.MalformedProblem)
+}
 
-	log.Clear()
-	_, prob = va.validateTLSSNI01(ctx, core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "always.invalid"}, chall)
+func TestTLSSNI01Invalid(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssni01Srv(t, chall)
+	va, _ := setup(hs, 0)
+
+	_, prob := va.validateTLSSNI01(ctx, core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "always.invalid"}, chall)
 	if prob == nil {
 		t.Fatalf("Domain name was supposed to be invalid.")
 	}
 	test.AssertEquals(t, prob.Type, probs.UnknownHostProblem)
+	expected := "No valid IP addresses found for always.invalid"
+	if prob.Detail != expected {
+		t.Errorf("Got wrong error detail. Expected %q, got %q",
+			expected, prob.Detail)
+	}
+}
 
-	// Need to create a new authorized keys object to get an unknown SNI (from the signature value)
-	chall.Token = core.NewToken()
-	chall.ProvidedKeyAuthorization = "invalid"
+func slowTLSSrv() *httptest.Server {
+	server := httptest.NewUnstartedServer(http.DefaultServeMux)
+	server.TLS = &tls.Config{
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			time.Sleep(100 * time.Millisecond)
+			return makeACert([]string{"nomatter"}), nil
+		},
+	}
+	server.StartTLS()
+	return server
+}
 
-	log.Clear()
+func TestTLSSNI01TimeoutAfterConnect(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := slowTLSSrv()
+	va, _ := setup(hs, 0)
+
+	timeout := 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	started := time.Now()
-	_, prob = va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
-	took := time.Since(started)
+	_, prob := va.validateTLSSNI01(ctx, dnsi("slow.server"), chall)
 	if prob == nil {
 		t.Fatalf("Validation should've failed")
 	}
-	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
 	// Check that the TLS connection doesn't return before a timeout, and times
 	// out after the expected time
-	test.Assert(t,
-		(took > (time.Second * singleDialTimeout)),
-		fmt.Sprintf("TLS connection returned before %d seconds", singleDialTimeout))
-	test.Assert(t,
-		(took < (time.Second * (2 * singleDialTimeout))),
-		fmt.Sprintf("TLS connection didn't timeout after %d seconds",
-			singleDialTimeout))
-	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for localhost \[using 127.0.0.1\]: \[127.0.0.1\]`)), 1)
+	took := time.Since(started)
+	// Check that the HTTP connection doesn't return too fast, and times
+	// out after the expected time
+	if took < timeout/2 {
+		t.Fatalf("TLSSNI returned before %s (%s) with %#v", timeout, took, prob)
+	}
+	if took > 2*timeout {
+		t.Fatalf("TLSSNI didn't timeout after %s (took %s to return %#v)", timeout,
+			took, prob)
+	}
+	if prob == nil {
+		t.Fatalf("Connection should've timed out")
+	}
+	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	expected := "Timeout after connect (your server may be slow or overloaded)"
+	if prob.Detail != expected {
+		t.Errorf("Wrong error detail. Expected %q, got %q", expected, prob.Detail)
+	}
+}
 
+func TestTLSSNI01DialTimeout(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := slowTLSSrv()
+	va, _ := setup(hs, 0)
+	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
+	started := time.Now()
+
+	timeout := 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// The only method I've found so far to trigger a connect timeout is to
+	// connect to an unrouteable IP address. This usuall generates a connection
+	// timeout, but will rarely return "Network unreachable" instead. If we get
+	// that, just retry until we get something other than "Network unreachable".
+	var prob *probs.ProblemDetails
+	for i := 0; i < 20; i++ {
+		_, prob = va.validateTLSSNI01(ctx, dnsi("unroutable.invalid"), chall)
+		if prob != nil && strings.Contains(prob.Detail, "Network unreachable") {
+			continue
+		} else {
+			break
+		}
+	}
+
+	if prob == nil {
+		t.Fatalf("Validation should've failed")
+	}
+	// Check that the TLS connection doesn't return before a timeout, and times
+	// out after the expected time
+	took := time.Since(started)
+	// Check that the HTTP connection doesn't return too fast, and times
+	// out after the expected time
+	if took < timeout/2 {
+		t.Fatalf("TLSSNI returned before %s (%s) with %#v", timeout, took, prob)
+	}
+	if took > 2*timeout {
+		t.Fatalf("TLSSNI didn't timeout after %s", timeout)
+	}
+	if prob == nil {
+		t.Fatalf("Connection should've timed out")
+	}
+	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	expected := "Timeout during connect (likely firewall problem)"
+	if prob.Detail != expected {
+		t.Errorf("Wrong error detail. Expected %q, got %q", expected, prob.Detail)
+	}
+}
+
+func TestTLSSNI01InvalidResponse(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssni01Srv(t, chall)
+	va, _ := setup(hs, 0)
+
+	differentChall := createChallenge(core.ChallengeTypeTLSSNI01)
+	differentChall.ProvidedKeyAuthorization = "invalid.keyAuthorization"
+
+	_, prob := va.validateTLSSNI01(ctx, dnsi("localhost"), differentChall)
+	if prob == nil {
+		t.Fatalf("Validation should've failed")
+	}
+	expected := "Incorrect validation certificate for tls-sni-01 challenge."
+	if !strings.HasPrefix(prob.Detail, expected) {
+		t.Errorf("Wrong error detail. Expected %q, got %q", expected, prob.Detail)
+	}
+}
+
+func TestTLSSNI01Refused(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssni01Srv(t, chall)
+	va, _ := setup(hs, 0)
 	// Take down validation server and check that validation fails.
 	hs.Close()
-	_, err := va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
-	if err == nil {
+	_, prob := va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
+	if prob == nil {
 		t.Fatalf("Server's down; expected refusal. Where did we connect?")
 	}
 	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+}
 
+func TestTLSSNI01TalkingToHTTP(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssni01Srv(t, chall)
+	va, _ := setup(hs, 0)
 	httpOnly := httpSrv(t, "")
 	va.tlsPort = getPort(httpOnly)
 
-	log.Clear()
-	_, err = va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
-	test.AssertError(t, err, "TLS-SNI-01 validation passed when talking to a HTTP-only server")
-	test.Assert(t, strings.HasSuffix(
-		err.Error(),
-		"Server only speaks HTTP, not TLS",
-	), "validate TLS-SNI-01 didn't return useful error")
+	_, prob := va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
+	test.AssertError(t, prob, "TLS-SNI-01 validation passed when talking to a HTTP-only server")
+	expected := "Server only speaks HTTP, not TLS"
+	if !strings.HasSuffix(prob.Detail, expected) {
+		t.Errorf("Got wrong error detail. Expected %q, got %q", expected, prob.Detail)
+	}
 }
 
 func brokenTLSSrv() *httptest.Server {
@@ -772,8 +946,9 @@ func TestPerformValidationInvalid(t *testing.T) {
 	test.Assert(t, prob != nil, "validation succeeded")
 
 	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
-		"type":   "dns-01",
-		"result": "invalid",
+		"type":        "dns-01",
+		"result":      "invalid",
+		"problemType": "unauthorized",
 	}))
 	if samples != 1 {
 		t.Errorf("Wrong number of samples for invalid validation. Expected 1, got %d", samples)
@@ -792,8 +967,9 @@ func TestDNSValidationEmpty(t *testing.T) {
 	test.AssertEquals(t, prob.Error(), "unauthorized :: No TXT record found at _acme-challenge.empty-txts.com")
 
 	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
-		"type":   "dns-01",
-		"result": "invalid",
+		"type":        "dns-01",
+		"result":      "invalid",
+		"problemType": "unauthorized",
 	}))
 	if samples != 1 {
 		t.Errorf("Wrong number of samples for invalid validation. Expected 1, got %d", samples)
@@ -856,8 +1032,9 @@ func TestPerformValidationValid(t *testing.T) {
 	test.Assert(t, prob == nil, fmt.Sprintf("validation failed: %#v", prob))
 
 	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
-		"type":   "dns-01",
-		"result": "valid",
+		"type":        "dns-01",
+		"result":      "valid",
+		"problemType": "",
 	}))
 	if samples != 1 {
 		t.Errorf("Wrong number of samples for successful validation. Expected 1, got %d", samples)
@@ -885,8 +1062,9 @@ func TestPerformValidationWildcard(t *testing.T) {
 	test.Assert(t, prob == nil, fmt.Sprintf("validation failed: %#v", prob))
 
 	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
-		"type":   "dns-01",
-		"result": "valid",
+		"type":        "dns-01",
+		"result":      "valid",
+		"problemType": "",
 	}))
 	if samples != 1 {
 		t.Errorf("Wrong number of samples for successful validation. Expected 1, got %d", samples)
@@ -971,7 +1149,7 @@ func TestDNSValidationServFail(t *testing.T) {
 
 	_, prob := va.validateChallenge(ctx, dnsi("servfail.com"), chalDNS)
 
-	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	test.AssertEquals(t, prob.Type, probs.DNSProblem)
 }
 
 func TestDNSValidationNoServer(t *testing.T) {
@@ -987,7 +1165,7 @@ func TestDNSValidationNoServer(t *testing.T) {
 
 	_, prob := va.validateChallenge(ctx, dnsi("localhost"), chalDNS)
 
-	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	test.AssertEquals(t, prob.Type, probs.DNSProblem)
 }
 
 func TestDNSValidationOK(t *testing.T) {
@@ -1167,7 +1345,7 @@ func TestHTTP01DialerFallback(t *testing.T) {
 	d, _ := va.resolveAndConstructDialer(context.Background(), "ipv4.and.ipv6.localhost", va.httpPort)
 
 	// Try to dial the dialer
-	_, dialProb := d.Dial("", "ipv4.and.ipv6.localhost")
+	_, dialProb := d.DialContext(context.Background(), "", "ipv4.and.ipv6.localhost")
 
 	// There shouldn't be a problem from this dial
 	test.AssertEquals(t, dialProb, nil)

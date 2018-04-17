@@ -36,7 +36,8 @@ type config struct {
 		// The number of times to try a DNS query (that has a temporary error)
 		// before giving up. May be short-circuited by deadlines. A zero value
 		// will be turned into 1.
-		DNSTries int
+		DNSTries     int
+		DNSResolvers []string
 
 		SAService        *cmd.GRPCClientConfig
 		VAService        *cmd.GRPCClientConfig
@@ -194,6 +195,10 @@ func main() {
 	kp, err := goodkey.NewKeyPolicy(c.RA.WeakKeyFile)
 	cmd.FailOnError(err, "Unable to create key policy")
 
+	if c.RA.MaxNames == 0 {
+		cmd.Fail(fmt.Sprintf("Error in RA config: MaxNames must not be 0"))
+	}
+
 	rai := ra.NewRegistrationAuthorityImpl(
 		cmd.Clock(),
 		logger,
@@ -221,17 +226,20 @@ func main() {
 	if dnsTries < 1 {
 		dnsTries = 1
 	}
+	if len(c.Common.DNSResolver) != 0 {
+		c.RA.DNSResolvers = append(c.RA.DNSResolvers, c.Common.DNSResolver)
+	}
 	if !c.Common.DNSAllowLoopbackAddresses {
 		rai.DNSClient = bdns.NewDNSClientImpl(
 			raDNSTimeout,
-			[]string{c.Common.DNSResolver},
+			c.RA.DNSResolvers,
 			scope,
 			cmd.Clock(),
 			dnsTries)
 	} else {
 		rai.DNSClient = bdns.NewTestDNSClientImpl(
 			raDNSTimeout,
-			[]string{c.Common.DNSResolver},
+			c.RA.DNSResolvers,
 			scope,
 			cmd.Clock(),
 			dnsTries)
@@ -240,9 +248,6 @@ func main() {
 	rai.VA = vac
 	rai.CA = cac
 	rai.SA = sac
-
-	err = rai.UpdateIssuedCountForever()
-	cmd.FailOnError(err, "Updating total issuance count")
 
 	serverMetrics := bgrpc.NewServerMetrics(scope)
 	grpcSrv, listener, err := bgrpc.NewServer(c.RA.GRPC, tlsConfig, serverMetrics)
