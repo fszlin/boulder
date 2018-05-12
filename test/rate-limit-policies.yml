@@ -33,7 +33,7 @@ pendingAuthorizationsPerAccount:
 invalidAuthorizationsPerAccount:
   window: 5m
   threshold: 10001
-pendingOrdersPerAccount:
+newOrdersPerAccount:
   window: 5m
   threshold: 10001
 certificatesPerFQDNSet:

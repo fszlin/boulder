@@ -28,7 +28,7 @@
     "GoogleSafeBrowsing": {
       "APIKey": "my-voice-is-my-passport",
       "DataDir": "/tmp",
-      "ServerURL": "http://boulder:6000"
+      "ServerURL": "http://va1.boulder:6000"
     },
     "features": {
       "RPCHeadroom": true,
@@ -37,11 +37,11 @@
     },
     "remoteVAs": [
       {
-        "serverAddresses": ["va.boulder:9097"],
+        "serverAddresses": ["va1.boulder:9097"],
         "timeout": "15s"
       },
       {
-        "serverAddresses": ["va.boulder:9098"],
+        "serverAddresses": ["va1.boulder:9098"],
         "timeout": "15s"
       }
     ]
