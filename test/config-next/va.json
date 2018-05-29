@@ -10,7 +10,7 @@
     "maxConcurrentRPCServerRequests": 100000,
     "dnsTries": 3,
     "dnsResolvers": [
-      "127.0.0.11:53"
+      "8.8.8.8:53"
     ],
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
@@ -33,7 +33,8 @@
     "features": {
       "RPCHeadroom": true,
       "VAChecksGSB": true,
-      "IPv6First": true
+      "IPv6First": true,
+      "CAAValidationMethods": true
     },
     "remoteVAs": [
       {

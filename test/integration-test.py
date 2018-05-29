@@ -270,7 +270,7 @@ def random_domain():
     return "rand.%x.xyz" % random.randrange(2**32)
 
 def test_expiration_mailer():
-    email_addr = "integration.%x@boulder.local" % random.randrange(2**16)
+    email_addr = "integration.%x@boulder" % random.randrange(2**16)
     cert, _ = auth_and_issue([random_domain()], email=email_addr)
     # Check that the expiration mailer sends a reminder
     expiry = datetime.datetime.strptime(cert.body.get_notAfter(), '%Y%m%d%H%M%SZ')
@@ -305,6 +305,7 @@ def test_revoke_by_account():
 
 def test_caa():
     """Request issuance for two CAA domains, one where we are permitted and one where we are not.
+       Two further sub-domains have restricted validation-methods.
     """
     if len(caa_authzs) == 0:
         raise Exception("CAA authzs not prepared for test_caa")
@@ -318,10 +319,28 @@ def test_caa():
 
     # Request issuance for recheck.good-caa-reserved.com, which should
     # now be denied due to CAA.
+    global caa_client
     chisel.expect_problem("urn:acme:error:caa", lambda: chisel.issue(caa_client, caa_authzs))
 
     chisel.expect_problem("urn:acme:error:caa",
         lambda: auth_and_issue(["bad-caa-reserved.com"]))
+
+    # TODO(@4a6f656c): Once the `CAAValidationMethods` feature flag is enabled by
+    # default, remove this early return.
+    if not default_config_dir.startswith("test/config-next"):
+        return
+
+    chisel.expect_problem("urn:acme:error:caa",
+        lambda: auth_and_issue(["dns-01-only.good-caa-reserved.com"], chall_type="http-01"))
+
+    chisel.expect_problem("urn:acme:error:caa",
+        lambda: auth_and_issue(["http-01-only.good-caa-reserved.com"], chall_type="dns-01"))
+
+    # Note: the additional names are to avoid rate limiting...
+    auth_and_issue(["dns-01-only.good-caa-reserved.com", "www.dns-01-only.good-caa-reserved.com"], chall_type="dns-01")
+    auth_and_issue(["http-01-only.good-caa-reserved.com", "www.http-01-only.good-caa-reserved.com"], chall_type="http-01")
+    auth_and_issue(["dns-01-or-http-01.good-caa-reserved.com", "dns-01-only.good-caa-reserved.com"], chall_type="dns-01")
+    auth_and_issue(["dns-01-or-http-01.good-caa-reserved.com", "http-01-only.good-caa-reserved.com"], chall_type="http-01")
 
 def test_account_update():
     """
@@ -616,6 +635,7 @@ def main():
         run(args.custom)
 
     run_cert_checker()
+    check_balance()
     run_expired_authz_purger()
 
     if not startservers.check():
@@ -640,6 +660,30 @@ def run_loadtest():
     run("./bin/load-generator \
             -config test/load-generator/config/v2-integration-test-config.json\
             -results %s" % latency_data_file)
+
+def check_balance():
+    """Verify that gRPC load balancing across backends is working correctly.
+
+    Fetch metrics from each backend and ensure the grpc_server_handled_total
+    metric is present, which means that backend handled at least one request.
+    """
+    addresses = [
+        "sa1.boulder:8003",
+        "sa2.boulder:8103",
+        "publisher1.boulder:8009",
+        "publisher2.boulder:8109",
+        "va1.boulder:8004",
+        "va2.boulder:8104",
+        "ca1.boulder:8001",
+        "ca2.boulder:8104",
+        "ra1.boulder:8002",
+        "ra2.boulder:8102",
+    ]
+    for address in addresses:
+        metrics = requests.get("http://%s/metrics" % address)
+        if not "grpc_server_handled_total" in metrics.text:
+            raise Exception("no gRPC traffic processed by %s; load balancing problem?"
+                % address)
 
 def run_cert_checker():
     run("./bin/cert-checker -config %s/cert-checker.json" % default_config_dir)

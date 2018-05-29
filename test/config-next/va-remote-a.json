@@ -9,6 +9,9 @@
       "tlsPort": 443
     },
     "dnsTries": 3,
+    "dnsResolvers": [
+      "8.8.8.8:53"
+    ],
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
       "caCertfile": "test/grpc-creds/minica.pem",
@@ -24,7 +27,8 @@
     },
     "features": {
       "RPCHeadroom": true,
-      "IPv6First": true
+      "IPv6First": true,
+      "CAAValidationMethods": true
     }
   },
 
@@ -34,8 +38,7 @@
   },
 
   "common": {
-    "dnsResolver": "127.0.0.11:53",
-    "dnsTimeout": "30s",
+    "dnsTimeout": "1s",
     "dnsAllowLoopbackAddresses": true
   }
 }
