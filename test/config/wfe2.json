@@ -4,7 +4,7 @@
     "TLSListenAddress": "0.0.0.0:4431",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "requestTimeout": "10s",
+    "requestTimeout": "100s",
     "allowOrigins": ["*"],
     "certCacheDuration": "6h",
     "certNoCacheExpirationWindow": "96h",
