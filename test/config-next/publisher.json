@@ -18,7 +18,7 @@
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "features": {
       "RPCHeadroom": true

@@ -9,11 +9,11 @@
     },
     "raService": {
       "serverAddresses": ["ra.boulder:9094"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     }
   },
 

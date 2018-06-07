@@ -22,11 +22,11 @@
     },
     "vaService": {
       "serverAddresses": ["va.boulder:9092"],
-      "timeout": "20s"
+      "timeout": "200s"
     },
     "caService": {
       "serverAddresses": ["ca.boulder:9093"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "publisherService": {
       "serverAddresses": ["publisher.boulder:9091"],
@@ -34,7 +34,7 @@
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "grpc": {
       "address": ":9094",
