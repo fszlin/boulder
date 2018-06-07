@@ -19,7 +19,7 @@
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "SMTPTrustedRootFile": "test/mail-test-srv/minica.pem",
     "frequency": "1h"

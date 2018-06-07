@@ -4,13 +4,13 @@
     "TLSListenAddress": "0.0.0.0:4430",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "requestTimeout": "10s",
+    "requestTimeout": "100s",
     "allowOrigins": ["*"],
     "certCacheDuration": "6h",
     "certNoCacheExpirationWindow": "96h",
     "indexCacheDuration": "24h",
     "issuerCacheDuration": "48h",
-    "shutdownStopTimeout": "10s",
+    "shutdownStopTimeout": "100s",
     "subscriberAgreementURL": "http://boulder:4000/terms/v1",
     "acceptRevocationReason": true,
     "allowAuthzDeactivation": true,
@@ -24,11 +24,11 @@
     },
     "raService": {
       "serverAddresses": ["ra.boulder:9094"],
-      "timeout": "20s"
+      "timeout": "200s"
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "features": {
       "RPCHeadroom": true,

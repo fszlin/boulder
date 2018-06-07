@@ -4,7 +4,7 @@
     "TLSListenAddress": "0.0.0.0:4431",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "requestTimeout": "10s",
+    "requestTimeout": "100s",
     "allowOrigins": ["*"],
     "certCacheDuration": "6h",
     "certNoCacheExpirationWindow": "96h",
@@ -25,11 +25,11 @@
     },
     "raService": {
       "serverAddresses": ["ra.boulder:9094"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "saService": {
       "serverAddresses": ["sa.boulder:9095"],
-      "timeout": "15s"
+      "timeout": "150s"
     },
     "certificateChains": {
       "http://boulder-certes-ci.dymetis.com:4430/acme/issuer-cert": [ "test/test-ca2.pem" ],
