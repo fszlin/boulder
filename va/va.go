@@ -456,6 +456,7 @@ func (va *ValidationAuthorityImpl) fetchHTTP(ctx context.Context, identifier cor
 		return nil
 	}
 	client := http.Client{
+		Timeout:       time.Duration(60 * time.Second),
 		Transport:     tr,
 		CheckRedirect: logRedirect,
 	}
@@ -790,11 +791,11 @@ func detailedError(err error) *probs.ProblemDetails {
 		} else if netErr.Timeout() && netErr.Op == "dial" {
 			return probs.ConnectionFailure("Timeout during connect (likely firewall problem)")
 		} else if netErr.Timeout() {
-			return probs.ConnectionFailure("Timeout during %s (your server may be slow or overloaded)", netErr.Op)
+			return probs.ConnectionFailure("Timeout during %s (your server may be slow or overloaded1)", netErr.Op)
 		}
 	}
 	if err, ok := err.(net.Error); ok && err.Timeout() {
-		return probs.ConnectionFailure("Timeout after connect (your server may be slow or overloaded)")
+		return probs.ConnectionFailure("Timeout after connect (your server may be slow or overloaded2)")
 	}
 	if berrors.Is(err, berrors.ConnectionFailure) {
 		return probs.ConnectionFailure(err.Error())
