@@ -34,7 +34,8 @@
       "RPCHeadroom": true,
       "VAChecksGSB": true,
       "IPv6First": true,
-      "CAAValidationMethods": true
+      "CAAValidationMethods": true,
+      "CAAAccountURI": true
     },
     "remoteVAs": [
       {
@@ -45,6 +46,9 @@
         "serverAddresses": ["va1.boulder:9098"],
         "timeout": "150s"
       }
+    ],
+    "accountURIPrefixes": [
+      "http://boulder:4000/acme/reg/"
     ]
   },
 
