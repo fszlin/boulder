@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -73,6 +74,8 @@ func dnsi(hostname string) core.AcmeIdentifier {
 }
 
 var ctx = context.Background()
+
+var accountURIPrefixes = []string{"http://boulder:4000/acme/reg/"}
 
 // All paths that get assigned to tokens MUST be valid tokens
 const expectedToken = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
@@ -226,10 +229,11 @@ func tlsalpn01Srv(t *testing.T, chall core.Challenge, names ...string) *httptest
 	}
 
 	shasum := sha256.Sum256([]byte(chall.ProvidedKeyAuthorization))
+	encHash, _ := asn1.Marshal(shasum[:])
 	acmeExtension := pkix.Extension{
 		Id:       IdPeAcmeIdentifierV1,
 		Critical: true,
-		Value:    shasum[:],
+		Value:    encHash,
 	}
 
 	template.ExtraExtensions = []pkix.Extension{acmeExtension}
@@ -914,7 +918,7 @@ func TestGSBAtValidation(t *testing.T) {
 	sbc.EXPECT().IsListed(gomock.Any(), "errorful.com").Return("", fmt.Errorf("welp"))
 	va.safeBrowsing = sbc
 
-	_, prob := va.validateChallengeAndIdentifier(ctx, dnsi("bad.com"), chall)
+	_, prob := va.validate(ctx, dnsi("bad.com"), chall, core.Authorization{})
 	if prob == nil {
 		t.Fatalf("Expected rejection for bad.com, got success")
 	}
@@ -922,12 +926,12 @@ func TestGSBAtValidation(t *testing.T) {
 		t.Errorf("Got error %q, expected an unsafe domain error.", prob.Error())
 	}
 
-	_, prob = va.validateChallengeAndIdentifier(ctx, dnsi("errorful.com"), chall)
+	_, prob = va.validate(ctx, dnsi("errorful.com"), chall, core.Authorization{})
 	if prob != nil {
 		t.Fatalf("Expected success for errorful.com, got error")
 	}
 
-	_, prob = va.validateChallengeAndIdentifier(ctx, dnsi("good.com"), chall)
+	_, prob = va.validate(ctx, dnsi("good.com"), chall, core.Authorization{})
 	if prob != nil {
 		t.Fatalf("Expected success for good.com, got %s", prob)
 	}
@@ -1316,7 +1320,7 @@ func setup(srv *httptest.Server, maxRemoteFailures int) (*ValidationAuthorityImp
 			TLSPort:  port,
 		}
 	}
-	va := NewValidationAuthorityImpl(
+	va, err := NewValidationAuthorityImpl(
 		// Use the test server's port as both the HTTPPort and the TLSPort for the VA
 		&portConfig,
 		nil,
@@ -1327,7 +1331,11 @@ func setup(srv *httptest.Server, maxRemoteFailures int) (*ValidationAuthorityImp
 		"letsencrypt.org",
 		metrics.NewNoopScope(),
 		clock.Default(),
-		logger)
+		logger,
+		accountURIPrefixes)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create validation authority: %v", err))
+	}
 	return va, logger
 }
 
