@@ -35,8 +35,7 @@
       "timeout": "150s"
     },
     "features": {
-      "RPCHeadroom": true,
-      "EmbedSCTs": true
+      "RPCHeadroom": true
     }
   },
 
