@@ -24,7 +24,6 @@ import (
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
@@ -469,7 +468,14 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	if err == nil {
 		response.Header().Set("Location",
 			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
-		response.WriteHeader(http.StatusOK)
+
+		err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, existingAcct)
+		if err != nil {
+			// ServerInternal because we just created this account, and it
+			// should be OK.
+			wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling account"), err)
+			return
+		}
 		return
 	} else if !berrors.Is(err, berrors.NotFound) {
 		wfe.sendError(response, logEvent, probs.ServerInternal("failed check for existing account"), err)
@@ -627,7 +633,7 @@ func (wfe *WebFrontEndImpl) processRevocation(
 	logEvent.Extra["CertificateStatus"] = certStatus.Status
 
 	if certStatus.Status == core.OCSPStatusRevoked {
-		return probs.Conflict("Certificate already revoked")
+		return probs.AlreadyRevoked("Certificate already revoked")
 	}
 
 	// Validate that the requester is authenticated to revoke the given certificate
@@ -875,7 +881,7 @@ func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz
 
 	// If the authz has been marked invalid, consider all challenges on that authz
 	// to be invalid as well.
-	if features.Enabled(features.ForceConsistentStatus) && authz.Status == core.StatusInvalid {
+	if authz.Status == core.StatusInvalid {
 		challenge.Status = authz.Status
 	}
 }
@@ -1143,8 +1149,11 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 	id := request.URL.Path
 	authz, err := wfe.SA.GetAuthorization(ctx, id)
 	if err != nil {
-		// TODO(#1199): handle db errors
-		wfe.sendError(response, logEvent, probs.NotFound("Unable to find authorization"), err)
+		if berrors.Is(err, berrors.NotFound) {
+			wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
+		} else {
+			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+		}
 		return
 	}
 	logEvent.Extra["Identifier"] = authz.Identifier
@@ -1366,6 +1375,7 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 		wfe.sendError(response, logEvent, prob, nil)
 		return
 	}
+	oldKey := acct.Key
 
 	// Parse the inner JWS from the validated outer JWS body
 	innerJWS, prob := wfe.parseJWS(outerBody)
@@ -1375,21 +1385,21 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 	}
 
 	// Validate the inner JWS as a key rollover request for the outer JWS
-	rolloverRequest, prob := wfe.validKeyRollover(outerJWS, innerJWS, logEvent)
+	rolloverOperation, prob := wfe.validKeyRollover(outerJWS, innerJWS, oldKey, logEvent)
 	if prob != nil {
 		wfe.sendError(response, logEvent, prob, nil)
 		return
 	}
-	newKey := rolloverRequest.NewKey
+	newKey := rolloverOperation.NewKey
 
 	// Check that the rollover request's account URL matches the account URL used
 	// to validate the outer JWS
 	header := outerJWS.Signatures[0].Header
-	if rolloverRequest.Account != header.KeyID {
+	if rolloverOperation.Account != header.KeyID {
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "KeyRolloverMismatchedAccount"}).Inc()
 		wfe.sendError(response, logEvent, probs.Malformed(
 			fmt.Sprintf("Inner key rollover request specified Account %q, but outer JWS has Key ID %q",
-				rolloverRequest.Account, header.KeyID)), nil)
+				rolloverOperation.Account, header.KeyID)), nil)
 		return
 	}
 
@@ -1398,7 +1408,7 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 	// will find the old account if its equal to the old account key. We
 	// check new key against old key explicitly to save an RPC round trip and a DB
 	// query for this easy rejection case
-	keysEqual, err := core.PublicKeysEqual(newKey.Key, acct.Key.Key)
+	keysEqual, err := core.PublicKeysEqual(newKey.Key, oldKey.Key)
 	if err != nil {
 		// This should not happen - both the old and new key have been validated by now
 		wfe.sendError(response, logEvent, probs.ServerInternal("Unable to compare new and old keys"), err)
@@ -1681,8 +1691,7 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 	// a pending status with valid authzs were finalizable. We accept both states
 	// here for deployability ease. In the future we will only allow ready orders
 	// to be finalized.
-	// TODO(@cpu): Forbid finalizing "Pending" orders once
-	// `features.Enabled(features.OrderReadyStatus)` is deployed
+	// TODO(@cpu): Forbid finalizing "Pending" orders
 	if *order.Status != string(core.StatusPending) &&
 		*order.Status != string(core.StatusReady) {
 		wfe.sendError(response, logEvent,

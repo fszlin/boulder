@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jmhodges/clock"
@@ -19,7 +18,6 @@ import (
 	"github.com/weppos/publicsuffix-go/publicsuffix"
 	"golang.org/x/net/context"
 
-	"github.com/letsencrypt/boulder/bdns"
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -69,7 +67,6 @@ type RegistrationAuthorityImpl struct {
 	caa       caaChecker
 
 	stats     metrics.Scope
-	DNSClient bdns.DNSClient
 	clk       clock.Clock
 	log       blog.Logger
 	keyPolicy goodkey.KeyPolicy
@@ -159,80 +156,6 @@ func (ra *RegistrationAuthorityImpl) SetRateLimitPoliciesFile(filename string) e
 
 func (ra *RegistrationAuthorityImpl) rateLimitPoliciesLoadError(err error) {
 	ra.log.Errf("error reloading rate limit policy: %s", err)
-}
-
-var (
-	unparseableEmailError = berrors.InvalidEmailError("not a valid e-mail address")
-	emptyDNSResponseError = berrors.InvalidEmailError(
-		"empty DNS response validating email domain - no MX/A records")
-	multipleAddressError = berrors.InvalidEmailError("more than one e-mail address")
-)
-
-func problemIsTimeout(err error) bool {
-	if dnsErr, ok := err.(*bdns.DNSError); ok && dnsErr.Timeout() {
-		return true
-	}
-
-	return false
-}
-
-// forbiddenMailDomains is a map of domain names we do not allow after the
-// @ symbol in contact mailto addresses. These are frequently used when
-// copy-pasting example configurations and would not result in expiration
-// messages and subscriber communications reaching the user that created the
-// registration if allowed.
-var forbiddenMailDomains = map[string]bool{
-	// https://tools.ietf.org/html/rfc2606#section-3
-	"example.com": true,
-	"example.net": true,
-	"example.org": true,
-}
-
-func validateEmail(ctx context.Context, address string, resolver bdns.DNSClient) error {
-	email, err := mail.ParseAddress(address)
-	if err != nil {
-		return unparseableEmailError
-	}
-	splitEmail := strings.SplitN(email.Address, "@", -1)
-	domain := strings.ToLower(splitEmail[len(splitEmail)-1])
-	if forbiddenMailDomains[domain] {
-		return berrors.InvalidEmailError(
-			"invalid contact domain. Contact emails @%s are forbidden",
-			domain)
-	}
-	var resultMX []string
-	var resultA []net.IP
-	var errMX, errA error
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		resultMX, errMX = resolver.LookupMX(ctx, domain)
-		wg.Done()
-	}()
-	go func() {
-		resultA, errA = resolver.LookupHost(ctx, domain)
-		wg.Done()
-	}()
-	wg.Wait()
-
-	// We treat timeouts as non-failures for best-effort email validation
-	// See: https://github.com/letsencrypt/boulder/issues/2260
-	if problemIsTimeout(errMX) || problemIsTimeout(errA) {
-		return nil
-	}
-
-	if errMX != nil {
-		return berrors.InvalidEmailError(errMX.Error())
-	} else if len(resultMX) > 0 {
-		return nil
-	}
-	if errA != nil {
-		return berrors.InvalidEmailError(errA.Error())
-	} else if len(resultA) > 0 {
-		return nil
-	}
-
-	return emptyDNSResponseError
 }
 
 // certificateRequestAuthz is a struct for holding information about a valid
@@ -384,6 +307,15 @@ func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, init c
 	return reg, nil
 }
 
+// validateContacts checks the provided list of contacts, returning an error if
+// any are not acceptable. Unacceptable contacts lists include:
+// * An empty list
+// * A list has more than maxContactsPerReg contacts
+// * A list containing an empty contact
+// * A list containing a contact that does not parse as a URL
+// * A list containing a contact that has a URL scheme other than mailto
+// * A list containing a contact that has non-ascii characters
+// * A list containing a contact that doesn't pass `validateEmail`
 func (ra *RegistrationAuthorityImpl) validateContacts(ctx context.Context, contacts *[]string) error {
 	if contacts == nil || len(*contacts) == 0 {
 		return nil // Nothing to validate
@@ -413,18 +345,47 @@ func (ra *RegistrationAuthorityImpl) validateContacts(ctx context.Context, conta
 				contact,
 			)
 		}
-
-		start := ra.clk.Now()
-		ra.stats.Inc("ValidateEmail.Calls", 1)
-		err = validateEmail(ctx, parsed.Opaque, ra.DNSClient)
-		ra.stats.TimingDuration("ValidateEmail.Latency", ra.clk.Now().Sub(start))
-		if err != nil {
-			ra.stats.Inc("ValidateEmail.Errors", 1)
+		if err := validateEmail(parsed.Opaque); err != nil {
 			return err
 		}
-		ra.stats.Inc("ValidateEmail.Successes", 1)
 	}
 
+	return nil
+}
+
+var (
+	// unparseableEmailError is returned by validateEmail when the given address
+	// is not parseable.
+	unparseableEmailError = berrors.InvalidEmailError("not a valid e-mail address")
+)
+
+// forbiddenMailDomains is a map of domain names we do not allow after the
+// @ symbol in contact mailto addresses. These are frequently used when
+// copy-pasting example configurations and would not result in expiration
+// messages and subscriber communications reaching the user that created the
+// registration if allowed.
+var forbiddenMailDomains = map[string]bool{
+	// https://tools.ietf.org/html/rfc2606#section-3
+	"example.com": true,
+	"example.net": true,
+	"example.org": true,
+}
+
+// validateEmail returns an error if the given address is not parseable as an
+// email address or if the domain portion of the email address is a member of
+// the forbiddenMailDomains map.
+func validateEmail(address string) error {
+	email, err := mail.ParseAddress(address)
+	if err != nil {
+		return unparseableEmailError
+	}
+	splitEmail := strings.SplitN(email.Address, "@", -1)
+	domain := strings.ToLower(splitEmail[len(splitEmail)-1])
+	if forbiddenMailDomains[domain] {
+		return berrors.InvalidEmailError(
+			"invalid contact domain. Contact emails @%s are forbidden",
+			domain)
+	}
 	return nil
 }
 
@@ -565,25 +526,23 @@ func (ra *RegistrationAuthorityImpl) NewAuthorization(ctx context.Context, reque
 			}
 		}
 	}
-	if features.Enabled(features.ReusePendingAuthz) {
-		nowishNano := ra.clk.Now().Add(time.Hour).UnixNano()
-		identifierTypeString := string(identifier.Type)
-		pendingAuth, err := ra.SA.GetPendingAuthorization(ctx, &sapb.GetPendingAuthorizationRequest{
-			RegistrationID:  &regID,
-			IdentifierType:  &identifierTypeString,
-			IdentifierValue: &identifier.Value,
-			ValidUntil:      &nowishNano,
-		})
-		if err != nil && !berrors.Is(err, berrors.NotFound) {
-			return core.Authorization{}, berrors.InternalServerError(
-				"unable to get pending authorization for regID: %d, identifier: %s: %s",
-				regID,
-				identifier.Value,
-				err)
-		} else if err == nil {
-			return *pendingAuth, nil
-		}
-		// Fall through to normal creation flow.
+
+	nowishNano := ra.clk.Now().Add(time.Hour).UnixNano()
+	identifierTypeString := string(identifier.Type)
+	pendingAuth, err := ra.SA.GetPendingAuthorization(ctx, &sapb.GetPendingAuthorizationRequest{
+		RegistrationID:  &regID,
+		IdentifierType:  &identifierTypeString,
+		IdentifierValue: &identifier.Value,
+		ValidUntil:      &nowishNano,
+	})
+	if err != nil && !berrors.Is(err, berrors.NotFound) {
+		return core.Authorization{}, berrors.InternalServerError(
+			"unable to get pending authorization for regID: %d, identifier: %s: %s",
+			regID,
+			identifier.Value,
+			err)
+	} else if err == nil {
+		return *pendingAuth, nil
 	}
 
 	authzPB, err := ra.createPendingAuthz(ctx, regID, identifier)
@@ -874,8 +833,7 @@ func (ra *RegistrationAuthorityImpl) FinalizeOrder(ctx context.Context, req *rap
 	// a pending status with valid authzs were finalizable. We accept both states
 	// here for deployability ease. In the future we will only allow ready orders
 	// to be finalized.
-	// TODO(@cpu): Forbid finalizing "Pending" orders once
-	// `features.Enabled(features.OrderReadyStatus)` is deployed
+	// TODO(@cpu): Forbid finalizing "Pending" orders
 	if *order.Status != string(core.StatusPending) &&
 		*order.Status != string(core.StatusReady) {
 		return nil, berrors.MalformedError(
@@ -1130,7 +1088,11 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	if err != nil {
 		return emptyCert, wrapError(err, "issuing precertificate")
 	}
-	scts, err := ra.getSCTs(ctx, precert.DER)
+	parsedPrecert, err := x509.ParseCertificate(precert.DER)
+	if err != nil {
+		return emptyCert, wrapError(err, "parsing precertificate")
+	}
+	scts, err := ra.getSCTs(ctx, precert.DER, parsedPrecert.NotAfter)
 	if err != nil {
 		return emptyCert, wrapError(err, "getting SCTs")
 	}
@@ -1143,8 +1105,6 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	if err != nil {
 		return emptyCert, wrapError(err, "issuing certificate for precertificate")
 	}
-	// Asynchronously submit the final certificate to any configured logs
-	go ra.ctpolicy.SubmitFinalCert(cert.DER)
 
 	parsedCertificate, err := x509.ParseCertificate([]byte(cert.DER))
 	if err != nil {
@@ -1152,6 +1112,9 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 		// parseable.
 		return emptyCert, berrors.InternalServerError("failed to parse certificate: %s", err.Error())
 	}
+
+	// Asynchronously submit the final certificate to any configured logs
+	go ra.ctpolicy.SubmitFinalCert(cert.DER, parsedCertificate.NotAfter)
 
 	err = ra.MatchesCSR(parsedCertificate, csr)
 	if err != nil {
@@ -1167,9 +1130,9 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	return cert, nil
 }
 
-func (ra *RegistrationAuthorityImpl) getSCTs(ctx context.Context, cert []byte) (core.SCTDERs, error) {
+func (ra *RegistrationAuthorityImpl) getSCTs(ctx context.Context, cert []byte, expiration time.Time) (core.SCTDERs, error) {
 	started := ra.clk.Now()
-	scts, err := ra.ctpolicy.GetSCTs(ctx, cert)
+	scts, err := ra.ctpolicy.GetSCTs(ctx, cert, expiration)
 	took := ra.clk.Since(started)
 	// The final cert has already been issued so actually return it to the
 	// user even if this fails since we aren't actually doing anything with
@@ -1738,19 +1701,13 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 	// Validate that our policy allows issuing for each of the names in the order
 	for _, name := range order.Names {
 		id := core.AcmeIdentifier{Value: name, Type: core.IdentifierDNS}
-		if features.Enabled(features.WildcardDomains) {
-			if err := ra.PA.WillingToIssueWildcard(id); err != nil {
-				return nil, err
-			}
-		} else if err := ra.PA.WillingToIssue(id); err != nil {
+		if err := ra.PA.WillingToIssueWildcard(id); err != nil {
 			return nil, err
 		}
 	}
 
-	if features.Enabled(features.EnforceOverlappingWildcards) {
-		if err := wildcardOverlap(order.Names); err != nil {
-			return nil, err
-		}
+	if err := wildcardOverlap(order.Names); err != nil {
+		return nil, err
 	}
 
 	// See if there is an existing, pending, unexpired order that can be reused
@@ -1874,7 +1831,7 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 		// An authz without an expiry is an unexpected internal server event
 		if authz.Expires == nil {
 			return nil, berrors.InternalServerError(
-				"SA.GetAuthorizations returned an authz (%d) with nil expiry",
+				"SA.GetAuthorizations returned an authz (%s) with nil expiry",
 				*authz.Id)
 		}
 		// If the reused authorization expires before the minExpiry, it's expiry
@@ -1924,21 +1881,6 @@ func (ra *RegistrationAuthorityImpl) createPendingAuthz(ctx context.Context, reg
 		RegistrationID: &reg,
 		Status:         &status,
 		Expires:        &expires,
-	}
-
-	if identifier.Type == core.IdentifierDNS && !features.Enabled(features.VAChecksGSB) {
-		isSafeResp, err := ra.VA.IsSafeDomain(ctx, &vaPB.IsSafeDomainRequest{Domain: &identifier.Value})
-		if err != nil {
-			outErr := berrors.InternalServerError("unable to determine if domain was safe")
-			ra.log.Warningf("%s: %s", outErr, err)
-			return nil, outErr
-		}
-		if !isSafeResp.GetIsSafe() {
-			return nil, berrors.UnauthorizedError(
-				"%q was considered an unsafe domain by a third-party API",
-				identifier.Value,
-			)
-		}
 	}
 
 	// If TLSSNIRevalidation is enabled, find out whether this was a revalidation

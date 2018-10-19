@@ -1,6 +1,8 @@
 package ra
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -21,9 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/bdns"
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -46,6 +45,12 @@ import (
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
 	vaPB "github.com/letsencrypt/boulder/va/proto"
+
+	"github.com/golang/protobuf/proto"
+	ctasn1 "github.com/google/certificate-transparency-go/asn1"
+	ctx509 "github.com/google/certificate-transparency-go/x509"
+	ctpkix "github.com/google/certificate-transparency-go/x509/pkix"
+	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weppos/publicsuffix-go/publicsuffix"
 	"golang.org/x/net/context"
@@ -288,7 +293,6 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 	ra.VA = va
 	ra.CA = ca
 	ra.PA = pa
-	ra.DNSClient = &bdns.MockDNSClient{}
 
 	AuthzInitial.RegistrationID = Registration.ID
 
@@ -306,6 +310,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 }
 
 func assertAuthzEqual(t *testing.T, a1, a2 core.Authorization) {
+	t.Helper()
 	test.Assert(t, a1.ID == a2.ID, "ret != DB: ID")
 	test.Assert(t, a1.Identifier == a2.Identifier, "ret != DB: Identifier")
 	test.Assert(t, a1.Status == a2.Status, "ret != DB: Status")
@@ -330,6 +335,8 @@ func TestValidateContacts(t *testing.T) {
 	otherValidEmail := "mailto:other-admin@email.com"
 	malformedEmail := "mailto:admin.com"
 	nonASCII := "mailto:señor@email.com"
+	unparseable := "mailto:a@email.com, b@email.com"
+	forbidden := "mailto:a@example.org"
 
 	err := ra.validateContacts(context.Background(), &[]string{})
 	test.AssertNotError(t, err, "No Contacts")
@@ -351,49 +358,12 @@ func TestValidateContacts(t *testing.T) {
 
 	err = ra.validateContacts(context.Background(), &[]string{nonASCII})
 	test.AssertError(t, err, "Non ASCII email")
-}
 
-func TestValidateEmail(t *testing.T) {
-	testFailures := []struct {
-		input    string
-		expected string
-	}{
-		{"an email`", unparseableEmailError.Error()},
-		{"a@always.invalid", emptyDNSResponseError.Error()},
-		{"a@email.com, b@email.com", unparseableEmailError.Error()},
-		{"a@always.error", "DNS problem: networking error looking up A for always.error"},
-		{"a@example.com", "invalid contact domain. Contact emails @example.com are forbidden"},
-		{"a@example.net", "invalid contact domain. Contact emails @example.net are forbidden"},
-		{"a@example.org", "invalid contact domain. Contact emails @example.org are forbidden"},
-	}
+	err = ra.validateContacts(context.Background(), &[]string{unparseable})
+	test.AssertError(t, err, "Unparseable email")
 
-	testSuccesses := []string{
-		"a@email.com",
-		"b@email.only",
-		// A timeout during email validation is treated as a success. We treat email
-		// validation during registration as a best-effort. See
-		// https://github.com/letsencrypt/boulder/issues/2260 for more
-		"a@always.timeout",
-	}
-
-	for _, tc := range testFailures {
-		err := validateEmail(context.Background(), tc.input, &bdns.MockDNSClient{})
-		if !berrors.Is(err, berrors.InvalidEmail) {
-			t.Errorf("validateEmail(%q): got error %#v, expected type berrors.InvalidEmail", tc.input, err)
-		}
-
-		if err.Error() != tc.expected {
-			t.Errorf("validateEmail(%q): got %#v, expected %#v",
-				tc.input, err.Error(), tc.expected)
-		}
-	}
-
-	for _, addr := range testSuccesses {
-		if err := validateEmail(context.Background(), addr, &bdns.MockDNSClient{}); err != nil {
-			t.Errorf("validateEmail(%q): expected success, but it failed: %#v",
-				addr, err)
-		}
-	}
+	err = ra.validateContacts(context.Background(), &[]string{forbidden})
+	test.AssertError(t, err, "Forbidden email")
 }
 
 func TestNewRegistration(t *testing.T) {
@@ -694,9 +664,6 @@ func TestReusePendingAuthorization(t *testing.T) {
 	_, sa, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
-	_ = features.Set(map[string]bool{"ReusePendingAuthz": true})
-	defer features.Reset()
-
 	// Create one pending authorization
 	firstAuthz, err := ra.NewAuthorization(ctx, AuthzInitial, Registration.ID)
 	test.AssertNotError(t, err, "Could not store test pending authorization")
@@ -889,7 +856,9 @@ func TestUpdateAuthorization(t *testing.T) {
 	test.Assert(t, len(vaAuthz.Challenges) > 0, "Authz passed to VA has no challenges")
 
 	// Create another authorization
-	authz, err = ra.NewAuthorization(ctx, AuthzRequest, Registration.ID)
+	newAR := AuthzRequest
+	newAR.Identifier.Value = "not-not-example.com" // Identifier needs to be different to bypass authorization reuse
+	authz, err = ra.NewAuthorization(ctx, newAR, Registration.ID)
 	test.AssertNotError(t, err, "NewAuthorization failed")
 
 	// Update it with an empty challenge, no key authorization
@@ -2390,9 +2359,6 @@ func (sa *mockSAUnsafeAuthzReuse) AddPendingAuthorizations(
 // for background - this safety check was previously broken!
 // https://github.com/letsencrypt/boulder/issues/3420
 func TestNewOrderAuthzReuseSafety(t *testing.T) {
-	// Enable wildcard domains
-	_ = features.Set(map[string]bool{"WildcardDomains": true})
-	defer features.Reset()
 
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
@@ -2433,20 +2399,6 @@ func TestNewOrderWildcard(t *testing.T) {
 		Names:          orderNames,
 	}
 
-	// First test that with WildcardDomains feature disabled wildcard orders are
-	// rejected as expected
-	_ = features.Set(map[string]bool{"WildcardDomains": false})
-
-	_, err := ra.NewOrder(context.Background(), wildcardOrderRequest)
-	test.AssertError(t, err, "NewOrder with wildcard names did not error with "+
-		"WildcardDomains feature disabled")
-	test.AssertEquals(t, err.Error(), "Wildcard names not supported")
-
-	// Now test with WildcardDomains feature enabled
-	features.Reset()
-	_ = features.Set(map[string]bool{"WildcardDomains": true})
-	defer features.Reset()
-
 	// Also ensure that the required challenge types are enabled. The ra_test
 	// global `SupportedChallenges` used by `initAuthorities` does not include
 	// DNS-01
@@ -2462,8 +2414,7 @@ func TestNewOrderWildcard(t *testing.T) {
 	ra.PA = pa
 
 	order, err := ra.NewOrder(context.Background(), wildcardOrderRequest)
-	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request "+
-		"with WildcardDomains enabled")
+	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request")
 
 	// We expect the order to be pending
 	test.AssertEquals(t, *order.Status, string(core.StatusPending))
@@ -2510,8 +2461,7 @@ func TestNewOrderWildcard(t *testing.T) {
 		Names:          orderNames,
 	}
 	order, err = ra.NewOrder(context.Background(), wildcardOrderRequest)
-	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request "+
-		"with WildcardDomains enabled")
+	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request")
 
 	// We expect the order to be pending
 	test.AssertEquals(t, *order.Status, string(core.StatusPending))
@@ -2578,8 +2528,7 @@ func TestNewOrderWildcard(t *testing.T) {
 		Names:          orderNames,
 	}
 	order, err = ra.NewOrder(context.Background(), wildcardOrderRequest)
-	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request "+
-		"with WildcardDomains enabled")
+	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request")
 	// We expect the order is in Pending status
 	test.AssertEquals(t, *order.Status, string(core.StatusPending))
 	// There should be one authz
@@ -2602,8 +2551,7 @@ func TestNewOrderWildcard(t *testing.T) {
 
 	// Submit an identical wildcard order request
 	dupeOrder, err := ra.NewOrder(context.Background(), wildcardOrderRequest)
-	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request "+
-		"with WildcardDomains enabled")
+	test.AssertNotError(t, err, "NewOrder failed for a wildcard order request")
 	// We expect the order is in Pending status
 	test.AssertEquals(t, *dupeOrder.Status, string(core.StatusPending))
 	// There should be one authz
@@ -2790,7 +2738,7 @@ func TestFinalizeOrder(t *testing.T) {
 
 	// Create a new order referencing both of the above finalized authzs
 	pendingStatus := "pending"
-	expUnix := exp.Unix()
+	expUnix := exp.UnixNano()
 	finalOrder, err := sa.NewOrder(context.Background(), &corepb.Order{
 		RegistrationID: &Registration.ID,
 		Expires:        &expUnix,
@@ -2800,8 +2748,6 @@ func TestFinalizeOrder(t *testing.T) {
 	})
 	test.AssertNotError(t, err, "Could not add test order with finalized authz IDs")
 
-	// Enable the order ready status temporarily
-	_ = features.Set(map[string]bool{"OrderReadyStatus": true})
 	// Create an order with valid authzs, it should end up status ready in the
 	// resulting returned order
 	modernFinalOrder, err := sa.NewOrder(context.Background(), &corepb.Order{
@@ -2813,8 +2759,6 @@ func TestFinalizeOrder(t *testing.T) {
 		BeganProcessing: &processingStatus,
 	})
 	test.AssertNotError(t, err, "Could not add test order with finalized authz IDs, ready status")
-	// Disable the order ready status again
-	_ = features.Set(map[string]bool{"OrderReadyStatus": false})
 
 	// Swallowing errors here because the CSRPEM is hardcoded test data expected
 	// to parse in all instance
@@ -3037,7 +2981,7 @@ func TestFinalizeOrderWithMixedSANAndCN(t *testing.T) {
 	test.AssertNotError(t, err, "Could not finalize 2nd test pending authorization")
 
 	// Create a new order to finalize with names in SAN and CN
-	expUnix := exp.Unix()
+	expUnix := exp.UnixNano()
 	pendingStatus := "pending"
 	mixedOrder, err := sa.NewOrder(context.Background(), &corepb.Order{
 		RegistrationID: &Registration.ID,
@@ -3090,10 +3034,6 @@ func TestFinalizeOrderWildcard(t *testing.T) {
 
 	// Pick an expiry in the future
 	exp := ra.clk.Now().Add(365 * 24 * time.Hour)
-
-	// Enable wildcard domains
-	_ = features.Set(map[string]bool{"WildcardDomains": true})
-	defer features.Reset()
 
 	// Also ensure that the required challenge types are enabled. The ra_test
 	// global `SupportedChallenges` used by `initAuthorities` does not include
@@ -3315,6 +3255,8 @@ func TestIssueCertificateAuditLog(t *testing.T) {
 	mockLog.Clear()
 
 	// Finalize the order with the CSR
+	status := string(core.StatusReady)
+	order.Status = &status
 	_, err = ra.FinalizeOrder(context.Background(), &rapb.FinalizeOrderRequest{
 		Order: order,
 		Csr:   csr})
@@ -3417,6 +3359,10 @@ func (ms *mockSAPreexistingCertificate) PreviousCertificateExists(ctx context.Co
 		return &sapb.Exists{Exists: &t}, nil
 	}
 	return &sapb.Exists{Exists: &f}, nil
+}
+
+func (ms *mockSAPreexistingCertificate) GetPendingAuthorization(ctx context.Context, req *sapb.GetPendingAuthorizationRequest) (*core.Authorization, error) {
+	return nil, berrors.NotFoundError("no pending authorization found")
 }
 
 // With TLS-SNI-01 disabled, an account that previously issued a certificate for
@@ -3552,7 +3498,6 @@ func TestCTPolicyMeasurements(t *testing.T) {
 	ra.VA = va
 	ra.CA = ca
 	ra.PA = pa
-	ra.DNSClient = &bdns.MockDNSClient{}
 
 	AuthzFinal.RegistrationID = Registration.ID
 	AuthzFinal, err := ssa.NewPendingAuthorization(ctx, AuthzFinal)
@@ -3578,8 +3523,6 @@ func TestCTPolicyMeasurements(t *testing.T) {
 }
 
 func TestWildcardOverlap(t *testing.T) {
-	_ = features.Set(map[string]bool{"EnforceOverlappingWildcards": true})
-	defer features.Reset()
 	err := wildcardOverlap([]string{
 		"*.example.com",
 		"*.example.net",
@@ -3633,8 +3576,26 @@ type mockCAFailCertForPrecert struct {
 
 // IssuePrecertificate needs to be mocked for mockCAFailCertForPrecert's `IssueCertificateForPrecertificate` to get called.
 func (ca *mockCAFailCertForPrecert) IssuePrecertificate(_ context.Context, _ *capb.IssueCertificateRequest) (*capb.IssuePrecertificateResponse, error) {
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	tmpl := &ctx509.Certificate{
+		SerialNumber: big.NewInt(1),
+		ExtraExtensions: []ctpkix.Extension{
+			{
+				Id:       ctx509.OIDExtensionCTPoison,
+				Critical: true,
+				Value:    ctasn1.NullBytes,
+			},
+		},
+	}
+	precert, err := ctx509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	if err != nil {
+		return nil, err
+	}
 	return &capb.IssuePrecertificateResponse{
-		DER: []byte{},
+		DER: precert,
 	}, nil
 }
 
@@ -3793,7 +3754,7 @@ func TestIssueCertificateInnerErrs(t *testing.T) {
 				// `issueCertificateInner` error to be a `berrors.BoulderError`
 				berr, ok := err.(*berrors.BoulderError)
 				if !ok {
-					t.Errorf("Expected a boulder error, got %#v\n", err)
+					t.Fatalf("Expected a boulder error, got %#v\n", err)
 				}
 				// Match the expected berror Type and Detail to the observed
 				test.AssertEquals(t, berr.Type, tc.ExpectedProb.Type)
