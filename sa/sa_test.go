@@ -24,7 +24,6 @@ import (
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/revocation"
@@ -1325,10 +1324,10 @@ func TestSetOrderProcessing(t *testing.T) {
 	err = sa.FinalizeAuthorization(ctx, authz)
 	test.AssertNotError(t, err, "Couldn't finalize pending authz to valid")
 
-	i := int64(1337)
+	orderExpiry := sa.clk.Now().Add(365 * 24 * time.Hour).UnixNano()
 	order := &corepb.Order{
 		RegistrationID: &reg.ID,
-		Expires:        &i,
+		Expires:        &orderExpiry,
 		Names:          []string{"example.com"},
 		Authorizations: []string{authz.ID},
 	}
@@ -1378,10 +1377,10 @@ func TestFinalizeOrder(t *testing.T) {
 	err = sa.FinalizeAuthorization(ctx, authz)
 	test.AssertNotError(t, err, "Couldn't finalize pending authorization")
 
-	i := int64(1337)
+	orderExpiry := sa.clk.Now().Add(365 * 24 * time.Hour).UnixNano()
 	order := &corepb.Order{
 		RegistrationID: &reg.ID,
-		Expires:        &i,
+		Expires:        &orderExpiry,
 		Names:          []string{"example.com"},
 		Authorizations: []string{authz.ID},
 	}
@@ -1726,7 +1725,7 @@ func TestCountOrders(t *testing.T) {
 
 	reg := satest.CreateWorkingRegistration(t, sa)
 	now := sa.clk.Now()
-	expires := now.Add(24 * time.Hour).UnixNano()
+	expires := now.Add(24 * time.Hour)
 
 	earliest := now.Add(-time.Hour)
 	latest := now.Add(time.Second)
@@ -1736,12 +1735,17 @@ func TestCountOrders(t *testing.T) {
 	test.AssertNotError(t, err, "Couldn't count new orders for fake reg ID")
 	test.AssertEquals(t, count, 0)
 
+	// Add a pending authorization
+	authz, err := sa.NewPendingAuthorization(ctx, core.Authorization{RegistrationID: reg.ID, Identifier: core.AcmeIdentifier{Type: "dns", Value: "example.com"}, Status: core.StatusPending, Expires: &expires})
+	test.AssertNotError(t, err, "Couldn't create new pending authorization")
+
 	// Add one pending order
+	expiresNano := expires.UnixNano()
 	order, err := sa.NewOrder(ctx, &corepb.Order{
 		RegistrationID: &reg.ID,
-		Expires:        &expires,
+		Expires:        &expiresNano,
 		Names:          []string{"example.com"},
-		Authorizations: []string{"~ ~ [:: AuThOrIzEd ::] ~ ~ "},
+		Authorizations: []string{authz.ID},
 	})
 	test.AssertNotError(t, err, "Couldn't create new pending order")
 
@@ -2033,10 +2037,10 @@ func TestStatusForOrder(t *testing.T) {
 		Name             string
 		AuthorizationIDs []string
 		OrderNames       []string
+		OrderExpires     int64
 		ExpectedStatus   string
 		SetProcessing    bool
 		Finalize         bool
-		Features         []string
 	}{
 		{
 			Name:             "Order with an invalid authz",
@@ -2057,6 +2061,13 @@ func TestStatusForOrder(t *testing.T) {
 			ExpectedStatus:   string(core.StatusDeactivated),
 		},
 		{
+			Name:             "Order that has expired and references a purged expired authz",
+			OrderExpires:     alreadyExpired.UnixNano(),
+			OrderNames:       []string{"missing.your.order.is.up"},
+			AuthorizationIDs: []string{"this does not exist"},
+			ExpectedStatus:   string(core.StatusInvalid),
+		},
+		{
 			Name:             "Order with a pending authz",
 			OrderNames:       []string{"valid.your.order.is.up", "pending.your.order.is.up"},
 			AuthorizationIDs: []string{validAuthz.ID, pendingAuthz.ID},
@@ -2066,7 +2077,7 @@ func TestStatusForOrder(t *testing.T) {
 			Name:             "Order with only valid authzs, not yet processed or finalized",
 			OrderNames:       []string{"valid.your.order.is.up"},
 			AuthorizationIDs: []string{validAuthz.ID},
-			ExpectedStatus:   string(core.StatusPending),
+			ExpectedStatus:   string(core.StatusReady),
 		},
 		{
 			Name:             "Order with only valid authzs, set processing",
@@ -2080,7 +2091,6 @@ func TestStatusForOrder(t *testing.T) {
 			OrderNames:       []string{"valid.your.order.is.up"},
 			AuthorizationIDs: []string{validAuthz.ID},
 			ExpectedStatus:   string(core.StatusReady),
-			Features:         []string{"OrderReadyStatus"},
 		},
 		{
 			Name:             "Order with only valid authzs, set processing",
@@ -2101,18 +2111,17 @@ func TestStatusForOrder(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			if len(tc.Features) > 0 {
-				for _, flag := range tc.Features {
-					_ = features.Set(map[string]bool{flag: true})
-				}
-				defer features.Reset()
-			}
-
 			// Add a new order with the testcase authz IDs
 			processing := false
+			// If the testcase doesn't specify an order expiry use a default timestamp
+			// in the near future.
+			orderExpiry := tc.OrderExpires
+			if orderExpiry == 0 {
+				orderExpiry = expiresNano
+			}
 			newOrder, err := sa.NewOrder(ctx, &corepb.Order{
 				RegistrationID:  &reg.ID,
-				Expires:         &expiresNano,
+				Expires:         &orderExpiry,
 				Authorizations:  tc.AuthorizationIDs,
 				Names:           tc.OrderNames,
 				BeganProcessing: &processing,
@@ -2193,5 +2202,55 @@ func TestGetAuthorizationsFast(t *testing.T) {
 	// We expect getChallenges to be called exactly once for each domain.
 	if challengeFetchCount != 2 {
 		t.Errorf("Wrong challenge fetch count: expected 2, got %d", challengeFetchCount)
+	}
+}
+
+func TestUpdateChallengesPendingOnly(t *testing.T) {
+	sa, fc, cleanUp := initSA(t)
+	defer cleanUp()
+
+	expires := fc.Now().Add(time.Hour)
+	ctx := context.Background()
+
+	// Create a registration to work with
+	reg := satest.CreateWorkingRegistration(t, sa)
+
+	// Create a pending authz
+	input := core.Authorization{
+		RegistrationID: reg.ID,
+		Expires:        &expires,
+		Status:         core.StatusPending,
+		Identifier:     core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "example.com"},
+		Challenges: []core.Challenge{
+			core.Challenge{
+				Type:   "http-01",
+				Status: "pending",
+			},
+		},
+	}
+	authz, err := sa.NewPendingAuthorization(ctx, input)
+	test.AssertNotError(t, err, "Couldn't create new pending authorization")
+
+	authz.Status = core.StatusValid
+	authz.Challenges[0].Status = core.StatusValid
+	err = sa.FinalizeAuthorization(ctx, authz)
+	test.AssertNotError(t, err, "Couldn't finalize pending authorization with ID "+authz.ID)
+
+	tx, err := sa.dbMap.Begin()
+	test.AssertNotError(t, err, "beginning transaction")
+
+	// We shouldn't be able to change a challenge status back to pending once it's
+	// been set to "valid". This update should succeed, but have no effect.
+	authz.Challenges[0].Status = core.StatusPending
+	err = updateChallenges(authz.ID, authz.Challenges, tx)
+	test.AssertNotError(t, err, "updating challenges")
+	err = tx.Commit()
+	test.AssertNotError(t, err, "committing")
+
+	result, err := sa.GetAuthorization(ctx, authz.ID)
+	test.AssertNotError(t, err, "fetching")
+
+	if result.Challenges[0].Status != core.StatusValid {
+		t.Errorf("challenge status was updated when it should not have been allowed to be changed.")
 	}
 }

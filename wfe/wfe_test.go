@@ -26,7 +26,6 @@ import (
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/ctpolicy"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -1647,6 +1646,39 @@ func TestRevokeCertificateWithAuthz(t *testing.T) {
 	test.AssertEquals(t, responseWriter.Body.String(), "")
 }
 
+// An SA mock that always returns a berrors.ServerInternal error for
+// GetAuthorization.
+type mockSAGetAuthzError struct {
+	core.StorageGetter
+}
+
+func (msa *mockSAGetAuthzError) GetAuthorization(ctx context.Context, id string) (core.Authorization, error) {
+	return core.Authorization{}, berrors.InternalServerError("oops")
+}
+
+// TestAuthorization500 tests that internal errors on GetAuthorization result in
+// a 500.
+func TestAuthorization500(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	wfe.SA = &mockSAGetAuthzError{}
+	mux := wfe.Handler()
+
+	responseWriter := httptest.NewRecorder()
+
+	// GET instead of POST should be rejected
+	mux.ServeHTTP(responseWriter, &http.Request{
+		Method: "GET",
+		URL:    mustParseURL(authzPath),
+	})
+	expected := `{
+	  "type": "urn:acme:error:serverInternal",
+		"detail": "Problem getting authorization",
+		"status": 500
+	}`
+	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), expected)
+
+}
+
 func TestAuthorization(t *testing.T) {
 	wfe, _ := setupWFE(t)
 	mux := wfe.Handler()
@@ -1739,7 +1771,7 @@ func TestAuthorization(t *testing.T) {
 		Method: "GET",
 	})
 	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(),
-		`{"type":"`+probs.V1ErrorNS+`malformed","detail":"Unable to find authorization","status":404}`)
+		`{"type":"`+probs.V1ErrorNS+`malformed","detail":"No such authorization","status":404}`)
 }
 
 // TestAuthorizationChallengeNamespace tests that the runtime prefixing of
@@ -2417,7 +2449,6 @@ func TestKeyRollover(t *testing.T) {
 }
 
 func TestPrepChallengeForDisplay(t *testing.T) {
-	_ = features.Set(map[string]bool{"ForceConsistentStatus": true})
 	req := &http.Request{
 		Host: "example.com",
 	}

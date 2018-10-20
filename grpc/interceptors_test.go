@@ -17,7 +17,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/grpc/test_proto"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/test"
@@ -46,7 +45,7 @@ func TestServerInterceptor(t *testing.T) {
 	si := newServerInterceptor(serverMetrics, clock.NewFake())
 
 	md := metadata.New(map[string]string{clientRequestTimeKey: "0"})
-	ctxWithMetadata := metadata.NewContext(context.Background(), md)
+	ctxWithMetadata := metadata.NewIncomingContext(context.Background(), md)
 
 	_, err := si.intercept(context.Background(), nil, nil, testHandler)
 	test.AssertError(t, err, "si.intercept didn't fail with a context missing metadata")
@@ -124,8 +123,6 @@ func (s *testServer) Chill(ctx context.Context, in *test_proto.Time) (*test_prot
 }
 
 func TestTimeouts(t *testing.T) {
-	_ = features.Set(map[string]bool{"RPCHeadroom": true})
-	defer features.Reset()
 	// start server
 	lis, err := net.Listen("tcp", ":0")
 	if err != nil {

@@ -193,7 +193,7 @@ func NewDNSClientImpl(
 			Help:    "Time taken to perform a DNS query",
 			Buckets: metrics.InternetFacingBuckets,
 		},
-		[]string{"qtype", "result", "authenticated_data"},
+		[]string{"qtype", "result", "authenticated_data", "resolver"},
 	)
 	totalLookupTime := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -201,14 +201,14 @@ func NewDNSClientImpl(
 			Help:    "Time taken to perform a DNS lookup, including all retried queries",
 			Buckets: metrics.InternetFacingBuckets,
 		},
-		[]string{"qtype", "result", "authenticated_data", "retries"},
+		[]string{"qtype", "result", "authenticated_data", "retries", "resolver"},
 	)
 	timeoutCounter := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "dns_timeout",
 			Help: "Counter of various types of DNS query timeouts",
 		},
-		[]string{"qtype", "type"},
+		[]string{"qtype", "type", "resolver"},
 	)
 	stats.MustRegister(queryTime, totalLookupTime, timeoutCounter)
 
@@ -258,7 +258,8 @@ func (dnsClient *DNSClientImpl) exchangeOne(ctx context.Context, hostname string
 	}
 
 	// Randomly pick a server
-	chosenServer := dnsClient.servers[rand.Intn(len(dnsClient.servers))]
+	chosenServerIndex := rand.Intn(len(dnsClient.servers))
+	chosenServer := dnsClient.servers[chosenServerIndex]
 
 	start := dnsClient.clk.Now()
 	client := dnsClient.dnsClient
@@ -275,6 +276,7 @@ func (dnsClient *DNSClientImpl) exchangeOne(ctx context.Context, hostname string
 			"result":             result,
 			"authenticated_data": authenticated,
 			"retries":            strconv.Itoa(tries),
+			"resolver":           chosenServer,
 		}).Observe(dnsClient.clk.Since(start).Seconds())
 	}()
 	for {
@@ -291,17 +293,30 @@ func (dnsClient *DNSClientImpl) exchangeOne(ctx context.Context, hostname string
 				"qtype":              qtypeStr,
 				"result":             result,
 				"authenticated_data": authenticated,
+				"resolver":           chosenServer,
 			}).Observe(rtt.Seconds())
 			ch <- dnsResp{m: rsp, err: err}
 		}()
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
-				dnsClient.timeoutCounter.With(prometheus.Labels{"qtype": qtypeStr, "type": "deadline exceeded"}).Inc()
+				dnsClient.timeoutCounter.With(prometheus.Labels{
+					"qtype":    qtypeStr,
+					"type":     "deadline exceeded",
+					"resolver": chosenServer,
+				}).Inc()
 			} else if ctx.Err() == context.Canceled {
-				dnsClient.timeoutCounter.With(prometheus.Labels{"qtype": qtypeStr, "type": "canceled"}).Inc()
+				dnsClient.timeoutCounter.With(prometheus.Labels{
+					"qtype":    qtypeStr,
+					"type":     "canceled",
+					"resolver": chosenServer,
+				}).Inc()
 			} else {
-				dnsClient.timeoutCounter.With(prometheus.Labels{"qtype": qtypeStr, "type": "unknown"}).Inc()
+				dnsClient.timeoutCounter.With(prometheus.Labels{
+					"qtype":    qtypeStr,
+					"type":     "unknown",
+					"resolver": chosenServer,
+				}).Inc()
 			}
 			err = ctx.Err()
 			return
@@ -312,9 +327,19 @@ func (dnsClient *DNSClientImpl) exchangeOne(ctx context.Context, hostname string
 				hasRetriesLeft := tries < dnsClient.maxTries
 				if isRetryable && hasRetriesLeft {
 					tries++
+					// Chose a new server to retry the query with by incrementing the
+					// chosen server index modulo the number of servers. This ensures that
+					// if one dns server isn't available we retry with the next in the
+					// list.
+					chosenServerIndex = (chosenServerIndex + 1) % len(dnsClient.servers)
+					chosenServer = dnsClient.servers[chosenServerIndex]
 					continue
 				} else if isRetryable && !hasRetriesLeft {
-					dnsClient.timeoutCounter.With(prometheus.Labels{"qtype": qtypeStr, "type": "out of retries"}).Inc()
+					dnsClient.timeoutCounter.With(prometheus.Labels{
+						"qtype":    qtypeStr,
+						"type":     "out of retries",
+						"resolver": chosenServer,
+					}).Inc()
 				}
 			}
 			resp, err = r.m, r.err

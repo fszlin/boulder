@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 )
 
 const (
@@ -46,35 +45,33 @@ func (si *serverInterceptor) intercept(ctx context.Context, req interface{}, inf
 	// Extract the grpc metadata from the context. If the context has
 	// a `clientRequestTimeKey` field, and it has a value, then observe the RPC
 	// latency with Prometheus.
-	if md, ok := metadata.FromContext(ctx); ok && len(md[clientRequestTimeKey]) > 0 {
+	if md, ok := metadata.FromIncomingContext(ctx); ok && len(md[clientRequestTimeKey]) > 0 {
 		if err := si.observeLatency(md[clientRequestTimeKey][0]); err != nil {
 			return nil, err
 		}
 	}
 
-	if features.Enabled(features.RPCHeadroom) {
-		// Shave 20 milliseconds off the deadline to ensure that if the RPC server times
-		// out any sub-calls it makes (like DNS lookups, or onwards RPCs), it has a
-		// chance to report that timeout to the client. This allows for more specific
-		// errors, e.g "the VA timed out looking up CAA for example.com" (when called
-		// from RA.NewCertificate, which was called from WFE.NewCertificate), as
-		// opposed to "RA.NewCertificate timed out" (causing a 500).
-		// Once we've shaved the deadline, we ensure we have we have at least another
-		// 100ms left to do work; otherwise we abort early.
-		deadline, ok := ctx.Deadline()
-		// Should never happen: there was no deadline.
-		if !ok {
-			deadline = time.Now().Add(100 * time.Second)
-		}
-		deadline = deadline.Add(-returnOverhead)
-		remaining := deadline.Sub(time.Now())
-		if remaining < meaningfulWorkOverhead {
-			return nil, grpc.Errorf(codes.DeadlineExceeded, "not enough time left on clock: %s", remaining)
-		}
-		var cancel func()
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+	// Shave 20 milliseconds off the deadline to ensure that if the RPC server times
+	// out any sub-calls it makes (like DNS lookups, or onwards RPCs), it has a
+	// chance to report that timeout to the client. This allows for more specific
+	// errors, e.g "the VA timed out looking up CAA for example.com" (when called
+	// from RA.NewCertificate, which was called from WFE.NewCertificate), as
+	// opposed to "RA.NewCertificate timed out" (causing a 500).
+	// Once we've shaved the deadline, we ensure we have we have at least another
+	// 100ms left to do work; otherwise we abort early.
+	deadline, ok := ctx.Deadline()
+	// Should never happen: there was no deadline.
+	if !ok {
+		deadline = time.Now().Add(100 * time.Second)
 	}
+	deadline = deadline.Add(-returnOverhead)
+	remaining := deadline.Sub(time.Now())
+	if remaining < meaningfulWorkOverhead {
+		return nil, grpc.Errorf(codes.DeadlineExceeded, "not enough time left on clock: %s", remaining)
+	}
+	var cancel func()
+	ctx, cancel = context.WithDeadline(ctx, deadline)
+	defer cancel()
 
 	resp, err := si.metrics.grpcMetrics.UnaryServerInterceptor()(ctx, req, info, handler)
 	if err != nil {
@@ -157,7 +154,7 @@ func (ci *clientInterceptor) intercept(
 	// Initialize it with the request time.
 	reqMD := metadata.New(map[string]string{clientRequestTimeKey: nowTS})
 	// Configure the localCtx with the metadata so it gets sent along in the request
-	localCtx = metadata.NewContext(localCtx, reqMD)
+	localCtx = metadata.NewOutgoingContext(localCtx, reqMD)
 
 	// Create a grpc/metadata.Metadata instance for a grpc.Trailer.
 	respMD := metadata.New(nil)

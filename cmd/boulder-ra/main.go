@@ -4,10 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
-	"github.com/letsencrypt/boulder/bdns"
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/ctpolicy"
@@ -33,12 +31,6 @@ type config struct {
 
 		// UseIsSafeDomain determines whether to call VA.IsSafeDomain
 		UseIsSafeDomain bool // TODO: remove after va IsSafeDomain deploy
-
-		// The number of times to try a DNS query (that has a temporary error)
-		// before giving up. May be short-circuited by deadlines. A zero value
-		// will be turned into 1.
-		DNSTries     int
-		DNSResolvers []string
 
 		SAService        *cmd.GRPCClientConfig
 		VAService        *cmd.GRPCClientConfig
@@ -92,12 +84,6 @@ type config struct {
 	PA cmd.PAConfig
 
 	Syslog cmd.SyslogConfig
-
-	Common struct {
-		DNSResolver               string
-		DNSTimeout                string
-		DNSAllowLoopbackAddresses bool
-	}
 }
 
 func main() {
@@ -175,18 +161,15 @@ func main() {
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to Publisher")
 	pubc = bgrpc.NewPublisherClientWrapper(pubPB.NewPublisherClient(conn))
 
-	if c.RA.CTLogGroups != nil {
-		groups := make([]cmd.CTGroup, len(c.RA.CTLogGroups))
-		for i, logs := range c.RA.CTLogGroups {
-			groups[i] = cmd.CTGroup{
-				Name: strconv.Itoa(i),
-				Logs: logs,
+	for _, g := range c.RA.CTLogGroups2 {
+		for _, l := range g.Logs {
+			if l.TemporalSet != nil {
+				err := l.Setup()
+				cmd.FailOnError(err, "Failed to setup a temporal log set")
 			}
 		}
-		ctp = ctpolicy.New(pubc, groups, nil, logger, scope)
-	} else if c.RA.CTLogGroups2 != nil {
-		ctp = ctpolicy.New(pubc, c.RA.CTLogGroups2, c.RA.InformationalCTLogs, logger, scope)
 	}
+	ctp = ctpolicy.New(pubc, c.RA.CTLogGroups2, c.RA.InformationalCTLogs, logger, scope)
 
 	saConn, err := bgrpc.ClientSetup(c.RA.SAService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
@@ -231,31 +214,6 @@ func main() {
 	policyErr := rai.SetRateLimitPoliciesFile(c.RA.RateLimitPoliciesFilename)
 	cmd.FailOnError(policyErr, "Couldn't load rate limit policies file")
 	rai.PA = pa
-
-	raDNSTimeout, err := time.ParseDuration(c.Common.DNSTimeout)
-	cmd.FailOnError(err, "Couldn't parse RA DNS timeout")
-	dnsTries := c.RA.DNSTries
-	if dnsTries < 1 {
-		dnsTries = 1
-	}
-	if len(c.Common.DNSResolver) != 0 {
-		c.RA.DNSResolvers = append(c.RA.DNSResolvers, c.Common.DNSResolver)
-	}
-	if !c.Common.DNSAllowLoopbackAddresses {
-		rai.DNSClient = bdns.NewDNSClientImpl(
-			raDNSTimeout,
-			c.RA.DNSResolvers,
-			scope,
-			clk,
-			dnsTries)
-	} else {
-		rai.DNSClient = bdns.NewTestDNSClientImpl(
-			raDNSTimeout,
-			c.RA.DNSResolvers,
-			scope,
-			clk,
-			dnsTries)
-	}
 
 	rai.VA = vac
 	rai.CA = cac

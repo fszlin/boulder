@@ -149,12 +149,25 @@ func updateChallenges(authID string, challenges []core.Challenge, tx *gorp.Trans
 		return fmt.Errorf("Invalid number of challenges provided")
 	}
 	for i, authChall := range challenges {
-		chall, err := challengeToModel(&authChall, challs[i].AuthorizationID)
+		if challs[i].AuthorizationID != authID {
+			return fmt.Errorf("challenge authorization ID %q didn't match associated authorization ID %q", challs[i].AuthorizationID, authID)
+		}
+		chall, err := challengeToModel(&authChall, authID)
 		if err != nil {
 			return err
 		}
 		chall.ID = challs[i].ID
-		_, err = tx.Update(chall)
+		_, err = tx.Exec(
+			`UPDATE challenges SET
+				status = ?,
+				error = ?,
+				validationRecord = ?
+			WHERE status = ? AND id = ?`,
+			string(chall.Status),
+			chall.Error,
+			chall.ValidationRecord,
+			string(core.StatusPending),
+			chall.ID)
 		if err != nil {
 			return err
 		}
@@ -514,7 +527,6 @@ func (ssa *SQLStorageAuthority) countCertificates(domain string, earliest, lates
 		for _, s := range serials {
 			serialMap[s] = struct{}{}
 		}
-
 		return len(serialMap), nil
 	}
 }
@@ -782,13 +794,13 @@ func (ssa *SQLStorageAuthority) UpdatePendingAuthorization(ctx context.Context, 
 	}
 
 	if !existingPending(tx, authz.ID) {
-		err = berrors.InternalServerError("authorization with ID '%d' not found", authz.ID)
+		err = berrors.InternalServerError("authorization with ID '%s' not found", authz.ID)
 		return Rollback(tx, err)
 	}
 
 	_, err = selectPendingAuthz(tx, "WHERE id = ?", authz.ID)
 	if err == sql.ErrNoRows {
-		err = berrors.InternalServerError("authorization with ID '%d' not found", authz.ID)
+		err = berrors.InternalServerError("authorization with ID '%s' not found", authz.ID)
 		return Rollback(tx, err)
 	}
 	if err != nil {
@@ -933,11 +945,17 @@ func (ssa *SQLStorageAuthority) AddCertificate(
 	// https://github.com/letsencrypt/boulder/issues/2265 for more
 	err = tx.Insert(cert)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "Error 1062: Duplicate entry") {
+			err = berrors.DuplicateError("cannot add a duplicate cert")
+		}
 		return "", Rollback(tx, err)
 	}
 
 	err = tx.Insert(certStatus)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "Error 1062: Duplicate entry") {
+			err = berrors.DuplicateError("cannot add a duplicate cert status")
+		}
 		return "", Rollback(tx, err)
 	}
 
@@ -1422,24 +1440,13 @@ func (ssa *SQLStorageAuthority) NewOrder(ctx context.Context, req *corepb.Order)
 	processingStatus := false
 	req.BeganProcessing = &processingStatus
 
-	// If the OrderReadyStatus feature is enabled we need to calculate the order
-	// status before returning it. Since it may have reused all valid
-	// authorizations the order may be "born" in a ready status.
-	if features.Enabled(features.OrderReadyStatus) {
-		// Calculate the status for the order
-		status, err := ssa.statusForOrder(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		req.Status = &status
-	} else {
-		// Update the request with pending status (No need to calculate the status
-		// based on authzs here, we know a brand new order is always pending when
-		// features.OrderReadyStatus isn't enabled)
-		pendingStatus := string(core.StatusPending)
-		req.Status = &pendingStatus
+	// Calculate the order status before returning it. Since it may have reused all
+	// valid authorizations the order may be "born" in a ready status.
+	status, err := ssa.statusForOrder(ctx, req)
+	if err != nil {
+		return nil, err
 	}
-	// Return the new order
+	req.Status = &status
 	return req, nil
 }
 
@@ -1622,13 +1629,23 @@ func (ssa *SQLStorageAuthority) GetOrder(ctx context.Context, req *sapb.OrderReq
 //   * If all of the order's authorizations are valid, and we have began
 //     processing, but there is no certificate serial, the order is processing.
 //   * If all of the order's authorizations are valid, and we haven't begun
-//     processing, then the order is status ready (if
-//     `features.OrderReadyStatus` is enabled) or status processing otherwise.
-//     In both cases it is awaiting a finalization request.
+//     processing, then the order is status ready.
 // An error is returned for any other case.
 func (ssa *SQLStorageAuthority) statusForOrder(ctx context.Context, order *corepb.Order) (string, error) {
 	// Without any further work we know an order with an error is invalid
 	if order.Error != nil {
+		return string(core.StatusInvalid), nil
+	}
+
+	// If the order is expired the status is invalid and we don't need to get
+	// order authorizations. Its important to exit early in this case because an
+	// order that references an expired authorization will be itself have been
+	// expired (because we match the order expiry to the associated authz expiries
+	// in ra.NewOrder), and expired authorizations may be purged from the DB.
+	// Because of this purging fetching the authz's for an expired order may
+	// return fewer authz objects than expected, triggering a 500 error response.
+	orderExpiry := time.Unix(0, *order.Expires)
+	if orderExpiry.Before(ssa.clk.Now()) {
 		return string(core.StatusInvalid), nil
 	}
 
@@ -1720,17 +1737,8 @@ func (ssa *SQLStorageAuthority) statusForOrder(ctx context.Context, order *corep
 		return string(core.StatusProcessing), nil
 	}
 
-	// If the order is fully authorized, and we haven't begun processing it, then
-	// the order is pending finalization and either status ready or status pending
-	// depending on the `OrderReadyStatus` feature flag. Historically we used
-	// "Pending" for this state but the ACME specification > draft-10 uses a new
-	// "Ready" state.
 	if fullyAuthorized && order.BeganProcessing != nil && !*order.BeganProcessing {
-		if features.Enabled(features.OrderReadyStatus) {
-			return string(core.StatusReady), nil
-		} else {
-			return string(core.StatusPending), nil
-		}
+		return string(core.StatusReady), nil
 	}
 
 	return "", berrors.InternalServerError(
@@ -2017,16 +2025,13 @@ func (ssa *SQLStorageAuthority) GetAuthorizations(
 		authzMap[name] = a
 	}
 
-	// WildcardDomain issuance requires that the authorizations returned by this
+	// Wildcard domain issuance requires that the authorizations returned by this
 	// RPC also include populated challenges such that the caller can know if the
 	// challenges meet the wildcard issuance policy (e.g. only 1 DNS-01
-	// challenge). We use a feature flag check here in case this causes
-	// performance regressions.
-	if features.Enabled(features.WildcardDomains) {
-		// Fetch each of the authorizations' associated challenges
-		for _, authz := range authzMap {
-			authz.Challenges, err = ssa.getChallenges(authz.ID)
-		}
+	// challenge).
+	// Fetch each of the authorizations' associated challenges
+	for _, authz := range authzMap {
+		authz.Challenges, err = ssa.getChallenges(authz.ID)
 	}
 	return authzMapToPB(authzMap)
 }
