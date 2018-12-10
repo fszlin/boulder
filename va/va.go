@@ -23,18 +23,18 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
-
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/canceled"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
+	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/probs"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -80,6 +80,9 @@ type vaMetrics struct {
 	validationTime           *prometheus.HistogramVec
 	remoteValidationTime     *prometheus.HistogramVec
 	remoteValidationFailures prometheus.Counter
+	tlsALPNOIDCounter        *prometheus.CounterVec
+	http01Fallbacks          prometheus.Counter
+	http01Redirects          prometheus.Counter
 }
 
 func initMetrics(stats metrics.Scope) *vaMetrics {
@@ -105,11 +108,34 @@ func initMetrics(stats metrics.Scope) *vaMetrics {
 			Help: "Number of validations failed due to remote VAs returning failure",
 		})
 	stats.MustRegister(remoteValidationFailures)
+	tlsALPNOIDCounter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tls_alpn_oid_usage",
+			Help: "Number of TLS ALPN validations using either of the two OIDs",
+		},
+		[]string{"oid"},
+	)
+	stats.MustRegister(tlsALPNOIDCounter)
+	http01Fallbacks := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "http01_fallbacks",
+			Help: "Number of IPv6 to IPv4 HTTP-01 fallback requests made",
+		})
+	stats.MustRegister(http01Fallbacks)
+	http01Redirects := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "http01_redirects",
+			Help: "Number of HTTP-01 redirects followed",
+		})
+	stats.MustRegister(http01Redirects)
 
 	return &vaMetrics{
 		validationTime:           validationTime,
 		remoteValidationTime:     remoteValidationTime,
 		remoteValidationFailures: remoteValidationFailures,
+		tlsALPNOIDCounter:        tlsALPNOIDCounter,
+		http01Fallbacks:          http01Fallbacks,
+		http01Redirects:          http01Redirects,
 	}
 }
 
@@ -185,8 +211,8 @@ type verificationRequestEvent struct {
 	Hostname          string                  `json:",omitempty"`
 	ValidationRecords []core.ValidationRecord `json:",omitempty"`
 	Challenge         core.Challenge          `json:",omitempty"`
-	ValidationLatency time.Duration           `json:",omitempty"`
-	Error             string                  `json:",omitempty"`
+	ValidationLatency float64
+	Error             string `json:",omitempty"`
 }
 
 // getAddr will query for all A/AAAA records associated with hostname and return
@@ -423,6 +449,12 @@ func (va *ValidationAuthorityImpl) fetchHTTP(ctx context.Context, identifier cor
 			req.Header["User-Agent"] = []string{va.userAgent}
 		}
 
+		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+			return berrors.ConnectionFailureError(
+				"Invalid protocol scheme in redirect target. "+
+					`Only "http" and "https" protocol schemes are supported, not %q`, req.URL.Scheme)
+		}
+
 		urlHost = req.URL.Host
 		reqHost := req.URL.Host
 		var reqPort int
@@ -441,6 +473,13 @@ func (va *ValidationAuthorityImpl) fetchHTTP(ctx context.Context, identifier cor
 			reqPort = va.httpsPort
 		} else {
 			reqPort = va.httpPort
+		}
+
+		// We do not want to redirect to any bare IP addresses. Only domain names
+		if net.ParseIP(reqHost) != nil {
+			return berrors.ConnectionFailureError(
+				"Invalid host in redirect target %q. "+
+					"Only domain names are supported, not IP addresses", reqHost)
 		}
 
 		// Since we've used dialer.DialContext we need to drain the address info
@@ -526,6 +565,9 @@ func certNames(cert *x509.Certificate) []string {
 	}
 	names = append(names, cert.DNSNames...)
 	names = core.UniqueLowerNames(names)
+	for i, n := range names {
+		names[i] = replaceInvalidUTF8([]byte(n))
+	}
 	return names
 }
 
@@ -623,7 +665,7 @@ func (va *ValidationAuthorityImpl) getTLSCerts(
 	va.log.Info(fmt.Sprintf("%s [%s] Attempting to validate for %s %s", challenge.Type, identifier, hostPort, config.ServerName))
 	// We expect a self-signed challenge certificate, do not verify it here.
 	config.InsecureSkipVerify = true
-	conn, err := tlsDial(ctx, hostPort, config)
+	conn, err := va.tlsDial(ctx, hostPort, config)
 
 	if err != nil {
 		va.log.Infof("%s connection failure for %s. err=[%#v] errStr=[%s]", challenge.Type, identifier, err, err)
@@ -649,7 +691,7 @@ func (va *ValidationAuthorityImpl) getTLSCerts(
 
 // tlsDial does the equivalent of tls.Dial, but obeying a context. Once
 // tls.DialContextWithDialer is available, switch to that.
-func tlsDial(ctx context.Context, hostPort string, config *tls.Config) (*tls.Conn, error) {
+func (va *ValidationAuthorityImpl) tlsDial(ctx context.Context, hostPort string, config *tls.Config) (*tls.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, singleDialTimeout)
 	defer cancel()
 	dialer := &net.Dialer{}
@@ -657,18 +699,16 @@ func tlsDial(ctx context.Context, hostPort string, config *tls.Config) (*tls.Con
 	if err != nil {
 		return nil, err
 	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		va.log.AuditErr("tlsDial was called without a deadline")
+		return nil, fmt.Errorf("tlsDial was called without a deadline")
+	}
+	_ = netConn.SetDeadline(deadline)
 	conn := tls.Client(netConn, config)
-	errChan := make(chan error)
-	go func() {
-		errChan <- conn.Handshake()
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case err := <-errChan:
-		if err != nil {
-			return nil, err
-		}
+	err = conn.Handshake()
+	if err != nil {
+		return nil, err
 	}
 	return conn, nil
 }
@@ -681,7 +721,14 @@ func (va *ValidationAuthorityImpl) validateHTTP01(ctx context.Context, identifie
 
 	// Perform the fetch
 	path := fmt.Sprintf(".well-known/acme-challenge/%s", challenge.Token)
-	body, validationRecords, prob := va.fetchHTTP(ctx, identifier, path, false, challenge)
+	var body []byte
+	var validationRecords []core.ValidationRecord
+	var prob *probs.ProblemDetails
+	if features.Enabled(features.SimplifiedVAHTTP) {
+		body, validationRecords, prob = va.fetchHTTPSimple(ctx, identifier.Value, "/"+path)
+	} else {
+		body, validationRecords, prob = va.fetchHTTP(ctx, identifier, path, false, challenge)
+	}
 	if prob != nil {
 		return validationRecords, prob
 	}
@@ -753,6 +800,11 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 	h := sha256.Sum256([]byte(challenge.ProvidedKeyAuthorization))
 	for _, ext := range leafCert.Extensions {
 		if IdPeAcmeIdentifier.Equal(ext.Id) || IdPeAcmeIdentifierV1Obsolete.Equal(ext.Id) {
+			if IdPeAcmeIdentifier.Equal(ext.Id) {
+				va.metrics.tlsALPNOIDCounter.WithLabelValues(IdPeAcmeIdentifier.String()).Inc()
+			} else {
+				va.metrics.tlsALPNOIDCounter.WithLabelValues(IdPeAcmeIdentifierV1Obsolete.String()).Inc()
+			}
 			if !ext.Critical {
 				errText := fmt.Sprintf("Incorrect validation certificate for %s challenge. "+
 					"acmeValidationV1 extension not critical.", core.ChallengeTypeTLSALPN01)
@@ -767,7 +819,7 @@ func (va *ValidationAuthorityImpl) validateTLSALPN01(ctx context.Context, identi
 			}
 			if subtle.ConstantTimeCompare(h[:], extValue) != 1 {
 				errText := fmt.Sprintf("Incorrect validation certificate for %s challenge. "+
-					"Invalid acmeValidationV1 extension value. %x - %x", core.ChallengeTypeTLSALPN01, h[:], ext.Value)
+					"Invalid acmeValidationV1 extension value.", core.ChallengeTypeTLSALPN01)
 				return validationRecords, probs.Unauthorized(errText)
 			}
 			return validationRecords, nil
@@ -819,14 +871,17 @@ func detailedError(err error) *probs.ProblemDetails {
 		} else if netErr.Timeout() && netErr.Op == "dial" {
 			return probs.ConnectionFailure("Timeout during connect (likely firewall problem)")
 		} else if netErr.Timeout() {
-			return probs.ConnectionFailure("Timeout during %s (your server may be slow or overloaded1)", netErr.Op)
+			return probs.ConnectionFailure("Timeout during %s (your server may be slow or overloaded)", netErr.Op)
 		}
 	}
 	if err, ok := err.(net.Error); ok && err.Timeout() {
-		return probs.ConnectionFailure("Timeout after connect (your server may be slow or overloaded2)")
+		return probs.ConnectionFailure("Timeout after connect (your server may be slow or overloaded)")
 	}
 	if berrors.Is(err, berrors.ConnectionFailure) {
 		return probs.ConnectionFailure(err.Error())
+	}
+	if berrors.Is(err, berrors.Unauthorized) {
+		return probs.Unauthorized(err.Error())
 	}
 
 	return probs.ConnectionFailure("Error getting validation data")
@@ -1081,7 +1136,7 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, domain
 	logEvent.Challenge = challenge
 
 	validationLatency := time.Since(vStart)
-	logEvent.ValidationLatency = validationLatency
+	logEvent.ValidationLatency = validationLatency.Round(time.Millisecond).Seconds()
 
 	va.metrics.validationTime.With(prometheus.Labels{
 		"type":        string(challenge.Type),
@@ -1091,6 +1146,17 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, domain
 
 	va.log.AuditObject("Validation result", logEvent)
 	va.log.Infof("Validations: %+v", authz)
+
+	// Try to marshal the validation results and prob (if any) to protocol
+	// buffers. We log at this layer instead of leaving it up to gRPC because gRPC
+	// doesn't log the actual contents that failed to marshal, making it hard to
+	// figure out what's broken.
+	if _, err := bgrpc.ValidationResultToPB(records, prob); err != nil {
+		va.log.Errf(
+			"failed to marshal records %#v and prob %#v to protocol buffer: %v",
+			records, prob, err)
+	}
+
 	if prob == nil {
 		// This is necessary because if we just naively returned prob, it would be a
 		// non-nil interface value containing a nil pointer, rather than a nil

@@ -16,13 +16,10 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
-	jose "gopkg.in/square/go-jose.v2"
-
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
+	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
@@ -34,6 +31,9 @@ import (
 	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/web"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/net/context"
+	jose "gopkg.in/square/go-jose.v2"
 )
 
 // Paths are the ACME-spec identified URL path-segments for various methods.
@@ -983,35 +983,70 @@ func (wfe *WebFrontEndImpl) postChallenge(
 		return
 	}
 
-	// NOTE(@cpu): Historically a challenge update needed to include
-	// a KeyAuthorization field. This is no longer the case, since both sides can
-	// calculate the key authorization as needed. We unmarshal here only to check
-	// that the POST body is valid JSON. Any data/fields included are ignored to
-	// be kind to ACMEv2 implementations that still send a key authorization.
-	var challengeUpdate struct{}
-	if err := json.Unmarshal(body, &challengeUpdate); err != nil {
-		wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling challenge response"), err)
-		return
+	// We can expect some clients to try and update a challenge for an authorization
+	// that is already valid. In this case we don't need to process the challenge
+	// update. It wouldn't be helpful, the overall authorization is already good! We
+	// increment a stat for this case and return early.
+	var returnAuthz core.Authorization
+	if authz.Status == core.StatusValid {
+		wfe.scope.Inc("ReusedValidAuthzChallengeWFE", 1)
+		returnAuthz = authz
+	} else {
+
+		// NOTE(@cpu): Historically a challenge update needed to include
+		// a KeyAuthorization field. This is no longer the case, since both sides can
+		// calculate the key authorization as needed. We unmarshal here only to check
+		// that the POST body is valid JSON. Any data/fields included are ignored to
+		// be kind to ACMEv2 implementations that still send a key authorization.
+		var challengeUpdate struct{}
+		if err := json.Unmarshal(body, &challengeUpdate); err != nil {
+			wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling challenge response"), err)
+			return
+		}
+
+		authzPB, err := bgrpc.AuthzToPB(authz)
+		if err != nil {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to serialize authz"), err)
+			return
+		}
+		challIndex := int64(challengeIndex)
+
+		// Ask the RA to update this authorization. Use the RA's PerformValidation
+		// RPC if the feature flag is enabled, otherwise use the legacy
+		// UpdateAuthorization RPC.
+		if features.Enabled(features.PerformValidationRPC) {
+			authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
+				Authz:          authzPB,
+				ChallengeIndex: &challIndex,
+			})
+			if err != nil {
+				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
+				return
+			}
+			updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
+			if err != nil {
+				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
+				return
+			}
+			returnAuthz = updatedAuthz
+		} else {
+			returnAuthz, err = wfe.RA.UpdateAuthorization(ctx, authz, challengeIndex, core.Challenge{})
+			if err != nil {
+				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
+				return
+			}
+		}
 	}
 
-	// Ask the RA to update this authorization. Send an empty `core.Challenge{}`
-	// as the challenge update because we do not care about the KeyAuthorization
-	// (if any) sent in the challengeUpdate.
-	updatedAuthorization, err := wfe.RA.UpdateAuthorization(ctx, authz, challengeIndex, core.Challenge{})
-	if err != nil {
-		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
-		return
-	}
-
-	// assumption: UpdateAuthorization does not modify order of challenges
-	challenge := updatedAuthorization.Challenges[challengeIndex]
+	// assumption: PerformValidation does not modify order of challenges
+	challenge := returnAuthz.Challenges[challengeIndex]
 	wfe.prepChallengeForDisplay(request, authz, &challenge)
 
 	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
 	response.Header().Add("Location", challenge.URL)
 	response.Header().Add("Link", link(authzURL, "up"))
 
-	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, challenge)
+	err := wfe.writeJsonResponse(response, logEvent, http.StatusOK, challenge)
 	if err != nil {
 		// ServerInternal because we made the challenges, they should be OK
 		wfe.sendError(response, logEvent, probs.ServerInternal("Failed to marshal challenge"), err)

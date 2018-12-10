@@ -30,10 +30,6 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/jmhodges/clock"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
-	"gopkg.in/square/go-jose.v2"
-
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -43,6 +39,9 @@ import (
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test"
 	vaPB "github.com/letsencrypt/boulder/va/proto"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/net/context"
+	"gopkg.in/square/go-jose.v2"
 )
 
 func bigIntFromB64(b64 string) *big.Int {
@@ -630,6 +629,32 @@ func TestTLSSNI01Invalid(t *testing.T) {
 	}
 }
 
+// TestTLSSNI01BadUTFSrv tests that validating TLS-SNI-01 against
+// a host that returns a certificate with a SAN/CN that contains invalid UTF-8
+// will result in a problem with the invalid UTF-8 replaced.
+func TestTLSSNI01BadUTFSrv(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	hs := tlssniSrvWithNames(t, chall, "localhost", "\xf0\x28\x8c\xbc")
+	port := getPort(hs)
+	va, _ := setup(hs, 0)
+
+	// Construct the zName so we know what to expect in the error message
+	h := sha256.Sum256([]byte(chall.ProvidedKeyAuthorization))
+	z := hex.EncodeToString(h[:])
+	zName := fmt.Sprintf("%s.%s.acme.invalid", z[:32], z[32:])
+
+	_, prob := va.validateTLSSNI01(ctx, dnsi("localhost"), chall)
+	if prob == nil {
+		t.Fatalf("TLS-SNI-01 validation should have failed.")
+	}
+	test.AssertEquals(t, prob.Type, probs.UnauthorizedProblem)
+	test.AssertEquals(t, prob.Detail, fmt.Sprintf(
+		"Incorrect validation certificate for tls-sni-01 challenge. "+
+			"Requested %s from 127.0.0.1:%d. Received 1 certificate(s), "+
+			`first certificate had names "localhost, %s"`,
+		zName, port, "\ufffd(\ufffd\ufffd"))
+}
+
 func slowTLSSrv() *httptest.Server {
 	server := httptest.NewUnstartedServer(http.DefaultServeMux)
 	server.TLS = &tls.Config{
@@ -672,7 +697,7 @@ func TestTLSSNI01TimeoutAfterConnect(t *testing.T) {
 		t.Fatalf("Connection should've timed out")
 	}
 	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
-	expected := "Timeout after connect (your server may be slow or overloaded)"
+	expected := "Timeout during read (your server may be slow or overloaded)"
 	if prob.Detail != expected {
 		t.Errorf("Wrong error detail. Expected %q, got %q", expected, prob.Detail)
 	}
@@ -838,11 +863,13 @@ func TestCertNames(t *testing.T) {
 		"hello.world", "goodbye.world",
 		"bonjour.le.monde", "au.revoir.le.monde",
 		"bonjour.le.monde", "au.revoir.le.monde",
+		"f\xffoo", "f\xffoo",
 	}
-	// We expect only unique names, in sorted order
+	// We expect only unique names, in sorted order and with any invalid utf-8
+	// replaced.
 	expected := []string{
 		"au.revoir.le.monde", "bonjour.le.monde",
-		"goodbye.world", "hello.world",
+		"f\ufffdoo", "goodbye.world", "hello.world",
 	}
 	template := &x509.Certificate{
 		SerialNumber:          big.NewInt(1337),
@@ -987,10 +1014,10 @@ func TestValidateTLSALPN01(t *testing.T) {
 	va, _ := setup(hs, 0)
 
 	_, prob := va.validateChallenge(ctx, dnsi("localhost"), chall)
-
 	if prob != nil {
 		t.Errorf("Validation failed: %v", prob)
 	}
+	test.AssertEquals(t, test.CountCounterVec("oid", IdPeAcmeIdentifier.String(), va.metrics.tlsALPNOIDCounter), 1)
 
 	hs.Close()
 	chall = createChallenge(core.ChallengeTypeTLSALPN01)
@@ -999,10 +1026,10 @@ func TestValidateTLSALPN01(t *testing.T) {
 	va, _ = setup(hs, 0)
 
 	_, prob = va.validateChallenge(ctx, dnsi("localhost"), chall)
-
 	if prob != nil {
 		t.Errorf("Validation failed: %v", prob)
 	}
+	test.AssertEquals(t, test.CountCounterVec("oid", IdPeAcmeIdentifierV1Obsolete.String(), va.metrics.tlsALPNOIDCounter), 1)
 }
 
 func TestValidateTLSALPN01BadChallenge(t *testing.T) {
@@ -1022,7 +1049,7 @@ func TestValidateTLSALPN01BadChallenge(t *testing.T) {
 }
 
 func TestValidateTLSALPN01BrokenSrv(t *testing.T) {
-	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	chall := createChallenge(core.ChallengeTypeTLSALPN01)
 	hs := brokenTLSSrv()
 
 	va, _ := setup(hs, 0)
@@ -1035,7 +1062,7 @@ func TestValidateTLSALPN01BrokenSrv(t *testing.T) {
 }
 
 func TestValidateTLSALPN01UnawareSrv(t *testing.T) {
-	chall := createChallenge(core.ChallengeTypeTLSSNI01)
+	chall := createChallenge(core.ChallengeTypeTLSALPN01)
 	hs := tlssniSrvWithNames(t, chall, "localhost")
 
 	va, _ := setup(hs, 0)
@@ -1045,6 +1072,27 @@ func TestValidateTLSALPN01UnawareSrv(t *testing.T) {
 		t.Fatalf("TLS ALPN validation should have failed.")
 	}
 	test.AssertEquals(t, prob.Type, probs.UnauthorizedProblem)
+}
+
+// TestValidateTLSALPN01BadUTFSrv tests that validating TLS-ALPN-01 against
+// a host that returns a certificate with a SAN/CN that contains invalid UTF-8
+// will result in a problem with the invalid UTF-8 replaced.
+func TestValidateTLSALPN01BadUTFSrv(t *testing.T) {
+	chall := createChallenge(core.ChallengeTypeTLSALPN01)
+	hs := tlsalpn01Srv(t, chall, IdPeAcmeIdentifier, "localhost", "\xf0\x28\x8c\xbc")
+	port := getPort(hs)
+	va, _ := setup(hs, 0)
+
+	_, prob := va.validateTLSALPN01(ctx, dnsi("localhost"), chall)
+	if prob == nil {
+		t.Fatalf("TLS ALPN validation should have failed.")
+	}
+	test.AssertEquals(t, prob.Type, probs.UnauthorizedProblem)
+	test.AssertEquals(t, prob.Detail, fmt.Sprintf(
+		"Incorrect validation certificate for tls-alpn-01 challenge. "+
+			"Requested localhost from 127.0.0.1:%d. Received 1 certificate(s), "+
+			`first certificate had names "localhost, %s"`,
+		port, "\ufffd(\ufffd\ufffd"))
 }
 
 func TestPerformValidationInvalid(t *testing.T) {

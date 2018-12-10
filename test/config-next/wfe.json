@@ -31,12 +31,13 @@
       "timeout": "150s"
     },
     "features": {
-      "RPCHeadroom": true
+      "RPCHeadroom": true,
+      "PerformValidationRPC": true
     }
   },
 
   "syslog": {
-    "stdoutlevel": 5,
+    "stdoutlevel": 4,
     "sysloglevel": 4
   },
 

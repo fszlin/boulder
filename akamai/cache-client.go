@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -146,19 +145,25 @@ func (cpc *CachePurgeClient) constructAuthHeader(request *http.Request, body []b
 		header,
 	)
 
-	// Create signing key using a HMAC of the client secret over the timestamp
-	h := hmac.New(sha256.New, []byte(cpc.clientSecret))
-	h.Write([]byte(timestamp))
-	key := make([]byte, base64.StdEncoding.EncodedLen(32))
-	base64.StdEncoding.Encode(key, h.Sum(nil))
+	cpc.log.Debugf("To-be-signed Akamai EdgeGrid authentication: %q", tbs)
 
-	h = hmac.New(sha256.New, key)
+	h := hmac.New(sha256.New, signingKey(cpc.clientSecret, timestamp))
 	h.Write([]byte(tbs))
 	return fmt.Sprintf(
 		"%ssignature=%s",
 		header,
 		base64.StdEncoding.EncodeToString(h.Sum(nil)),
 	), nil
+}
+
+// signingKey makes a signing key by HMAC'ing the timestamp
+// using a client secret as the key.
+func signingKey(clientSecret string, timestamp string) []byte {
+	h := hmac.New(sha256.New, []byte(clientSecret))
+	h.Write([]byte(timestamp))
+	key := make([]byte, base64.StdEncoding.EncodedLen(32))
+	base64.StdEncoding.Encode(key, h.Sum(nil))
+	return key
 }
 
 // purge actually sends the individual requests to the Akamai endpoint and checks
@@ -185,7 +190,6 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 	if err != nil {
 		return errFatal(err.Error())
 	}
-
 	req, err := http.NewRequest(
 		"POST",
 		endpoint,
@@ -199,7 +203,7 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 	authHeader, err := cpc.constructAuthHeader(
 		req,
 		reqJSON,
-		purgePath,
+		purgePath+cpc.v3Network,
 		core.RandomString(16),
 	)
 	if err != nil {
@@ -207,6 +211,9 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 	}
 	req.Header.Set("Authorization", authHeader)
 	req.Header.Set("Content-Type", "application/json")
+
+	cpc.log.Debugf("POSTing to %s with Authorization %s: %s",
+		endpoint, authHeader, reqJSON)
 
 	rS := cpc.clk.Now()
 	resp, err := cpc.client.Do(req)
@@ -231,7 +238,7 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 	var purgeInfo purgeResponse
 	err = json.Unmarshal(body, &purgeInfo)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s. Body was: %s", err, body)
 	}
 	if purgeInfo.HTTPStatus != http.StatusCreated || resp.StatusCode != http.StatusCreated {
 		if purgeInfo.HTTPStatus == http.StatusForbidden {
@@ -246,9 +253,7 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 	return nil
 }
 
-// Purge attempts to send a purge request to the Akamai CCU API cpc.retries number
-//  of times before giving up and returning ErrAllRetriesFailed
-func (cpc *CachePurgeClient) Purge(urls []string) error {
+func (cpc *CachePurgeClient) purgeBatch(urls []string) error {
 	successful := false
 	for i := 0; i <= cpc.retries; i++ {
 		cpc.clk.Sleep(core.RetryBackoff(i, cpc.retryBackoff, time.Minute, 1.3))
@@ -273,5 +278,55 @@ func (cpc *CachePurgeClient) Purge(urls []string) error {
 	}
 
 	cpc.stats.Inc("SuccessfulPurges", 1)
+	return nil
+}
+
+var akamaiBatchSize = 100
+
+// Purge attempts to send a purge request to the Akamai CCU API cpc.retries number
+//  of times before giving up and returning ErrAllRetriesFailed
+func (cpc *CachePurgeClient) Purge(urls []string) error {
+	for i := 0; i < len(urls); {
+		sliceEnd := i + akamaiBatchSize
+		if sliceEnd > len(urls) {
+			sliceEnd = len(urls)
+		}
+		err := cpc.purgeBatch(urls[i:sliceEnd])
+		if err != nil {
+			return err
+		}
+		i += akamaiBatchSize
+	}
+	return nil
+}
+
+// CheckSignature is used for tests, it exported so that it can be used in akamai-test-srv
+func CheckSignature(secret string, url string, r *http.Request, body []byte) error {
+	bodyHash := sha256.Sum256(body)
+	bodyHashB64 := base64.StdEncoding.EncodeToString(bodyHash[:])
+
+	authorization := r.Header.Get("Authorization")
+	authValues := make(map[string]string)
+	for _, v := range strings.Split(authorization, ";") {
+		splitValue := strings.Split(v, "=")
+		authValues[splitValue[0]] = splitValue[1]
+	}
+	headerTimestamp := authValues["timestamp"]
+	splitHeader := strings.Split(authorization, "signature=")
+	shortenedHeader, signature := splitHeader[0], splitHeader[1]
+	hostPort := strings.Split(url, "://")[1]
+	h := hmac.New(sha256.New, signingKey(secret, headerTimestamp))
+	input := []byte(fmt.Sprintf("POST\thttp\t%s\t%s\t\t%s\t%s",
+		hostPort,
+		r.URL.Path,
+		bodyHashB64,
+		shortenedHeader,
+	))
+	h.Write(input)
+	expectedSignature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	if signature != expectedSignature {
+		return fmt.Errorf("Wrong signature %q in %q. Expected %q\n",
+			signature, authorization, expectedSignature)
+	}
 	return nil
 }
