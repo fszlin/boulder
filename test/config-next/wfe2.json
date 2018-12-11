@@ -39,12 +39,13 @@
     "features": {
       "EnforceV2ContentType": true,
       "RPCHeadroom": true,
-      "ACME13KeyRollover": true
+      "ACME13KeyRollover": true,
+      "PerformValidationRPC": true
     }
   },
 
   "syslog": {
-    "stdoutlevel": 5,
+    "stdoutlevel": 4,
     "sysloglevel": 4
   },
 

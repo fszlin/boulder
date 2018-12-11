@@ -22,7 +22,11 @@ import startservers
 
 import chisel
 from chisel import auth_and_issue
+from chisel import add_http_redirect, remove_http_redirect, add_http01_response, remove_http01_response
 from v2_integration import *
+from helpers import *
+
+from acme import challenges
 
 import requests
 import OpenSSL
@@ -62,8 +66,6 @@ def setup_twenty_days_ago():
     # Issue a certificate with the clock set back, and save the authzs to check
     # later that they are valid (200). They should however require rechecking for
     # CAA purposes.
-    global caa_client
-    caa_client = chisel.make_client()
     global caa_authzs
     _, caa_authzs = auth_and_issue(["recheck.good-caa-reserved.com"], client=caa_client)
 
@@ -74,101 +76,144 @@ def setup_zero_days_ago():
     global new_authzs
     _, new_authzs = auth_and_issue([random_domain()])
 
-def fetch_ocsp(request_bytes, url):
-    """Fetch an OCSP response using POST, GET, and GET with URL encoding.
-
-    Returns a tuple of the responses.
-    """
-    ocsp_req_b64 = base64.b64encode(request_bytes)
-
-    # Make the OCSP request three different ways: by POST, by GET, and by GET with
-    # URL-encoded parameters. All three should have an identical response.
-    get_response = urllib2.urlopen("%s/%s" % (url, ocsp_req_b64)).read()
-    get_encoded_response = urllib2.urlopen("%s/%s" % (url, urllib2.quote(ocsp_req_b64, safe = ""))).read()
-    post_response = urllib2.urlopen("%s/" % (url), request_bytes).read()
-
-    return (post_response, get_response, get_encoded_response)
-
-def make_ocsp_req(cert_file, issuer_file):
-    """Return the bytes of an OCSP request for the given certificate file."""
-    ocsp_req_file = os.path.join(tempdir, "ocsp.req")
-    # First generate the OCSP request in DER form
-    run("openssl ocsp -no_nonce -issuer %s -cert %s -reqout %s" % (
-        issuer_file, cert_file, ocsp_req_file))
-    with open(ocsp_req_file) as f:
-        ocsp_req = f.read()
-    return ocsp_req
-
-def fetch_until(cert_file, issuer_file, url, initial, final):
-    """Fetch OCSP for cert_file until OCSP status goes from initial to final.
-
-    Initial and final are treated as regular expressions. Any OCSP response
-    whose OpenSSL OCSP verify output doesn't match either initial or final is
-    a fatal error.
-
-    If OCSP responses by the three methods (POST, GET, URL-encoded GET) differ
-    from each other, that is a fatal error.
-
-    If we loop for more than five seconds, that is a fatal error.
-
-    Returns nothing on success.
-    """
-    ocsp_request = make_ocsp_req(cert_file, issuer_file)
-    timeout = time.time() + 5
-    while True:
-        time.sleep(0.25)
-        if time.time() > timeout:
-            raise Exception("Timed out waiting for OCSP to go from '%s' to '%s'" % (
-                initial, final))
-        responses = fetch_ocsp(ocsp_request, url)
-        # This variable will be true at the end of the loop if all the responses
-        # matched the final state.
-        all_final = True
-        for resp in responses:
-            verify_output = ocsp_verify(cert_file, issuer_file, resp)
-            if re.search(initial, verify_output):
-                all_final = False
-                break
-            elif re.search(final, verify_output):
-                continue
-            else:
-                print verify_output
-                raise Exception("OCSP response didn't match '%s' or '%s'" %(
-                    initial, final))
-        if all_final:
-            # Check that all responses were equal to each other.
-            for resp in responses:
-                if resp != responses[0]:
-                    raise Exception("OCSP responses differed: %s vs %s" %(
-                        base64.b64encode(responses[0]), base64.b64encode(resp)))
-            return
-
-def ocsp_verify(cert_file, issuer_file, ocsp_response):
-    ocsp_resp_file = os.path.join(tempdir, "ocsp.resp")
-    with open(ocsp_resp_file, "w") as f:
-        f.write(ocsp_response)
-    output = run("openssl ocsp -no_nonce -issuer %s -cert %s \
-      -verify_other %s -CAfile test/test-root.pem \
-      -respin %s" % (issuer_file, cert_file, issuer_file, ocsp_resp_file))
-    # OpenSSL doesn't always return non-zero when response verify fails, so we
-    # also look for the string "Response Verify Failure"
-    verify_failure = "Response Verify Failure"
-    if re.search(verify_failure, output):
-        print output
-        raise Exception("OCSP verify failure")
-    return output
-
-def wait_for_ocsp_good(cert_file, issuer_file, url):
-    fetch_until(cert_file, issuer_file, url, " unauthorized", ": good")
-
-def wait_for_ocsp_revoked(cert_file, issuer_file, url):
-    fetch_until(cert_file, issuer_file, url, ": good", ": revoked")
-
 def test_dns_challenge():
     auth_and_issue([random_domain(), random_domain()], chall_type="dns-01")
 
 def test_http_challenge():
     auth_and_issue([random_domain(), random_domain()], chall_type="http-01")
+
+def rand_http_chall(client):
+    d = random_domain()
+    authz = client.request_domain_challenges(d)
+    for c in authz.body.challenges:
+        if isinstance(c.chall, challenges.HTTP01):
+            return d, c.chall
+    raise Exception("No HTTP-01 challenge found for random domain authz")
+
+def test_http_challenge_loop_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+
+    # Create a HTTP redirect from the challenge's validation path to itself
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "http://{0}{1}".format(d, challengePath))
+
+    # Issuing for the the name should fail because of the challenge domains's
+    # redirect loop.
+    chisel.expect_problem("urn:acme:error:connection",
+        lambda: auth_and_issue([d], client=client, chall_type="http-01"))
+
+    remove_http_redirect(challengePath)
+
+def test_http_challenge_badport_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+
+    # Create a HTTP redirect from the challenge's validation path to a host with
+    # an invalid port.
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "http://{0}:1337{1}".format(d, challengePath))
+
+    # Issuing for the name should fail because of the challenge domain's
+    # invalid port redirect.
+    chisel.expect_problem("urn:acme:error:connection",
+        lambda: auth_and_issue([d], client=client, chall_type="http-01"))
+
+    remove_http_redirect(challengePath)
+
+def test_http_challenge_badhost_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+
+    # Create a HTTP redirect from the challenge's validation path to a bare IP
+    # hostname.
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "https://127.0.0.1{0}".format(challengePath))
+
+    # Issuing for the name should cause a connection error because the redirect
+    # domain name is an IP address.
+    chisel.expect_problem("urn:acme:error:connection",
+        lambda: auth_and_issue([d], client=client, chall_type="http-01"))
+
+    remove_http_redirect(challengePath)
+
+def test_http_challenge_badproto_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+
+    # Create a HTTP redirect from the challenge's validation path to whacky
+    # non-http/https protocol URL.
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "gopher://{0}{1}".format(d, challengePath))
+
+    # Issuing for the name should cause a connection error because the redirect
+    # URL an invalid protocol scheme.
+    chisel.expect_problem("urn:acme:error:connection",
+        lambda: auth_and_issue([d], client=client, chall_type="http-01"))
+
+    remove_http_redirect(challengePath)
+
+def test_http_challenge_http_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+    # Calculate its keyauth so we can add it in a special non-standard location
+    # for the redirect result
+    resp = chall.response(client.key)
+    keyauth = resp.key_authorization
+    add_http01_response("http-redirect", keyauth)
+
+    # Create a HTTP redirect from the challenge's validation path to some other
+    # token path where we have registered the key authorization.
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "http://{0}/.well-known/acme-challenge/http-redirect".format(d))
+
+    auth_and_issue([d], client=client, chall_type="http-01")
+
+    remove_http_redirect(challengePath)
+    remove_http01_response("http-redirect")
+
+def test_http_challenge_https_redirect():
+    client = chisel.make_client()
+
+    # Create an authz for a random domain and get its HTTP-01 challenge token
+    d, chall = rand_http_chall(client)
+    token = chall.encode("token")
+
+    # Create a HTTP redirect from the challenge's validation path to an HTTPS
+    # address with the same path.
+    challengePath = "/.well-known/acme-challenge/{0}".format(token)
+    add_http_redirect(
+        challengePath,
+        "https://{0}{1}".format(d, challengePath))
+
+    auth_and_issue([d], client=client, chall_type="http-01")
+
+    remove_http_redirect(challengePath)
 
 def test_tls_alpn_challenge():
     # TODO(@mdebski): Once the tls-alpn-01 challenge is enabled in pa.challenges
@@ -297,6 +342,7 @@ def test_expiration_mailer():
 def test_revoke_by_account():
     client = chisel.make_client()
     cert, _ = auth_and_issue([random_domain()], client=client)
+    reset_akamai_purges()
     client.revoke(cert.body, 0)
 
     cert_file_pem = os.path.join(tempdir, "revokeme.pem")
@@ -305,6 +351,7 @@ def test_revoke_by_account():
             OpenSSL.crypto.FILETYPE_PEM, cert.body.wrapped).decode())
     ee_ocsp_url = "http://localhost:4002"
     wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    verify_akamai_purge()
     return 0
 
 def test_caa():
@@ -366,9 +413,6 @@ def test_account_update():
         actual = result.body.contact[0]
         if actual != "mailto:"+email:
             raise Exception("\nUpdate account failed: expected contact %s, got %s" % (email, actual))
-
-def run(cmd, **kwargs):
-    return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, **kwargs)
 
 def run_client_tests():
     root = os.environ.get("CERTBOT_PATH")
@@ -518,11 +562,13 @@ def test_admin_revoker_cert():
     cert, _ = auth_and_issue([random_domain()], cert_output=cert_file_pem)
     serial = "%x" % cert.body.get_serial_number()
     # Revoke certificate by serial
+    reset_akamai_purges()
     run("./bin/admin-revoker serial-revoke --config %s/admin-revoker.json %s %d" % (
         default_config_dir, serial, 1))
     # Wait for OCSP response to indicate revocation took place
     ee_ocsp_url = "http://localhost:4002"
     wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    verify_akamai_purge()
 
 def test_admin_revoker_authz():
     # Make an authz, but don't attempt its challenges.
@@ -549,8 +595,13 @@ def test_stats():
     expect_stat(8000, "\nresponse_time_count{")
     expect_stat(8000, "\ngo_goroutines ")
     expect_stat(8000, '\ngrpc_client_handling_seconds_count{grpc_method="NewRegistration",grpc_service="ra.RegistrationAuthority",grpc_type="unary"} ')
-    expect_stat(8002, '\ngrpc_server_handling_seconds_sum{grpc_method="UpdateAuthorization",grpc_service="ra.RegistrationAuthority",grpc_type="unary"} ')
-    expect_stat(8002, '\ngrpc_client_handling_seconds_count{grpc_method="UpdatePendingAuthorization",grpc_service="sa.StorageAuthority",grpc_type="unary"} ')
+
+    # Expect the PerformValidation RPC to be used with config-next and the
+    # legacy UpdateAuthorization RPC to be used otherwise.
+    if os.environ.get('BOULDER_CONFIG_DIR', '').startswith("test/config-next"):
+        expect_stat(8002, '\ngrpc_server_handling_seconds_sum{grpc_method="PerformValidation",grpc_service="ra.RegistrationAuthority",grpc_type="unary"} ')
+    else:
+        expect_stat(8002, '\ngrpc_server_handling_seconds_sum{grpc_method="UpdateAuthorization",grpc_service="ra.RegistrationAuthority",grpc_type="unary"} ')
     expect_stat(8001, "\ngo_goroutines ")
 
 def test_sct_embedding():
@@ -600,34 +651,41 @@ def main():
                         help="run load-generator")
     parser.add_argument('--filter', dest="test_case_filter", action="store",
                         help="Regex filter for test cases")
+    parser.add_argument('--skip-setup', dest="skip_setup", action="store_true",
+                        help="skip integration test setup")
     # allow any ACME client to run custom command for integration
     # testing (without having to implement its own busy-wait loop)
     parser.add_argument('--custom', metavar="CMD", help="run custom command")
     parser.set_defaults(run_all=False, run_certbot=False, run_chisel=False,
-        run_loadtest=False, test_case_filter="")
+        run_loadtest=False, test_case_filter="", skip_setup=False)
     args = parser.parse_args()
 
     if not (args.run_all or args.run_certbot or args.run_chisel or args.run_loadtest or args.custom is not None):
         raise Exception("must run at least one of the letsencrypt or chisel tests with --all, --certbot, --chisel, --load or --custom")
 
-    now = datetime.datetime.utcnow()
-    seventy_days_ago = now+datetime.timedelta(days=-70)
-    if not startservers.start(race_detection=True, fakeclock=fakeclock(seventy_days_ago)):
-        raise Exception("startservers failed (mocking seventy days ago)")
-    setup_seventy_days_ago()
-    startservers.stop()
+    if not args.skip_setup:
+        now = datetime.datetime.utcnow()
+        seventy_days_ago = now+datetime.timedelta(days=-70)
+        if not startservers.start(race_detection=True, fakeclock=fakeclock(seventy_days_ago)):
+            raise Exception("startservers failed (mocking seventy days ago)")
+        setup_seventy_days_ago()
+        global caa_client
+        caa_client = chisel.make_client()
+        startservers.stop()
 
-    now = datetime.datetime.utcnow()
-    twenty_days_ago = now+datetime.timedelta(days=-20)
-    if not startservers.start(race_detection=True, fakeclock=fakeclock(twenty_days_ago)):
-        raise Exception("startservers failed (mocking twenty days ago)")
-    setup_twenty_days_ago()
-    startservers.stop()
+        now = datetime.datetime.utcnow()
+        twenty_days_ago = now+datetime.timedelta(days=-20)
+        if not startservers.start(race_detection=True, fakeclock=fakeclock(twenty_days_ago)):
+            raise Exception("startservers failed (mocking twenty days ago)")
+        setup_twenty_days_ago()
+        startservers.stop()
 
-    if not startservers.start(race_detection=True, account_uri=caa_client.account.uri):
+    caa_acount_uri = caa_client.account.uri if caa_client is not None else None
+    if not startservers.start(race_detection=True, account_uri=caa_acount_uri):
         raise Exception("startservers failed")
 
-    setup_zero_days_ago()
+    if not args.skip_setup:
+        setup_zero_days_ago()
 
     if args.run_all or args.run_chisel:
         run_chisel(args.test_case_filter)
