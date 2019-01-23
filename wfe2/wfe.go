@@ -424,14 +424,22 @@ func (wfe *WebFrontEndImpl) Directory(
 }
 
 // Nonce is an endpoint for getting a fresh nonce with an HTTP GET or HEAD
-// request. This endpoint only returns a no content header - the `HandleFunc`
+// request. This endpoint only returns a status code header - the `HandleFunc`
 // wrapper ensures that a nonce is written in the correct response header.
 func (wfe *WebFrontEndImpl) Nonce(
 	ctx context.Context,
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
 	request *http.Request) {
-	response.WriteHeader(http.StatusNoContent)
+	statusCode := http.StatusNoContent
+	// The ACME specification says GET requets should receive http.StatusNoContent
+	// and HEAD requests should receive http.StatusOK. We gate this with the
+	// HeadNonceStatusOK feature flag because it may break clients that are
+	// programmed to expect StatusOK.
+	if features.Enabled(features.HeadNonceStatusOK) && request.Method == "HEAD" {
+		statusCode = http.StatusOK
+	}
+	response.WriteHeader(statusCode)
 }
 
 // sendError wraps web.SendError
@@ -477,6 +485,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	if err == nil {
 		response.Header().Set("Location",
 			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.ID)))
+		logEvent.Requester = existingAcct.ID
 
 		err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, existingAcct)
 		if err != nil {
@@ -534,7 +543,9 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	}
 	logEvent.Requester = acct.ID
 	addRequesterHeader(response, acct.ID)
-	logEvent.Contacts = acct.Contact
+	if acct.Contact != nil {
+		logEvent.Contacts = *acct.Contact
+	}
 
 	// We populate the account Agreement field when creating a new response to
 	// track which terms-of-service URL was in effect when an account with
@@ -858,8 +869,10 @@ func (wfe *WebFrontEndImpl) Challenge(
 	challenge := authz.Challenges[challengeIndex]
 
 	logEvent.Extra["ChallengeType"] = challenge.Type
-	logEvent.Extra["Identifier"] = authz.Identifier
-	logEvent.Extra["AuthorizationStatus"] = authz.Status
+	if authz.Identifier.Type == core.IdentifierDNS {
+		logEvent.DNSName = authz.Identifier.Value
+	}
+	logEvent.Status = string(authz.Status)
 
 	switch request.Method {
 	case "GET", "HEAD":
@@ -1011,31 +1024,20 @@ func (wfe *WebFrontEndImpl) postChallenge(
 		}
 		challIndex := int64(challengeIndex)
 
-		// Ask the RA to update this authorization. Use the RA's PerformValidation
-		// RPC if the feature flag is enabled, otherwise use the legacy
-		// UpdateAuthorization RPC.
-		if features.Enabled(features.PerformValidationRPC) {
-			authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
-				Authz:          authzPB,
-				ChallengeIndex: &challIndex,
-			})
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
-				return
-			}
-			updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
-				return
-			}
-			returnAuthz = updatedAuthz
-		} else {
-			returnAuthz, err = wfe.RA.UpdateAuthorization(ctx, authz, challengeIndex, core.Challenge{})
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
-				return
-			}
+		authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
+			Authz:          authzPB,
+			ChallengeIndex: &challIndex,
+		})
+		if err != nil {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
+			return
 		}
+		updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
+		if err != nil {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
+			return
+		}
+		returnAuthz = updatedAuthz
 	}
 
 	// assumption: PerformValidation does not modify order of challenges
@@ -1242,8 +1244,10 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 		}
 		return
 	}
-	logEvent.Extra["Identifier"] = authz.Identifier
-	logEvent.Extra["AuthorizationStatus"] = authz.Status
+	if authz.Identifier.Type == core.IdentifierDNS {
+		logEvent.DNSName = authz.Identifier.Value
+	}
+	logEvent.Status = string(authz.Status)
 
 	// After expiring, authorizations are inaccessible
 	if authz.Expires == nil || authz.Expires.Before(wfe.clk.Now()) {
@@ -1672,6 +1676,7 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new order"), err)
 		return
 	}
+	logEvent.Created = fmt.Sprintf("%d", *order.Id)
 
 	orderURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", orderPath, acct.ID, *order.Id))

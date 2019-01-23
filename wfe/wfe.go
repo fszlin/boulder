@@ -23,7 +23,6 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
@@ -506,7 +505,9 @@ func (wfe *WebFrontEndImpl) verifyPOST(ctx context.Context, logEvent *web.Reques
 		// If the lookup was successful, use that key.
 		key = reg.Key
 		logEvent.Requester = reg.ID
-		logEvent.Contacts = reg.Contact
+		if reg.Contact != nil {
+			logEvent.Contacts = *reg.Contact
+		}
 	}
 
 	// Only check for validity if we are actually checking the registration
@@ -626,7 +627,9 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 	}
 	logEvent.Requester = reg.ID
 	addRequesterHeader(response, reg.ID)
-	logEvent.Contacts = reg.Contact
+	if reg.Contact != nil {
+		logEvent.Contacts = *reg.Contact
+	}
 
 	// Use an explicitly typed variable. Otherwise `go vet' incorrectly complains
 	// that reg.ID is a string being passed to %d.
@@ -669,7 +672,9 @@ func (wfe *WebFrontEndImpl) NewAuthorization(ctx context.Context, logEvent *web.
 		wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling JSON"), err)
 		return
 	}
-	logEvent.Extra["Identifier"] = init.Identifier
+	if init.Identifier.Type == core.IdentifierDNS {
+		logEvent.DNSName = init.Identifier.Value
+	}
 
 	// Create new authz and return
 	authz, err := wfe.RA.NewAuthorization(ctx, init, currReg.ID)
@@ -677,7 +682,7 @@ func (wfe *WebFrontEndImpl) NewAuthorization(ctx context.Context, logEvent *web.
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new authz"), err)
 		return
 	}
-	logEvent.Extra["AuthzID"] = authz.ID
+	logEvent.Created = authz.ID
 
 	// Make a URL for this authz, then blow away the ID and RegID before serializing
 	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
@@ -971,15 +976,17 @@ func (wfe *WebFrontEndImpl) Challenge(
 	}
 	challenge := authz.Challenges[challengeIndex]
 
-	logEvent.Extra["ChallengeType"] = challenge.Type
-	logEvent.Extra["Identifier"] = authz.Identifier
-	logEvent.Extra["AuthorizationStatus"] = authz.Status
+	if authz.Identifier.Type == core.IdentifierDNS {
+		logEvent.DNSName = authz.Identifier.Value
+	}
+	logEvent.Status = string(authz.Status)
 
 	switch request.Method {
 	case "GET", "HEAD":
 		wfe.getChallenge(ctx, response, request, authz, &challenge, logEvent)
 
 	case "POST":
+		logEvent.ChallengeType = challenge.Type
 		wfe.postChallenge(ctx, response, request, authz, challengeIndex, logEvent)
 	}
 }
@@ -1097,30 +1104,23 @@ func (wfe *WebFrontEndImpl) postChallenge(
 		}
 		challIndex := int64(challengeIndex)
 
-		// Ask the RA to update this authorization. Use the RA's PerformValidation
-		// RPC if the feature flag is enabled, otherwise use the legacy
-		// UpdateAuthorization RPC.
-		if features.Enabled(features.PerformValidationRPC) {
-			authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
-				Authz:          authzPB,
-				ChallengeIndex: &challIndex})
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
-				return
-			}
-			updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
-				return
-			}
-			returnAuthz = updatedAuthz
-		} else {
-			returnAuthz, err = wfe.RA.UpdateAuthorization(ctx, authz, challengeIndex, challengeUpdate)
-			if err != nil {
-				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
-				return
-			}
+		authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
+			Authz:          authzPB,
+			ChallengeIndex: &challIndex})
+		if err != nil {
+			wfe.sendError(
+				response,
+				logEvent,
+				web.ProblemDetailsForError(err, "Unable to perform validation for challenge"),
+				err)
+			return
 		}
+		updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
+		if err != nil {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
+			return
+		}
+		returnAuthz = updatedAuthz
 	}
 
 	// assumption: PerformValidation does not modify order of challenges
@@ -1280,8 +1280,11 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 		}
 		return
 	}
-	logEvent.Extra["Identifier"] = authz.Identifier
-	logEvent.Extra["AuthorizationStatus"] = authz.Status
+
+	if authz.Identifier.Type == core.IdentifierDNS {
+		logEvent.DNSName = authz.Identifier.Value
+	}
+	logEvent.Status = string(authz.Status)
 
 	// After expiring, authorizations are inaccessible
 	if authz.Expires == nil || authz.Expires.Before(wfe.clk.Now()) {

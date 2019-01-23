@@ -31,8 +31,6 @@
       "timeout": "150s"
     },
     "features": {
-      "RPCHeadroom": true,
-      "PerformValidationRPC": true
     }
   },
 

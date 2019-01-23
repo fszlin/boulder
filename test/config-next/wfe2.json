@@ -38,10 +38,7 @@
       "http://127.0.0.1:4000/acme/issuer-cert": [ "test/test-ca2.pem" ]
     },
     "features": {
-      "EnforceV2ContentType": true,
-      "RPCHeadroom": true,
-      "ACME13KeyRollover": true,
-      "PerformValidationRPC": true
+      "HeadNonceStatusOK": true
     }
   },
 

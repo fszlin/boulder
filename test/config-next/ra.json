@@ -41,12 +41,6 @@
       ]
     },
     "features": {
-      "RPCHeadroom": true,
-      "WildcardDomains": true,
-      "TLSSNIRevalidation": true,
-      "ReusePendingAuthz": true,
-      "EnforceOverlappingWildcards": true,
-      "VAChecksGSB": true
     },
     "CTLogGroups2": [
       {
@@ -113,7 +107,6 @@
   "pa": {
     "challenges": {
       "http-01": true,
-      "tls-sni-01": true,
       "dns-01": true,
       "tls-alpn-01": true
     },
