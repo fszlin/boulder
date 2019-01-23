@@ -232,10 +232,6 @@ func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, acc
 	return acct, nil
 }
 
-func (ra *MockRegistrationAuthority) UpdateAuthorization(ctx context.Context, authz core.Authorization, foo int, challenge core.Challenge) (core.Authorization, error) {
-	return authz, nil
-}
-
 func (ra *MockRegistrationAuthority) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
 	return nil, nil
 }
@@ -825,24 +821,56 @@ func TestRelativeDirectory(t *testing.T) {
 	}
 }
 
-// TestNonceEndpoint tests the WFE2's new-nonce endpoint
-func TestNonceEndpoint(t *testing.T) {
+// TestNonceEndpoint tests requests to the WFE2's new-nonce endpoint
+func TestNonceEndpointGET(t *testing.T) {
 	wfe, _ := setupWFE(t)
 	mux := wfe.Handler()
 
-	responseWriter := httptest.NewRecorder()
+	testCases := []struct {
+		Name              string
+		Method            string
+		ExpectedStatus    int
+		HeadNonceStatusOK bool
+	}{
+		{
+			Name:           "GET new-nonce request",
+			Method:         "GET",
+			ExpectedStatus: http.StatusNoContent,
+		},
+		{
+			Name:           "HEAD new-nonce request (legacy)",
+			Method:         "HEAD",
+			ExpectedStatus: http.StatusNoContent,
+		},
+		{
+			Name:              "HEAD new-nonce request (feature flag)",
+			Method:            "HEAD",
+			ExpectedStatus:    http.StatusOK,
+			HeadNonceStatusOK: true,
+		},
+	}
 
-	mux.ServeHTTP(responseWriter, &http.Request{
-		Method: "GET",
-		URL:    mustParseURL(newNoncePath),
-	})
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if tc.HeadNonceStatusOK {
+				if err := features.Set(map[string]bool{"HeadNonceStatusOK": true}); err != nil {
+					t.Fatalf("Failed to enable HeadNonceStatusOK feature: %v", err)
+				}
+				defer features.Reset()
+			}
 
-	// Sending a GET request to the nonce endpoint should produce a HTTP response
-	// with the correct status code
-	test.AssertEquals(t, responseWriter.Code, http.StatusNoContent)
-	// And the response should contain a valid nonce in the Replay-Nonce header
-	nonce := responseWriter.Header().Get("Replay-Nonce")
-	test.AssertEquals(t, wfe.nonceService.Valid(nonce), true)
+			responseWriter := httptest.NewRecorder()
+			mux.ServeHTTP(responseWriter, &http.Request{
+				Method: tc.Method,
+				URL:    mustParseURL(newNoncePath),
+			})
+			// The response should have the expected HTTP status code
+			test.AssertEquals(t, responseWriter.Code, tc.ExpectedStatus)
+			// And the response should contain a valid nonce in the Replay-Nonce header
+			nonce := responseWriter.Header().Get("Replay-Nonce")
+			test.AssertEquals(t, wfe.nonceService.Valid(nonce), true)
+		})
+	}
 }
 
 func TestHTTPMethods(t *testing.T) {
@@ -1102,17 +1130,13 @@ func TestChallenge(t *testing.T) {
 	}
 }
 
-// MockRAUpdateAuthorizationError is a mock RA that just returns an error on
-// UpdateAuthorization or PerformValidation.
-type MockRAUpdateAuthorizationError struct {
+// MockRAPerformValidationError is a mock RA that just returns an error on
+// PerformValidation.
+type MockRAPerformValidationError struct {
 	MockRegistrationAuthority
 }
 
-func (ra *MockRAUpdateAuthorizationError) UpdateAuthorization(_ context.Context, authz core.Authorization, _ int, _ core.Challenge) (core.Authorization, error) {
-	return core.Authorization{}, errors.New("broken on purpose")
-}
-
-func (ra *MockRAUpdateAuthorizationError) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
+func (ra *MockRAPerformValidationError) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
 	return nil, errors.New("broken on purpose")
 }
 
@@ -1121,7 +1145,7 @@ func (ra *MockRAUpdateAuthorizationError) PerformValidation(_ context.Context, _
 // the RA.
 func TestUpdateChallengeFinalizedAuthz(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	wfe.RA = &MockRAUpdateAuthorizationError{}
+	wfe.RA = &MockRAPerformValidationError{}
 	responseWriter := httptest.NewRecorder()
 
 	signedURL := "http://localhost/valid/23"
@@ -1137,12 +1161,12 @@ func TestUpdateChallengeFinalizedAuthz(t *testing.T) {
 }
 
 // TestUpdateChallengeRAError tests that when the RA returns an error from
-// UpdateAuthorization (or PerformValidation) that the WFE returns an internal
-// server error as expected and does not panic or otherwise bug out.
+// PerformValidation that the WFE returns an internal server error as expected
+// and does not panic or otherwise bug out.
 func TestUpdateChallengeRAError(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	// Mock the RA to always fail UpdateAuthorization/PerformValidation
-	wfe.RA = &MockRAUpdateAuthorizationError{}
+	// Mock the RA to always fail PerformValidation
+	wfe.RA = &MockRAPerformValidationError{}
 
 	// Update a pending challenge
 	signedURL := "http://localhost/pending/23"
@@ -1154,25 +1178,6 @@ func TestUpdateChallengeRAError(t *testing.T) {
 
 	// The result should be an internal server error problem.
 	body := responseWriter.Body.String()
-	test.AssertUnmarshaledEquals(t, body, `{
-		"type": "urn:ietf:params:acme:error:serverInternal",
-	  "detail": "Unable to update challenge",
-		"status": 500
-	}`)
-
-	// Doing the same with the PerformValidationRPC feature flag enabled should
-	// have the same result
-	if err := features.Set(map[string]bool{"PerformValidationRPC": true}); err != nil {
-		t.Fatalf("Failed to enable feature: %v", err)
-	}
-	defer features.Reset()
-
-	responseWriter = httptest.NewRecorder()
-	_, _, jwsBody = signRequestKeyID(t, 1, nil, signedURL, `{}`, wfe.nonceService)
-	request = makePostRequestWithPath("pending/23", jwsBody)
-	wfe.Challenge(ctx, newRequestEvent(), responseWriter, request)
-
-	body = responseWriter.Body.String()
 	test.AssertUnmarshaledEquals(t, body, `{
 		"type": "urn:ietf:params:acme:error:serverInternal",
 	  "detail": "Unable to update challenge",
@@ -1756,7 +1761,7 @@ func TestGetCertificate(t *testing.T) {
 				test.Assert(t, bytes.Compare(bodyBytes, tc.ExpectedCert) == 0, "Certificates don't match")
 
 				// Successful requests should be logged as such
-				reqlogs := mockLog.GetAllMatching(`INFO: JSON=.*"Code":200.*`)
+				reqlogs := mockLog.GetAllMatching(`INFO: [^ ]+ [^ ]+ [^ ]+ 200 .*`)
 				if len(reqlogs) != 1 {
 					t.Errorf("Didn't find info logs with code 200. Instead got:\n%s\n",
 						strings.Join(mockLog.GetAllMatching(`.*`), "\n"))
@@ -1767,7 +1772,7 @@ func TestGetCertificate(t *testing.T) {
 				test.AssertUnmarshaledEquals(t, body, tc.ExpectedBody)
 
 				// Unsuccessful requests should be logged as such
-				reqlogs := mockLog.GetAllMatching(fmt.Sprintf(`INFO: JSON=.*"Code":%d.*`, tc.ExpectedStatus))
+				reqlogs := mockLog.GetAllMatching(fmt.Sprintf(`INFO: [^ ]+ [^ ]+ [^ ]+ %d .*`, tc.ExpectedStatus))
 				if len(reqlogs) != 1 {
 					t.Errorf("Didn't find info logs with code %d. Instead got:\n%s\n",
 						tc.ExpectedStatus, strings.Join(mockLog.GetAllMatching(`.*`), "\n"))
@@ -2067,6 +2072,17 @@ func TestNewOrder(t *testing.T) {
 			}
 		})
 	}
+
+	// Test that we log the "Created" field.
+	responseWriter.Body.Reset()
+	responseWriter.HeaderMap = http.Header{}
+	request := signAndPost(t, targetPath, signedURL, validOrderBody, 1, wfe.nonceService)
+	requestEvent := newRequestEvent()
+	wfe.NewOrder(ctx, requestEvent, responseWriter, request)
+
+	if requestEvent.Created != "1" {
+		t.Errorf("Expected to log Created field when creating Order: %#v", requestEvent)
+	}
 }
 
 func TestFinalizeOrder(t *testing.T) {
@@ -2228,13 +2244,6 @@ func TestKeyRollover(t *testing.T) {
 	existingKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	test.AssertNotError(t, err, "Error creating random 2048 RSA key")
 
-	existingJWK := &jose.JSONWebKey{
-		Key:       &existingKey.PublicKey,
-		Algorithm: keyAlgForKey(t, existingKey),
-	}
-	existingJWKJSON, err := existingJWK.MarshalJSON()
-	test.AssertNotError(t, err, "Error marshaling random JWK")
-
 	newKeyBytes, err := ioutil.ReadFile("../test/test-key-5.der")
 	test.AssertNotError(t, err, "Failed to read ../test/test-key-5.der")
 	newKeyPriv, err := x509.ParsePKCS1PrivateKey(newKeyBytes)
@@ -2252,57 +2261,37 @@ func TestKeyRollover(t *testing.T) {
 		}`)
 
 	testCases := []struct {
-		Name              string
-		ACME13KeyRollover bool
-		Payload           string
-		ExpectedResponse  string
-		NewKey            crypto.Signer
-		ErrorStatType     string
+		Name             string
+		Payload          string
+		ExpectedResponse string
+		NewKey           crypto.Signer
+		ErrorStatType    string
 	}{
 		{
 			Name:    "Missing account URL",
-			Payload: `{"newKey":` + string(existingJWKJSON) + `}`,
+			Payload: `{"oldKey":` + test1KeyPublicJSON + `}`,
 			ExpectedResponse: `{
 		     "type": "` + probs.V2ErrorNS + `malformed",
 		     "detail": "Inner key rollover request specified Account \"\", but outer JWS has Key ID \"http://localhost/acme/acct/1\"",
 		     "status": 400
 		   }`,
-			NewKey:        existingKey,
+			NewKey:        newKeyPriv,
 			ErrorStatType: "KeyRolloverMismatchedAccount",
 		},
 		{
-			Name:    "Missing new key from inner payload",
-			Payload: `{"account":"http://localhost/acme/acct/1"}`,
+			Name:    "incorrect old key",
+			Payload: `{"oldKey":` + string(newJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
 			ExpectedResponse: `{
 		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "Inner JWS does not verify with specified new key",
+		     "detail": "Inner JWS does not contain old key field matching current account key",
 		     "status": 400
 		   }`,
-			ErrorStatType: "KeyRolloverJWSNewKeyVerifyFailed",
-		},
-		{
-			Name:    "New key is the same as the old key",
-			Payload: `{"newKey":{"kty":"RSA","n":"yNWVhtYEKJR21y9xsHV-PD_bYwbXSeNuFal46xYxVfRL5mqha7vttvjB_vc7Xg2RvgCxHPCqoxgMPTzHrZT75LjCwIW2K_klBYN8oYvTwwmeSkAz6ut7ZxPv-nZaT5TJhGk0NT2kh_zSpdriEJ_3vW-mqxYbbBmpvHqsa1_zx9fSuHYctAZJWzxzUZXykbWMWQZpEiE0J4ajj51fInEzVn7VxV-mzfMyboQjujPh7aNJxAWSq4oQEJJDgWwSh9leyoJoPpONHxh5nEE5AjE01FkGICSxjpZsF-w8hOTI3XXohUdu29Se26k2B0PolDSuj0GIQU6-W9TdLXSjBb2SpQ","e":"AQAB"},"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "New key specified by rollover request is the same as the old key",
-		     "status": 400
-		   }`,
-			ErrorStatType: "KeyRolloverUnchangedKey",
-		},
-		{
-			Name:    "Inner JWS signed by the wrong key",
-			Payload: `{"newKey":` + string(existingJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "Inner JWS does not verify with specified new key",
-		     "status": 400
-		   }`,
-			ErrorStatType: "KeyRolloverJWSNewKeyVerifyFailed",
+			NewKey:        newKeyPriv,
+			ErrorStatType: "KeyRolloverWrongOldKey",
 		},
 		{
 			Name:    "Valid key rollover request, key exists",
-			Payload: `{"newKey":` + string(existingJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
+			Payload: `{"oldKey":` + test1KeyPublicJSON + `,"account":"http://localhost/acme/acct/1"}`,
 			ExpectedResponse: `{
                           "type": "urn:ietf:params:acme:error:malformed",
                           "detail": "New key is already in use for a different account",
@@ -2312,104 +2301,7 @@ func TestKeyRollover(t *testing.T) {
 		},
 		{
 			Name:    "Valid key rollover request",
-			Payload: `{"newKey":` + string(newJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "id": 1,
-		     "key": ` + string(newJWKJSON) + `,
-		     "contact": [
-		       "mailto:person@mail.com"
-		     ],
-		     "agreement": "http://example.invalid/terms",
-		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
-		     "status": "valid"
-		   }`,
-			NewKey: newKeyPriv,
-		},
-		{
-			Name:    "Valid key rollover request, added ACME13KeyRollover compat",
-			Payload: `{"newKey":` + string(newJWKJSON) + `, "oldKey":` + test1KeyPublicJSON + `, "account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "id": 1,
-		     "key": ` + string(newJWKJSON) + `,
-		     "contact": [
-		       "mailto:person@mail.com"
-		     ],
-		     "agreement": "http://example.invalid/terms",
-		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
-		     "status": "valid"
-		   }`,
-			NewKey: newKeyPriv,
-		},
-		{
-			Name:              "ACME13KeyRollover, legacy rollover request",
-			ACME13KeyRollover: true,
-			Payload:           `{"newKey":` + string(newJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "Inner JWS does not contain old key field matching current account key",
-		     "status": 400
-		   }`,
-			NewKey:        newKeyPriv,
-			ErrorStatType: "KeyRolloverWrongOldKey",
-		},
-		{
-			Name:              "ACME13KeyRollover, Missing account URL",
-			ACME13KeyRollover: true,
-			Payload:           `{"oldKey":` + test1KeyPublicJSON + `}`,
-			ExpectedResponse: `{
-		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "Inner key rollover request specified Account \"\", but outer JWS has Key ID \"http://localhost/acme/acct/1\"",
-		     "status": 400
-		   }`,
-			NewKey:        newKeyPriv,
-			ErrorStatType: "KeyRolloverMismatchedAccount",
-		},
-		{
-			Name:              "ACME13KeyRollover, incorrect old key",
-			ACME13KeyRollover: true,
-			Payload:           `{"oldKey":` + string(newJWKJSON) + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "type": "` + probs.V2ErrorNS + `malformed",
-		     "detail": "Inner JWS does not contain old key field matching current account key",
-		     "status": 400
-		   }`,
-			NewKey:        newKeyPriv,
-			ErrorStatType: "KeyRolloverWrongOldKey",
-		},
-		{
-			Name:              "ACME13KeyRollover, Valid key rollover request, key exists",
-			ACME13KeyRollover: true,
-			Payload:           `{"oldKey":` + test1KeyPublicJSON + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-                          "type": "urn:ietf:params:acme:error:malformed",
-                          "detail": "New key is already in use for a different account",
-                          "status": 409
-                        }`,
-			NewKey: existingKey,
-		},
-		{
-			Name:              "ACME13KeyRollover, Valid key rollover request",
-			ACME13KeyRollover: true,
-			Payload:           `{"oldKey":` + test1KeyPublicJSON + `,"account":"http://localhost/acme/acct/1"}`,
-			ExpectedResponse: `{
-		     "id": 1,
-		     "key": ` + string(newJWKJSON) + `,
-		     "contact": [
-		       "mailto:person@mail.com"
-		     ],
-		     "agreement": "http://example.invalid/terms",
-		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
-		     "status": "valid"
-		   }`,
-			NewKey: newKeyPriv,
-		},
-		{
-			Name:              "ACME13KeyRollover, Valid key rollover request, legacy compat",
-			ACME13KeyRollover: true,
-			Payload:           `{"oldKey":` + test1KeyPublicJSON + `, "newKey":` + string(newJWKJSON) + `, "account":"http://localhost/acme/acct/1"}`,
+			Payload: `{"oldKey":` + test1KeyPublicJSON + `,"account":"http://localhost/acme/acct/1"}`,
 			ExpectedResponse: `{
 		     "id": 1,
 		     "key": ` + string(newJWKJSON) + `,
@@ -2427,10 +2319,6 @@ func TestKeyRollover(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			if tc.ACME13KeyRollover {
-				_ = features.Set(map[string]bool{"ACME13KeyRollover": true})
-				defer features.Reset()
-			}
 			wfe.stats.joseErrorCount.Reset()
 			responseWriter.Body.Reset()
 			_, _, inner := signRequestEmbed(t, tc.NewKey, "http://localhost/key-change", tc.Payload, wfe.nonceService)

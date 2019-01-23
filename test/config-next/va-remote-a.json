@@ -26,8 +26,6 @@
       ]
     },
     "features": {
-      "RPCHeadroom": true,
-      "IPv6First": true,
       "CAAValidationMethods": true,
       "CAAAccountURI": true,
       "SimplifiedVAHTTP": true

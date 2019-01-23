@@ -48,9 +48,8 @@ type ServiceConfig struct {
 type DBConfig struct {
 	DBConnect string
 	// A file containing a connect URL for the DB.
-	DBConnectFile  string
-	MaxDBConns     int
-	MaxIdleDBConns int
+	DBConnectFile string
+	MaxDBConns    int
 }
 
 // URL returns the DBConnect URL represented by this DBConfig object, either
@@ -157,28 +156,20 @@ type OCSPUpdaterConfig struct {
 	ServiceConfig
 	DBConfig
 
-	NewCertificateWindow     ConfigDuration
 	OldOCSPWindow            ConfigDuration
-	MissingSCTWindow         ConfigDuration
 	RevokedCertificateWindow ConfigDuration
 
-	NewCertificateBatchSize     int
 	OldOCSPBatchSize            int
-	MissingSCTBatchSize         int
 	RevokedCertificateBatchSize int
 
 	OCSPMinTimeToExpiry          ConfigDuration
 	OCSPStaleMaxAge              ConfigDuration
-	OldestIssuedSCT              ConfigDuration
 	ParallelGenerateOCSPRequests int
 
-	AkamaiBaseURL      string
-	AkamaiClientToken  string
-	AkamaiClientSecret string
-	AkamaiAccessToken  string
-	// When AkamaiV3Network is not provided, the Akamai CCU API v2 is used. When
-	// AkamaiV3Network is set to "staging" or "production" the Akamai CCU API v3
-	// is used.
+	AkamaiBaseURL           string
+	AkamaiClientToken       string
+	AkamaiClientSecret      string
+	AkamaiAccessToken       string
 	AkamaiV3Network         string
 	AkamaiPurgeRetries      int
 	AkamaiPurgeRetryBackoff ConfigDuration

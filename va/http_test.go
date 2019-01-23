@@ -20,113 +20,42 @@ import (
 	"testing"
 )
 
-func TestNewHTTPClient(t *testing.T) {
-	dummyRedirHandler := func(_ *http.Request, _ []*http.Request) error {
-		return nil
+// TestDialerMismatchError tests that using a preresolvedDialer for one host for
+// a dial to another host produces the expected dialerMismatchError.
+func TestDialerMismatchError(t *testing.T) {
+	d := preresolvedDialer{
+		ip:       net.ParseIP("127.0.0.1"),
+		port:     1337,
+		hostname: "letsencrypt.org",
 	}
-	client := newHTTPClient(dummyRedirHandler)
 
-	// The client should have a HTTP Transport
-	rawTransport := client.Transport
-	if httpTrans, ok := rawTransport.(*http.Transport); !ok {
-		t.Fatalf(
-			"newHTTPClient returned a client with a Transport of the wrong type: "+
-				"%t not http.Transport",
-			rawTransport)
-	} else {
-		// The HTTP Transport should have a TLS config that skips verifying
-		// certificates.
-		test.AssertEquals(t, httpTrans.TLSClientConfig.InsecureSkipVerify, true)
-		// Keep alives should be disabled
-		test.AssertEquals(t, httpTrans.DisableKeepAlives, true)
-		test.AssertEquals(t, httpTrans.MaxIdleConns, 1)
-		test.AssertEquals(t, httpTrans.IdleConnTimeout.String(), "1s")
-		test.AssertEquals(t, httpTrans.TLSHandshakeTimeout.String(), "10s")
+	expectedErr := dialerMismatchError{
+		dialerHost: d.hostname,
+		dialerIP:   d.ip.String(),
+		dialerPort: d.port,
+		host:       "lettuceencrypt.org",
 	}
+
+	_, err := d.DialContext(
+		context.Background(),
+		"tincan-and-string",
+		"lettuceencrypt.org:80")
+	test.AssertEquals(t, err.Error(), expectedErr.Error())
 }
 
-func TestHTTPValidationURL(t *testing.T) {
-	egPath := "/.well-known/.less-known/.obscure"
-	testCases := []struct {
-		Name        string
-		IP          string
-		Path        string
-		Port        int
-		UseHTTPS    bool
-		ExpectedURL string
-	}{
-		{
-			Name:        "IPv4 Standard HTTP port",
-			IP:          "10.10.10.10",
-			Path:        egPath,
-			Port:        80,
-			ExpectedURL: fmt.Sprintf("http://10.10.10.10%s", egPath),
-		},
-		{
-			Name:        "IPv4 Non-standard HTTP port",
-			IP:          "15.15.15.15",
-			Path:        egPath,
-			Port:        8080,
-			ExpectedURL: fmt.Sprintf("http://15.15.15.15:8080%s", egPath),
-		},
-		{
-			Name:        "IPv6 Standard HTTP port",
-			IP:          "::1",
-			Path:        egPath,
-			Port:        80,
-			ExpectedURL: fmt.Sprintf("http://[::1]%s", egPath),
-		},
-		{
-			Name:        "IPv6 Non-standard HTTP port",
-			IP:          "::1",
-			Path:        egPath,
-			Port:        8080,
-			ExpectedURL: fmt.Sprintf("http://[::1]:8080%s", egPath),
-		},
-		{
-			Name:        "IPv4 Standard HTTPS port",
-			IP:          "10.10.10.10",
-			Path:        egPath,
-			Port:        443,
-			UseHTTPS:    true,
-			ExpectedURL: fmt.Sprintf("https://10.10.10.10%s", egPath),
-		},
-		{
-			Name:        "IPv4 Non-standard HTTPS port",
-			IP:          "15.15.15.15",
-			Path:        egPath,
-			Port:        4443,
-			UseHTTPS:    true,
-			ExpectedURL: fmt.Sprintf("https://15.15.15.15:4443%s", egPath),
-		},
-		{
-			Name:        "IPv6 Standard HTTPS port",
-			IP:          "::1",
-			Path:        egPath,
-			Port:        443,
-			UseHTTPS:    true,
-			ExpectedURL: fmt.Sprintf("https://[::1]%s", egPath),
-		},
-		{
-			Name:        "IPv6 Non-standard HTTPS port",
-			IP:          "::1",
-			Path:        egPath,
-			Port:        4443,
-			UseHTTPS:    true,
-			ExpectedURL: fmt.Sprintf("https://[::1]:4443%s", egPath),
-		},
+func TestHTTPTransport(t *testing.T) {
+	dummyDialerFunc := func(_ context.Context, _, _ string) (net.Conn, error) {
+		return nil, nil
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			ipAddr := net.ParseIP(tc.IP)
-			if ipAddr == nil {
-				t.Fatalf("Failed to parse test case %q IP %q", tc.Name, tc.IP)
-			}
-			url := httpValidationURL(ipAddr, tc.Path, tc.Port, tc.UseHTTPS)
-			test.AssertEquals(t, url.String(), tc.ExpectedURL)
-		})
-	}
+	transport := httpTransport(dummyDialerFunc)
+	// The HTTP Transport should have a TLS config that skips verifying
+	// certificates.
+	test.AssertEquals(t, transport.TLSClientConfig.InsecureSkipVerify, true)
+	// Keep alives should be disabled
+	test.AssertEquals(t, transport.DisableKeepAlives, true)
+	test.AssertEquals(t, transport.MaxIdleConns, 1)
+	test.AssertEquals(t, transport.IdleConnTimeout.String(), "1s")
+	test.AssertEquals(t, transport.TLSHandshakeTimeout.String(), "10s")
 }
 
 func TestHTTPValidationTarget(t *testing.T) {
@@ -162,8 +91,9 @@ func TestHTTPValidationTarget(t *testing.T) {
 	}
 
 	const (
-		examplePort = 1234
-		examplePath = "/.well-known/path/i/took"
+		examplePort  = 1234
+		examplePath  = "/.well-known/path/i/took"
+		exampleQuery = "my-path=was&my=own"
 	)
 
 	va, _ := setup(nil, 0)
@@ -173,7 +103,8 @@ func TestHTTPValidationTarget(t *testing.T) {
 				context.Background(),
 				tc.Host,
 				examplePort,
-				examplePath)
+				examplePath,
+				exampleQuery)
 			if err != nil && tc.ExpectedError == nil {
 				t.Fatalf("Unexpected error from NewHTTPValidationTarget: %v", err)
 			} else if err != nil && tc.ExpectedError != nil {
@@ -306,7 +237,8 @@ func TestSetupHTTPValidation(t *testing.T) {
 			context.Background(),
 			host,
 			port,
-			path)
+			path,
+			"")
 		if err != nil {
 			t.Fatalf("Failed to construct httpValidationTarget for %q", host)
 			return nil
@@ -314,111 +246,81 @@ func TestSetupHTTPValidation(t *testing.T) {
 		return target
 	}
 
-	httpInputURL, err := url.Parse("http://ipv4.and.ipv6.localhost/yellow/brick/road")
-	if err != nil {
-		t.Fatalf("Failed to construct test httpInputURL")
-	}
-	httpsInputURL, err := url.Parse("https://ipv4.and.ipv6.localhost/yellow/brick/road")
-	if err != nil {
-		t.Fatalf("Failed to construct test httpsInputURL")
-	}
+	httpInputURL := "http://ipv4.and.ipv6.localhost/yellow/brick/road"
+	httpsInputURL := "https://ipv4.and.ipv6.localhost/yellow/brick/road"
 
 	testCases := []struct {
-		Name                string
-		InputReq            *http.Request
-		InputTarget         *httpValidationTarget
-		ExpectedRequestHost string
-		ExpectedRequestURL  string
-		ExpectedRecord      core.ValidationRecord
-		ExpectedError       error
+		Name           string
+		InputURL       string
+		InputTarget    *httpValidationTarget
+		ExpectedRecord core.ValidationRecord
+		ExpectedDialer *preresolvedDialer
+		ExpectedError  error
 	}{
 		{
 			Name:          "nil target",
+			InputURL:      httpInputURL,
 			ExpectedError: fmt.Errorf("httpValidationTarget can not be nil"),
 		},
 		{
-			Name: "target with no IPs",
+			Name:          "empty input URL",
+			InputTarget:   &httpValidationTarget{},
+			ExpectedError: fmt.Errorf("reqURL can not be nil"),
+		},
+		{
+			Name:     "target with no IPs",
+			InputURL: httpInputURL,
 			InputTarget: &httpValidationTarget{
 				host: "foobar",
 				port: va.httpPort,
 				path: "idk",
 			},
-			// With a broken target no URL is added to the validation record because
-			// there was no IP to construct it with.
 			ExpectedRecord: core.ValidationRecord{
+				URL:      "http://ipv4.and.ipv6.localhost/yellow/brick/road",
 				Hostname: "foobar",
 				Port:     strconv.Itoa(va.httpPort),
 			},
 			ExpectedError: fmt.Errorf(`host "foobar" has no IP addresses remaining to use`),
 		},
 		{
-			Name:                "nil input req",
-			InputTarget:         mustTarget(t, "example.com", 9999, "/.well-known/stuff"),
-			ExpectedRequestHost: "example.com",
-			ExpectedRequestURL:  "http://127.0.0.1:9999/.well-known/stuff",
-			ExpectedRecord: core.ValidationRecord{
-				Hostname:          "example.com",
-				Port:              "9999",
-				URL:               "http://127.0.0.1:9999/.well-known/stuff",
-				AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
-				AddressUsed:       net.ParseIP("127.0.0.1"),
-			},
-		},
-		{
-			Name:        "non-nil non-standard port input req",
-			InputTarget: mustTarget(t, "ipv4.and.ipv6.localhost", 808, "/yellow/brick/road"),
-			InputReq: &http.Request{
-				URL: httpInputURL,
-			},
-			ExpectedRequestHost: "ipv4.and.ipv6.localhost",
-			ExpectedRequestURL:  "http://[::1]:808/yellow/brick/road",
-			ExpectedRecord: core.ValidationRecord{
-				Hostname:          "ipv4.and.ipv6.localhost",
-				Port:              "808",
-				URL:               "http://[::1]:808/yellow/brick/road",
-				AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
-				AddressUsed:       net.ParseIP("::1"),
-			},
-		},
-		{
-			Name:        "non-nil HTTP input req",
+			Name:        "HTTP input req",
 			InputTarget: mustTarget(t, "ipv4.and.ipv6.localhost", va.httpPort, "/yellow/brick/road"),
-			InputReq: &http.Request{
-				URL: httpInputURL,
-			},
-			ExpectedRequestHost: "ipv4.and.ipv6.localhost",
-			ExpectedRequestURL:  "http://[::1]/yellow/brick/road",
+			InputURL:    httpInputURL,
 			ExpectedRecord: core.ValidationRecord{
 				Hostname:          "ipv4.and.ipv6.localhost",
 				Port:              strconv.Itoa(va.httpPort),
-				URL:               "http://[::1]/yellow/brick/road",
+				URL:               "http://ipv4.and.ipv6.localhost/yellow/brick/road",
 				AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
 				AddressUsed:       net.ParseIP("::1"),
+			},
+			ExpectedDialer: &preresolvedDialer{
+				ip:   net.ParseIP("::1"),
+				port: va.httpPort,
 			},
 		},
 		{
-			Name:        "non-nil HTTPS input req",
+			Name:        "HTTPS input req",
 			InputTarget: mustTarget(t, "ipv4.and.ipv6.localhost", va.httpsPort, "/yellow/brick/road"),
-			InputReq: &http.Request{
-				URL: httpsInputURL,
-			},
-			ExpectedRequestHost: "ipv4.and.ipv6.localhost",
-			ExpectedRequestURL:  "https://[::1]/yellow/brick/road",
+			InputURL:    httpsInputURL,
 			ExpectedRecord: core.ValidationRecord{
 				Hostname:          "ipv4.and.ipv6.localhost",
 				Port:              strconv.Itoa(va.httpsPort),
-				URL:               "https://[::1]/yellow/brick/road",
+				URL:               "https://ipv4.and.ipv6.localhost/yellow/brick/road",
 				AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
 				AddressUsed:       net.ParseIP("::1"),
+			},
+			ExpectedDialer: &preresolvedDialer{
+				ip:   net.ParseIP("::1"),
+				port: va.httpsPort,
 			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			outReq, outRecord, err := va.setupHTTPValidation(
+			outDialer, outRecord, err := va.setupHTTPValidation(
 				context.Background(),
-				tc.InputReq,
+				tc.InputURL,
 				tc.InputTarget)
 
 			if err != nil && tc.ExpectedError == nil {
@@ -427,23 +329,14 @@ func TestSetupHTTPValidation(t *testing.T) {
 				t.Errorf("Expected %v error, got nil", tc.ExpectedError)
 			} else if err != nil && tc.ExpectedError != nil {
 				test.AssertEquals(t, err.Error(), tc.ExpectedError.Error())
-			} else {
-				test.AssertEquals(t, outReq.Host, tc.ExpectedRequestHost)
-				test.AssertEquals(t, outReq.URL.String(), tc.ExpectedRequestURL)
+			}
+			if tc.ExpectedDialer == nil && outDialer != nil {
+				t.Errorf("Expected nil dialer, got %v", outDialer)
+			} else if tc.ExpectedDialer != nil {
+				test.AssertMarshaledEquals(t, outDialer, tc.ExpectedDialer)
 			}
 			// In all cases we expect there to have been a validation record
 			test.AssertMarshaledEquals(t, outRecord, tc.ExpectedRecord)
-			// If the input request was nil then check that the constructed outReq has
-			// the right UA and Accept header values.
-			if tc.InputReq == nil && err == nil {
-				test.AssertEquals(t, outReq.Header.Get("User-Agent"), va.userAgent)
-				test.AssertEquals(t, outReq.Header.Get("Accept"), "*/*")
-			} else if tc.InputReq != nil && err == nil {
-				// Otherwise if there was an input req make sure its URL and Host were
-				// mutated as expected.
-				test.AssertEquals(t, tc.InputReq.Host, tc.ExpectedRequestHost)
-				test.AssertEquals(t, tc.InputReq.URL.String(), tc.ExpectedRequestURL)
-			}
 		})
 	}
 }
@@ -654,11 +547,16 @@ func TestFetchHTTPSimple(t *testing.T) {
 	// giving a termination criteria of > maxRedirect+1
 	expectedLoopRecords := []core.ValidationRecord{}
 	for i := 0; i <= maxRedirect+1; i++ {
+		// The first request will not have a port # in the URL.
+		url := "http://example.com/loop"
+		if i != 0 {
+			url = fmt.Sprintf("http://example.com:%d/loop", httpPort)
+		}
 		expectedLoopRecords = append(expectedLoopRecords,
 			core.ValidationRecord{
 				Hostname:          "example.com",
 				Port:              strconv.Itoa(httpPort),
-				URL:               fmt.Sprintf("http://127.0.0.1:%d/loop", httpPort),
+				URL:               url,
 				AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 				AddressUsed:       net.ParseIP("127.0.0.1"),
 			})
@@ -692,13 +590,13 @@ func TestFetchHTTPSimple(t *testing.T) {
 			Host: "example.com",
 			Path: "/timeout",
 			ExpectedProblem: probs.ConnectionFailure(
-				"Fetching http://127.0.0.1:%d/timeout: "+
-					"Timeout after connect (your server may be slow or overloaded)", httpPort),
+				"Fetching http://example.com/timeout: " +
+					"Timeout after connect (your server may be slow or overloaded)"),
 			ExpectedRecords: []core.ValidationRecord{
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/timeout", httpPort),
+					URL:               "http://example.com/timeout",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -724,7 +622,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/redir-bad-proto", httpPort),
+					URL:               "http://example.com/redir-bad-proto",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -741,7 +639,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/redir-bad-port", httpPort),
+					URL:               "http://example.com/redir-bad-port",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -758,7 +656,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/redir-bad-host", httpPort),
+					URL:               "http://example.com/redir-bad-host",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -769,15 +667,13 @@ func TestFetchHTTPSimple(t *testing.T) {
 			Host: "example.com",
 			Path: "/bad-status-code",
 			ExpectedProblem: probs.Unauthorized(
-				"Invalid response from http://127.0.0.1:%d/bad-status-code "+
-					"[127.0.0.1]: 410",
-				httpPort,
-			),
+				"Invalid response from http://example.com/bad-status-code " +
+					"[127.0.0.1]: 410"),
 			ExpectedRecords: []core.ValidationRecord{
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/bad-status-code", httpPort),
+					URL:               "http://example.com/bad-status-code",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -788,14 +684,14 @@ func TestFetchHTTPSimple(t *testing.T) {
 			Host: "example.com",
 			Path: "/resp-too-big",
 			ExpectedProblem: probs.Unauthorized(
-				"Invalid response from http://127.0.0.1:%d/resp-too-big "+
-					"[127.0.0.1]: %q", httpPort, expectedTruncatedResp.String(),
+				"Invalid response from http://example.com/resp-too-big "+
+					"[127.0.0.1]: %q", expectedTruncatedResp.String(),
 			),
 			ExpectedRecords: []core.ValidationRecord{
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/resp-too-big", httpPort),
+					URL:               "http://example.com/resp-too-big",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -806,13 +702,12 @@ func TestFetchHTTPSimple(t *testing.T) {
 			Host: "ipv6.localhost",
 			Path: "/ok",
 			ExpectedProblem: probs.ConnectionFailure(
-				"Fetching http://[::1]:%d/ok: Error getting validation data", httpPort,
-			),
+				"Fetching http://ipv6.localhost/ok: Error getting validation data"),
 			ExpectedRecords: []core.ValidationRecord{
 				core.ValidationRecord{
 					Hostname:          "ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://[::1]:%d/ok", httpPort),
+					URL:               "http://ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1")},
 					AddressUsed:       net.ParseIP("::1"),
 				},
@@ -827,7 +722,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "ipv4.and.ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://[::1]:%d/ok", httpPort),
+					URL:               "http://ipv4.and.ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
 					// The first validation record should have used the IPv6 addr
 					AddressUsed: net.ParseIP("::1"),
@@ -835,7 +730,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "ipv4.and.ipv6.localhost",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/ok", httpPort),
+					URL:               "http://ipv4.and.ipv6.localhost/ok",
 					AddressesResolved: []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")},
 					// The second validation record should have used the IPv4 addr as a fallback
 					AddressUsed: net.ParseIP("127.0.0.1"),
@@ -851,7 +746,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 				core.ValidationRecord{
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
-					URL:               fmt.Sprintf("http://127.0.0.1:%d/ok", httpPort),
+					URL:               "http://example.com/ok",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
