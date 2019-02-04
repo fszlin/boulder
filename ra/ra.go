@@ -23,6 +23,7 @@ import (
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/iana"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/probs"
@@ -384,6 +385,9 @@ func validateEmail(address string) error {
 		return berrors.InvalidEmailError(
 			"invalid contact domain. Contact emails @%s are forbidden",
 			domain)
+	}
+	if _, err := iana.ExtractSuffix(domain); err != nil {
+		return berrors.InvalidEmailError("email domain name does not end in a IANA suffix")
 	}
 	return nil
 }
@@ -1743,6 +1747,11 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 	// authorizations correspond to
 	nameToExistingAuthz := make(map[string]*corepb.Authorization, len(order.Names))
 	for _, v := range existingAuthz.Authz {
+		// Don't reuse a valid authorization if the reuseValidAuthz flag is
+		// disabled.
+		if *v.Authz.Status == string(core.StatusValid) && !ra.reuseValidAuthz {
+			continue
+		}
 		nameToExistingAuthz[*v.Domain] = v.Authz
 	}
 
