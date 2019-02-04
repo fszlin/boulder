@@ -104,7 +104,6 @@
   },
 
   "common": {
-    "dnsResolver": "8.8.8.8:53",
     "dnsTimeout": "1s",
     "dnsAllowLoopbackAddresses": true
   }

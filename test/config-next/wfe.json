@@ -27,7 +27,7 @@
       "timeout": "200s"
     },
     "saService": {
-      "serverAddresses": ["sa.boulder:9095"],
+      "serverAddress": "sa.boulder:9095",
       "timeout": "150s"
     },
     "features": {

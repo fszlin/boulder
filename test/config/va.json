@@ -3,9 +3,9 @@
     "userAgent": "boulder",
     "debugAddr": ":8004",
     "portConfig": {
-      "httpPort": 80,
-      "httpsPort": 443,
-      "tlsPort": 443
+      "httpPort": 5002,
+      "httpsPort": 5001,
+      "tlsPort": 5001
     },
     "maxConcurrentRPCServerRequests": 100000,
     "dnsTries": 3,
@@ -41,8 +41,7 @@
   },
 
   "common": {
-    "dnsResolver": "127.0.0.11:53",
-    "dnsTimeout": "30s",
+    "dnsTimeout": "1s",
     "dnsAllowLoopbackAddresses": true
   }
 }

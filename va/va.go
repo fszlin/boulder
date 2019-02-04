@@ -515,7 +515,6 @@ func (va *ValidationAuthorityImpl) fetchHTTP(ctx context.Context, identifier cor
 		return nil
 	}
 	client := http.Client{
-		Timeout:       time.Duration(60 * time.Second),
 		Transport:     tr,
 		CheckRedirect: logRedirect,
 	}

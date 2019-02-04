@@ -10,7 +10,8 @@
     },
     "dnsTries": 3,
     "dnsResolvers": [
-      "8.8.8.8:53"
+      "8.8.8.8:53",
+      "8.8.4.4:53"
     ],
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
