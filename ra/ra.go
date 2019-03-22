@@ -3,7 +3,6 @@ package ra
 import (
 	"crypto/x509"
 	"encoding/json"
-	"expvar"
 	"fmt"
 	"net"
 	"net/mail"
@@ -14,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
+	"github.com/letsencrypt/boulder/akamai"
+	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -39,12 +40,6 @@ import (
 	"golang.org/x/net/context"
 	grpc "google.golang.org/grpc"
 )
-
-// Note: the issuanceExpvar must be a global. If it is a member of the RA, or
-// initialized with everything else in NewRegistrationAuthority() then multiple
-// invocations of the constructor (e.g from unit tests) will panic with a "Reuse
-// of exported var name:" error from the expvar package.
-var issuanceExpvar = expvar.NewInt("lastIssuance")
 
 type caaChecker interface {
 	IsCAAValid(
@@ -80,6 +75,9 @@ type RegistrationAuthorityImpl struct {
 	reuseValidAuthz              bool
 	orderLifetime                time.Duration
 
+	issuer *x509.Certificate
+	purger akamaipb.AkamaiPurgerClient
+
 	regByIPStats           metrics.Scope
 	regByIPRangeStats      metrics.Scope
 	pendAuthByRegIDStats   metrics.Scope
@@ -107,6 +105,8 @@ func NewRegistrationAuthorityImpl(
 	caaClient caaChecker,
 	orderLifetime time.Duration,
 	ctp *ctpolicy.CTPolicy,
+	purger akamaipb.AkamaiPurgerClient,
+	issuer *x509.Certificate,
 ) *RegistrationAuthorityImpl {
 	ctpolicyResults := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -141,6 +141,8 @@ func NewRegistrationAuthorityImpl(
 		orderLifetime:                orderLifetime,
 		ctpolicy:                     ctp,
 		ctpolicyResults:              ctpolicyResults,
+		purger:                       purger,
+		issuer:                       issuer,
 	}
 	return ra
 }
@@ -832,14 +834,8 @@ func (ra *RegistrationAuthorityImpl) failOrder(
 func (ra *RegistrationAuthorityImpl) FinalizeOrder(ctx context.Context, req *rapb.FinalizeOrderRequest) (*corepb.Order, error) {
 	order := req.Order
 
-	// Prior to ACME draft-10 the "ready" status did not exist and orders in
-	// a pending status with valid authzs were finalizable. We accept both states
-	// here for deployability ease. In the future we will only allow ready orders
-	// to be finalized.
-	// TODO(@cpu): Forbid finalizing "Pending" orders
-	if *order.Status != string(core.StatusPending) &&
-		*order.Status != string(core.StatusReady) {
-		return nil, berrors.MalformedError(
+	if *order.Status != string(core.StatusReady) {
+		return nil, berrors.OrderNotReadyError(
 			"Order's status (%q) is not acceptable for finalization",
 			*order.Status)
 	}
@@ -976,7 +972,6 @@ func (ra *RegistrationAuthorityImpl) issueCertificate(
 		logEvent.Error = err.Error()
 		result = "error"
 	} else {
-		issuanceExpvar.Set(ra.clk.Now().Unix())
 		result = "successful"
 	}
 	logEvent.ResponseTime = ra.clk.Now()
@@ -1264,7 +1259,7 @@ func (ra *RegistrationAuthorityImpl) checkCertificatesPerNameLimit(ctx context.C
 	}
 
 	if len(badNames) > 0 {
-		// check if there is already a existing certificate for
+		// check if there is already an existing certificate for
 		// the exact name set we are issuing for. If so bypass the
 		// the certificatesPerName limit.
 		exists, err := ra.SA.FQDNSetExists(ctx, names)
@@ -1438,22 +1433,9 @@ func (ra *RegistrationAuthorityImpl) PerformValidation(
 
 	ch := &authz.Challenges[challIndex]
 
-	// If TLSSNIRevalidation is enabled, find out whether this was a revalidation
-	// (previous certificate existed) or not. If it is a revalidation, we can
-	// proceed with validation even though the challenge type is currently
-	// disabled.
-	if !ra.PA.ChallengeTypeEnabled(ch.Type, authz.RegistrationID) && features.Enabled(features.TLSSNIRevalidation) {
-		existsResp, err := ra.SA.PreviousCertificateExists(ctx, &sapb.PreviousCertificateExistsRequest{
-			Domain: &authz.Identifier.Value,
-			RegID:  &authz.RegistrationID,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if !*existsResp.Exists {
-			return nil,
-				berrors.MalformedError("challenge type %q no longer allowed", ch.Type)
-		}
+	// This challenge type may have been disabled since the challenge was created.
+	if !ra.PA.ChallengeTypeEnabled(ch.Type) {
+		return nil, berrors.MalformedError("challenge type %q no longer allowed", ch.Type)
 	}
 
 	// When configured with `reuseValidAuthz` we can expect some clients to try
@@ -1553,10 +1535,53 @@ func revokeEvent(state, serial, cn string, names []string, revocationCode revoca
 	)
 }
 
+// revokeCertificate generates a revoked OCSP response for the given certificate, stores
+// the revocation information, and purges OCSP request URLs from Akamai.
+func (ra *RegistrationAuthorityImpl) revokeCertificate(ctx context.Context, cert x509.Certificate, code revocation.Reason) error {
+	now := time.Now()
+	signRequest := core.OCSPSigningRequest{
+		CertDER:   cert.Raw,
+		Status:    string(core.OCSPStatusRevoked),
+		Reason:    code,
+		RevokedAt: now,
+	}
+	ocspResponse, err := ra.CA.GenerateOCSP(ctx, signRequest)
+	if err != nil {
+		return err
+	}
+	serial := core.SerialToString(cert.SerialNumber)
+	nowUnix := now.UnixNano()
+	reason := int64(code)
+	err = ra.SA.RevokeCertificate(ctx, &sapb.RevokeCertificateRequest{
+		Serial:   &serial,
+		Reason:   &reason,
+		Date:     &nowUnix,
+		Response: ocspResponse,
+	})
+	if err != nil {
+		return err
+	}
+	purgeURLs, err := akamai.GeneratePurgeURLs(cert.Raw, ra.issuer)
+	if err != nil {
+		return err
+	}
+	_, err = ra.purger.Purge(ctx, &akamaipb.PurgeRequest{Urls: purgeURLs})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // RevokeCertificateWithReg terminates trust in the certificate provided.
 func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, revocationCode revocation.Reason, regID int64) error {
 	serialString := core.SerialToString(cert.SerialNumber)
-	err := ra.SA.MarkCertificateRevoked(ctx, serialString, revocationCode)
+	var err error
+	if features.Enabled(features.RevokeAtRA) {
+		err = ra.revokeCertificate(ctx, cert, revocationCode)
+	} else {
+		err = ra.SA.MarkCertificateRevoked(ctx, serialString, revocationCode)
+	}
 
 	state := "Failure"
 	defer func() {
@@ -1578,6 +1603,7 @@ func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Contex
 	}
 
 	state = "Success"
+	ra.stats.Inc("RevokedCertificates", 1)
 	return nil
 }
 
@@ -1586,7 +1612,12 @@ func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Contex
 // called from the admin-revoker tool.
 func (ra *RegistrationAuthorityImpl) AdministrativelyRevokeCertificate(ctx context.Context, cert x509.Certificate, revocationCode revocation.Reason, user string) error {
 	serialString := core.SerialToString(cert.SerialNumber)
-	err := ra.SA.MarkCertificateRevoked(ctx, serialString, revocationCode)
+	var err error
+	if features.Enabled(features.RevokeAtRA) {
+		err = ra.revokeCertificate(ctx, cert, revocationCode)
+	} else {
+		err = ra.SA.MarkCertificateRevoked(ctx, serialString, revocationCode)
+	}
 
 	state := "Failure"
 	defer func() {
@@ -1719,6 +1750,15 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 	// Check if there is rate limit space for a new order within the current window
 	if err := ra.checkNewOrdersPerAccountLimit(ctx, *order.RegistrationID); err != nil {
 		return nil, err
+	}
+
+	if features.Enabled(features.EarlyOrderRateLimit) {
+		// Check if there is rate limit space for issuing a certificate for the new
+		// order's names. If there isn't then it doesn't make sense to allow creating
+		// an order - it will just fail when finalization checks the same limits.
+		if err := ra.checkLimits(ctx, order.Names, *order.RegistrationID); err != nil {
+			return nil, err
+		}
 	}
 
 	// An order's lifetime is effectively bound by the shortest remaining lifetime
@@ -1876,23 +1916,8 @@ func (ra *RegistrationAuthorityImpl) createPendingAuthz(ctx context.Context, reg
 		Expires:        &expires,
 	}
 
-	// If TLSSNIRevalidation is enabled, find out whether this was a revalidation
-	// (previous certificate existed) or not. If it is a revalidation, we'll tell
-	// the PA about that so it can include the TLS-SNI-01 challenge.
-	var previousCertificateExists bool
-	if features.Enabled(features.TLSSNIRevalidation) {
-		existsResp, err := ra.SA.PreviousCertificateExists(ctx, &sapb.PreviousCertificateExistsRequest{
-			Domain: &identifier.Value,
-			RegID:  &reg,
-		})
-		if err != nil {
-			return nil, err
-		}
-		previousCertificateExists = *existsResp.Exists
-	}
-
 	// Create challenges. The WFE will update them with URIs before sending them out.
-	challenges, combinations, err := ra.PA.ChallengesFor(identifier, reg, previousCertificateExists)
+	challenges, combinations, err := ra.PA.ChallengesFor(identifier)
 	if err != nil {
 		// The only time ChallengesFor errors it is a fatal configuration error
 		// where challenges required by policy for an identifier are not enabled. We
@@ -1926,7 +1951,7 @@ func (ra *RegistrationAuthorityImpl) createPendingAuthz(ctx context.Context, reg
 func (ra *RegistrationAuthorityImpl) authzValidChallengeEnabled(authz *core.Authorization) bool {
 	for _, chall := range authz.Challenges {
 		if chall.Status == core.StatusValid {
-			return ra.PA.ChallengeTypeEnabled(chall.Type, authz.RegistrationID)
+			return ra.PA.ChallengeTypeEnabled(chall.Type)
 		}
 	}
 	return false

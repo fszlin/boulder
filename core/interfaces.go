@@ -108,8 +108,8 @@ type CertificateAuthority interface {
 type PolicyAuthority interface {
 	WillingToIssue(domain AcmeIdentifier) error
 	WillingToIssueWildcard(domain AcmeIdentifier) error
-	ChallengesFor(domain AcmeIdentifier, registrationID int64, revalidation bool) (challenges []Challenge, validCombinations [][]int, err error)
-	ChallengeTypeEnabled(t string, registrationID int64) bool
+	ChallengesFor(domain AcmeIdentifier) (challenges []Challenge, validCombinations [][]int, err error)
+	ChallengeTypeEnabled(t string) bool
 }
 
 // StorageGetter are the Boulder SA's read-only methods
@@ -135,6 +135,7 @@ type StorageGetter interface {
 	GetValidOrderAuthorizations(ctx context.Context, req *sapb.GetValidOrderAuthorizationsRequest) (map[string]*Authorization, error)
 	CountInvalidAuthorizations(ctx context.Context, req *sapb.CountInvalidAuthorizationsRequest) (count *sapb.Count, err error)
 	GetAuthorizations(ctx context.Context, req *sapb.GetAuthorizationsRequest) (*sapb.Authorizations, error)
+	GetAuthz2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Authorization, error)
 }
 
 // StorageAdder are the Boulder SA's write/update methods
@@ -142,7 +143,6 @@ type StorageAdder interface {
 	NewRegistration(ctx context.Context, reg Registration) (created Registration, err error)
 	UpdateRegistration(ctx context.Context, reg Registration) error
 	NewPendingAuthorization(ctx context.Context, authz Authorization) (Authorization, error)
-	UpdatePendingAuthorization(ctx context.Context, authz Authorization) error
 	FinalizeAuthorization(ctx context.Context, authz Authorization) error
 	MarkCertificateRevoked(ctx context.Context, serial string, reasonCode revocation.Reason) error
 	AddCertificate(ctx context.Context, der []byte, regID int64, ocsp []byte, issued *time.Time) (digest string, err error)
@@ -154,6 +154,7 @@ type StorageAdder interface {
 	FinalizeOrder(ctx context.Context, order *corepb.Order) error
 	AddPendingAuthorizations(ctx context.Context, req *sapb.AddPendingAuthorizationsRequest) (*sapb.AuthorizationIDs, error)
 	SetOrderError(ctx context.Context, order *corepb.Order) error
+	RevokeCertificate(ctx context.Context, req *sapb.RevokeCertificateRequest) error
 }
 
 // StorageAuthority interface represents a simple key/value

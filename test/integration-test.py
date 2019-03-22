@@ -4,6 +4,7 @@ import atexit
 import base64
 import datetime
 import errno
+import inspect
 import json
 import os
 import random
@@ -22,7 +23,7 @@ import startservers
 
 import chisel
 from chisel import auth_and_issue
-from v2_integration import *
+import v2_integration
 from helpers import *
 
 from acme import challenges
@@ -52,6 +53,9 @@ caa_authzs = []
 old_authzs = []
 new_authzs = []
 
+default_config_dir = os.environ.get('BOULDER_CONFIG_DIR', '')
+if default_config_dir == '':
+    default_config_dir = 'test/config'
 
 def setup_seventy_days_ago():
     """Do any setup that needs to happen 70 days in the past, for tests that
@@ -306,6 +310,65 @@ def test_http_challenge_https_redirect():
       elif r['ServerName'] != d:
         raise Exception("Expected all redirected requests to have ServerName {0} got \"{1}\"".format(d, r['ServerName']))
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class SlowHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            # Sleeptime needs to be larger than the RA->VA timeout (20s at the
+            # time of writing)
+            sleeptime = 22
+            print("SlowHTTPRequestHandler: sleeping for {0}s\n".format(sleeptime))
+            time.sleep(sleeptime)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'this is not an ACME key authorization')
+        except:
+            pass
+
+def test_http_challenge_timeout():
+    """
+    test_http_challenge_timeout tests that the VA times out challenge requests
+    to a slow HTTP server appropriately.
+    """
+    # Start a simple python HTTP server on port 5002 in its own thread.
+    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:5002 for HTTP-01
+    # challenges so we must use the 10.88.88.88 address for the throw away
+    # server for this test and add a mock DNS entry that directs the VA to it.
+    httpd = HTTPServer(('10.88.88.88', 5002), SlowHTTPRequestHandler)
+    thread = threading.Thread(target = httpd.serve_forever)
+    thread.daemon = False
+    thread.start()
+
+    # Pick a random domains
+    hostname = random_domain()
+
+    # Add A record for the domains to ensure the VA's requests are directed
+    # to the interface that we bound the HTTPServer to.
+    challSrv.add_a_record(hostname, ["10.88.88.88"])
+
+    start = datetime.datetime.utcnow()
+    end = 0
+
+    try:
+        # We expect a connection timeout error to occur
+        chisel.expect_problem("urn:acme:error:connection",
+            lambda: auth_and_issue([hostname], chall_type="http-01"))
+        end = datetime.datetime.utcnow()
+    finally:
+        # Shut down the HTTP server gracefully and join on its thread.
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join()
+
+    delta = end - start
+    # Expected duration should be the RA->VA timeout plus some padding (At
+    # present the timeout is 20s so adding 2s of padding = 22s)
+    expectedDuration = 22
+    if delta.total_seconds() == 0 or delta.total_seconds() > expectedDuration:
+        raise Exception("expected timeout to occur in under {0} seconds. Took {1}".format(expectedDuration, delta.total_seconds()))
+
 def test_tls_alpn_challenge():
     # Pick two random domains
     domains = [random_domain(), random_domain()]
@@ -349,21 +412,6 @@ def test_issuer():
     # Now check the end-entity certificate.
     store_ctx = OpenSSL.crypto.X509StoreContext(store, parsed_cert)
     store_ctx.verify_certificate()
-
-def test_gsb_lookups():
-    """Attempt issuances for a GSB-blocked domain, and expect it to fail. Also
-       check the gsb-test-srv's count of received queries to ensure it got a
-       request."""
-    hostname = "honest.achmeds.discount.hosting.com"
-    chisel.expect_problem("urn:acme:error:unauthorized",
-        lambda: auth_and_issue([hostname]))
-
-    hits_map = json.loads(urllib2.urlopen("http://localhost:6000/hits").read())
-
-    # The GSB test server tracks hits with a trailing / on the URL
-    hits = hits_map.get(hostname + "/", 0)
-    if hits != 1:
-        raise Exception("Expected %d Google Safe Browsing lookups for %s, found %d" % (1, url, actual))
 
 def test_ocsp():
     cert_file_pem = os.path.join(tempdir, "cert.pem")
@@ -449,7 +497,10 @@ def test_revoke_by_account():
         f.write(OpenSSL.crypto.dump_certificate(
             OpenSSL.crypto.FILETYPE_PEM, cert.body.wrapped).decode())
     ee_ocsp_url = "http://localhost:4002"
-    wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    if default_config_dir.startswith("test/config-next"):
+        verify_revocation(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    else:
+        wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
     verify_akamai_purge()
     return 0
 
@@ -652,10 +703,6 @@ def test_oversized_csr():
     chisel.expect_problem("urn:acme:error:malformed",
             lambda: auth_and_issue(domains))
 
-default_config_dir = os.environ.get('BOULDER_CONFIG_DIR', '')
-if default_config_dir == '':
-    default_config_dir = 'test/config'
-
 def test_admin_revoker_cert():
     cert_file_pem = os.path.join(tempdir, "ar-cert.pem")
     cert, _ = auth_and_issue([random_domain()], cert_output=cert_file_pem)
@@ -666,7 +713,10 @@ def test_admin_revoker_cert():
         default_config_dir, serial, 1))
     # Wait for OCSP response to indicate revocation took place
     ee_ocsp_url = "http://localhost:4002"
-    wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    if default_config_dir.startswith("test/config-next"):
+        verify_revocation(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
+    else:
+        wait_for_ocsp_revoked(cert_file_pem, "test/test-ca2.pem", ee_ocsp_url)
     verify_akamai_purge()
 
 def test_admin_revoker_authz():
@@ -831,6 +881,9 @@ def main():
     exit_status = 0
 
 def run_chisel(test_case_filter):
+    for key, value in inspect.getmembers(v2_integration):
+      if callable(value) and key.startswith('test_') and re.search(test_case_filter, key):
+        value()
     for key, value in globals().items():
       if callable(value) and key.startswith('test_') and re.search(test_case_filter, key):
         value()
