@@ -11,7 +11,7 @@ fi
 # defaults, because we don't want to run it locally (would be too disruptive to
 # GOPATH). We also omit coverage by default on local runs because it generates
 # artifacts on disk that aren't needed.
-RUN=${RUN:-vet fmt migrations unit integration errcheck dashlint}
+RUN=${RUN:-vet fmt migrations unit integration errcheck ineffassign dashlint}
 
 # The list of segments to hard fail on, as opposed to continuing to the end of
 # the unit tests before failing.
@@ -111,11 +111,6 @@ fi
 if [[ "$RUN" =~ "fmt" ]] ; then
   start_context "fmt"
   check_gofmt() {
-    # NOTE(@cpu): Go 1.10.3's gofmt and Go 1.11.1's gofmt don't agree. Let's
-    # temporarily ignore the gofmt check when not using Go 1.11.1
-    if [ "$TRAVIS_GO_VERSION" != "1.11.1" ]; then
-      return 0
-    fi
     unformatted=$(find . -name "*.go" -not -path "./vendor/*" -print | xargs -n1 gofmt -l)
     if [ "x${unformatted}" == "x" ] ; then
       return 0
@@ -217,6 +212,15 @@ if [[ "$RUN" =~ "errcheck" ]] ; then
     -ignore fmt:Fprintf,fmt:Fprintln,fmt:Fprint,io:Write,os:Remove,net/http:Write \
     $(go list -f '{{ .ImportPath }}' ./... | grep -v test)
   end_context #errcheck
+fi
+
+#
+# Run ineffassign, to check for ineffectual assignments.
+#
+if [[ "$RUN" =~ "ineffassign" ]] ; then
+  start_context "ineffassign"
+  run_and_expect_silence ineffassign $(go list -f '{{ .Dir }}' ./...)
+  end_context #ineffassign
 fi
 
 # Run generate to make sure all our generated code can be re-generated with

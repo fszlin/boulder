@@ -77,8 +77,8 @@ def start(race_detection, fakeclock=None, account_uri=None):
     if default_config_dir.startswith("test/config-next"):
         # Run the two 'remote' VAs
         progs.extend([
-            [8011, './bin/boulder-va --config %s' % os.path.join(default_config_dir, "va-remote-a.json")],
-            [8012, './bin/boulder-va --config %s' % os.path.join(default_config_dir, "va-remote-b.json")],
+            [8011, './bin/boulder-remoteva --config %s' % os.path.join(default_config_dir, "va-remote-a.json")],
+            [8012, './bin/boulder-remoteva --config %s' % os.path.join(default_config_dir, "va-remote-b.json")],
         ])
     progs.extend([
         [53, './bin/sd-test-srv --listen :53'], # Service discovery DNS server
@@ -89,20 +89,18 @@ def start(race_detection, fakeclock=None, account_uri=None):
         [8109, './bin/boulder-publisher --config %s --addr publisher2.boulder:9091 --debug-addr :8109' % os.path.join(default_config_dir, "publisher.json")],
         [9380, './bin/mail-test-srv --closeFirst 5 --cert test/mail-test-srv/localhost/cert.pem --key test/mail-test-srv/localhost/key.pem'],
         [8005, './bin/ocsp-responder --config %s' % os.path.join(default_config_dir, "ocsp-responder.json")],
-        # The gsb-test-srv needs to be started before the VA or its intial DB
-        # update will fail and all subsequent lookups will be invalid
-        [6000, './bin/gsb-test-srv -apikey my-voice-is-my-passport'],
         # NOTE(@cpu): We specify explicit bind addresses for -https01 and
         # --tlsalpn01 here to allow HTTPS HTTP-01 responses on 5001 for one
         # interface and TLS-ALPN-01 responses on 5001 for another interface. The
         # choice of which is used is controlled by mock DNS data added by the
         # relevant integration tests.
-        [8053, 'pebble-challtestsrv --defaultIPv4 %s --defaultIPv6 "" --dns01 :8053,:8054 --management :8055 --http01 :5002 -https01 10.77.77.77:5001 --tlsalpn01 10.88.88.88:5001' % os.environ.get("FAKE_DNS")],
+        [8053, 'pebble-challtestsrv --defaultIPv4 %s --defaultIPv6 "" --dns01 :8053,:8054 --management :8055 --http01 10.77.77.77:5002 -https01 10.77.77.77:5001 --tlsalpn01 10.88.88.88:5001' % os.environ.get("FAKE_DNS")],
         [8004, './bin/boulder-va --config %s --addr va1.boulder:9092 --debug-addr :8004' % os.path.join(default_config_dir, "va.json")],
         [8104, './bin/boulder-va --config %s --addr va2.boulder:9092 --debug-addr :8104' % os.path.join(default_config_dir, "va.json")],
         [8001, './bin/boulder-ca --config %s --ca-addr ca1.boulder:9093 --ocsp-addr ca1.boulder:9096 --debug-addr :8001' % os.path.join(default_config_dir, "ca-a.json")],
         [8101, './bin/boulder-ca --config %s --ca-addr ca2.boulder:9093 --ocsp-addr ca2.boulder:9096 --debug-addr :8101' % os.path.join(default_config_dir, "ca-b.json")],
         [6789, './bin/akamai-test-srv --listen localhost:6789 --secret its-a-secret'],
+        [9666, './bin/akamai-purger --config %s' % os.path.join(default_config_dir, "akamai-purger.json")],
         [8006, './bin/ocsp-updater --config %s' % os.path.join(default_config_dir, "ocsp-updater.json")],
         [8002, './bin/boulder-ra --config %s --addr ra1.boulder:9094 --debug-addr :8002' % os.path.join(default_config_dir, "ra.json")],
         [8102, './bin/boulder-ra --config %s --addr ra2.boulder:9094 --debug-addr :8102' % os.path.join(default_config_dir, "ra.json")],

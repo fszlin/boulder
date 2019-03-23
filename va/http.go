@@ -14,6 +14,7 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
+	"github.com/letsencrypt/boulder/iana"
 	"github.com/letsencrypt/boulder/probs"
 )
 
@@ -25,6 +26,7 @@ type preresolvedDialer struct {
 	ip       net.IP
 	port     int
 	hostname string
+	timeout  time.Duration
 }
 
 // a dialerMismatchError is produced when a preresolvedDialer is used to dial
@@ -103,13 +105,14 @@ func (d *preresolvedDialer) DialContext(
 	// Make a new dial address using the pre-resolved IP and port.
 	targetAddr := net.JoinHostPort(d.ip.String(), strconv.Itoa(d.port))
 
-	// Invoke the default transport's original DialContext function using the
-	// reconstructed context.
-	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, fmt.Errorf("DefaultTransport was not an http.Transport")
+	// Create a throw-away dialer using default values and the dialer timeout
+	// (populated from the VA singleDialTimeout).
+	throwAwayDialer := &net.Dialer{
+		Timeout: d.timeout,
+		// Default KeepAlive - see Golang src/net/http/transport.go DefaultTransport
+		KeepAlive: 30 * time.Second,
 	}
-	return defaultTransport.DialContext(ctx, network, targetAddr)
+	return throwAwayDialer.DialContext(ctx, network, targetAddr)
 }
 
 // a dialerFunc meets the function signature requirements of
@@ -283,12 +286,21 @@ func (va *ValidationAuthorityImpl) extractRequestTarget(req *http.Request) (stri
 		return "", 0, fmt.Errorf("unable to determine redirect HTTP request port")
 	}
 
+	if reqHost == "" {
+		return "", 0, berrors.ConnectionFailureError("Invalid empty hostname in redirect target")
+	}
+
 	// Check that the request host isn't a bare IP address. We only follow
 	// redirects to hostnames.
 	if net.ParseIP(reqHost) != nil {
 		return "", 0, berrors.ConnectionFailureError(
 			"Invalid host in redirect target %q. "+
 				"Only domain names are supported, not IP addresses", reqHost)
+	}
+
+	if _, err := iana.ExtractSuffix(reqHost); err != nil {
+		return "", 0, berrors.ConnectionFailureError(
+			"Invalid hostname in redirect target, must end in IANA registered TLD")
 	}
 
 	return reqHost, reqPort, nil
@@ -339,14 +351,15 @@ func (va *ValidationAuthorityImpl) setupHTTPValidation(
 		ip:       targetIP,
 		port:     target.port,
 		hostname: target.host,
+		timeout:  va.singleDialTimeout,
 	}
 	return dialer, record, nil
 }
 
-// fetchHTTPSimple invokes processHTTPValidation and if an error result is
+// fetchHTTP invokes processHTTPValidation and if an error result is
 // returned, converts it to a problem. Otherwise the results from
 // processHTTPValidation are returned.
-func (va *ValidationAuthorityImpl) fetchHTTPSimple(
+func (va *ValidationAuthorityImpl) fetchHTTP(
 	ctx context.Context,
 	host string,
 	path string) ([]byte, []core.ValidationRecord, *probs.ProblemDetails) {
@@ -406,7 +419,23 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	if err != nil {
 		return nil, nil, err
 	}
-	// Immediately reconstruct the request using the validation context
+
+	// Add a context to the request. Shave some time from the
+	// overall context deadline so that we are not racing with gRPC when the
+	// HTTP server is timing out. This avoids returning ServerInternal
+	// errors when we should be returning Connection errors. This may fix a flaky
+	// integration test: https://github.com/letsencrypt/boulder/issues/4087
+	// Note: The gRPC interceptor in grpc/interceptors.go already shaves some time
+	// off RPCs, but this takes off additional time because HTTP-related timeouts
+	// are so common (and because it might fix a flaky build).
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, nil, fmt.Errorf("processHTTPValidation had no deadline")
+	} else {
+		deadline = deadline.Add(-200 * time.Millisecond)
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	initialReq = initialReq.WithContext(ctx)
 	if va.userAgent != "" {
 		initialReq.Header.Set("User-Agent", va.userAgent)

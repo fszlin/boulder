@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/probs"
@@ -41,6 +44,57 @@ func TestDialerMismatchError(t *testing.T) {
 		"tincan-and-string",
 		"lettuceencrypt.org:80")
 	test.AssertEquals(t, err.Error(), expectedErr.Error())
+}
+
+// TestPreresolvedDialerTimeout tests that the preresolvedDialer's DialContext
+// will timeout after the expected singleDialTimeout. This ensures timeouts at
+// the TCP level are handled correctly.
+func TestPreresolvedDialerTimeout(t *testing.T) {
+	va, _ := setup(nil, 0)
+	// Timeouts below 50ms tend to be flaky.
+	va.singleDialTimeout = 50 * time.Millisecond
+
+	// The context timeout needs to be larger than the singleDialTimeout
+	ctxTimeout := 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
+	defer cancel()
+
+	started := time.Now()
+
+	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
+	// NOTE(@jsha): The only method I've found so far to trigger a connect timeout
+	// is to connect to an unrouteable IP address. This usually generates
+	// a connection timeout, but will rarely return "Network unreachable" instead.
+	// If we get that, just retry until we get something other than "Network unreachable".
+	var prob *probs.ProblemDetails
+	for i := 0; i < 20; i++ {
+		_, _, prob = va.fetchHTTP(ctx, "unroutable.invalid", "/.well-known/acme-challenge/whatever")
+		if prob != nil && strings.Contains(prob.Detail, "Network unreachable") {
+			continue
+		} else {
+			break
+		}
+	}
+	if prob == nil {
+		t.Fatalf("Connection should've timed out")
+	}
+	took := time.Since(started)
+
+	// Check that the HTTP connection doesn't return too fast, and times
+	// out after the expected time
+	if took < va.singleDialTimeout {
+		t.Fatalf("fetch returned before %s (%s) with %#v", va.singleDialTimeout, took, prob)
+	}
+	if took > 2*va.singleDialTimeout {
+		t.Fatalf("fetch didn't timeout after %s", va.singleDialTimeout)
+	}
+	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+	expectMatch := regexp.MustCompile(
+		"Fetching http://unroutable.invalid/.well-known/acme-challenge/.*: Timeout during connect")
+	if !expectMatch.MatchString(prob.Detail) {
+		t.Errorf("Problem details incorrect. Got %q, expected to match %q",
+			prob.Detail, expectMatch)
+	}
 }
 
 func TestHTTPTransport(t *testing.T) {
@@ -170,6 +224,20 @@ func TestExtractRequestTarget(t *testing.T) {
 				"and 443 are supported, not 9999"),
 		},
 		{
+			Name: "invalid empty hostname",
+			Req: &http.Request{
+				URL: mustURL(t, "https:///who/needs/a/hostname?not=me"),
+			},
+			ExpectedError: errors.New("Invalid empty hostname in redirect target"),
+		},
+		{
+			Name: "invalid non-iana hostname",
+			Req: &http.Request{
+				URL: mustURL(t, "https://my.tld.is.cpu/pretty/cool/right?yeah=Ithoughtsotoo"),
+			},
+			ExpectedError: errors.New("Invalid hostname in redirect target, must end in IANA registered TLD"),
+		},
+		{
 			Name: "bare IP",
 			Req: &http.Request{
 				URL: mustURL(t, "https://10.10.10.10"),
@@ -294,8 +362,9 @@ func TestSetupHTTPValidation(t *testing.T) {
 				AddressUsed:       net.ParseIP("::1"),
 			},
 			ExpectedDialer: &preresolvedDialer{
-				ip:   net.ParseIP("::1"),
-				port: va.httpPort,
+				ip:      net.ParseIP("::1"),
+				port:    va.httpPort,
+				timeout: va.singleDialTimeout,
 			},
 		},
 		{
@@ -310,8 +379,9 @@ func TestSetupHTTPValidation(t *testing.T) {
 				AddressUsed:       net.ParseIP("::1"),
 			},
 			ExpectedDialer: &preresolvedDialer{
-				ip:   net.ParseIP("::1"),
-				port: va.httpsPort,
+				ip:      net.ParseIP("::1"),
+				port:    va.httpsPort,
+				timeout: va.singleDialTimeout,
 			},
 		},
 	}
@@ -530,7 +600,7 @@ func TestFallbackErr(t *testing.T) {
 	}
 }
 
-func TestFetchHTTPSimple(t *testing.T) {
+func TestFetchHTTP(t *testing.T) {
 	// Create a test server
 	testSrv := httpTestSrv(t)
 	defer testSrv.Close()
@@ -758,7 +828,7 @@ func TestFetchHTTPSimple(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
 			defer cancel()
-			body, records, prob := va.fetchHTTPSimple(ctx, tc.Host, tc.Path)
+			body, records, prob := va.fetchHTTP(ctx, tc.Host, tc.Path)
 			if prob != nil && tc.ExpectedProblem == nil {
 				t.Errorf("expected nil prob, got %#v\n", prob)
 			} else if prob == nil && tc.ExpectedProblem != nil {

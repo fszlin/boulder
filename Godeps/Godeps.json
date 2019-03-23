@@ -190,14 +190,6 @@
 			"Rev": "c25855a82c757ba69d84b68c1a6706df6dbb5cee"
 		},
 		{
-			"ImportPath": "github.com/google/safebrowsing",
-			"Rev": "ce39ae7e50e719c4518fcac8a81032c2f43046aa"
-		},
-		{
-			"ImportPath": "github.com/google/safebrowsing/internal/safebrowsing_proto",
-			"Rev": "ce39ae7e50e719c4518fcac8a81032c2f43046aa"
-		},
-		{
 			"ImportPath": "github.com/grpc-ecosystem/go-grpc-prometheus",
 			"Comment": "v1.1-8-g0dafe0d",
 			"Rev": "0dafe0d496ea71181bf2dd039e7e3f44b6bd11a7"
@@ -329,8 +321,8 @@
 		},
 		{
 			"ImportPath": "github.com/weppos/publicsuffix-go/publicsuffix",
-			"Comment": "v0.4.0-37-g928ba98",
-			"Rev": "928ba9809f1c2a919e7defbf586a3aeef6f6683f"
+			"Comment": "v0.4.0-42-g26bf87f",
+			"Rev": "26bf87f586cf47ea86705ad9aab94acd1e4193ff"
 		},
 		{
 			"ImportPath": "github.com/zmap/zcrypto/json",
@@ -350,15 +342,15 @@
 		},
 		{
 			"ImportPath": "github.com/zmap/zlint",
-			"Rev": "34b7be2e59081f4bbe6970785e021e6bf0741f2a"
+			"Rev": "f38bd223a43c3378b07b78a0bab51ac7006b8586"
 		},
 		{
 			"ImportPath": "github.com/zmap/zlint/lints",
-			"Rev": "34b7be2e59081f4bbe6970785e021e6bf0741f2a"
+			"Rev": "f38bd223a43c3378b07b78a0bab51ac7006b8586"
 		},
 		{
 			"ImportPath": "github.com/zmap/zlint/util",
-			"Rev": "34b7be2e59081f4bbe6970785e021e6bf0741f2a"
+			"Rev": "f38bd223a43c3378b07b78a0bab51ac7006b8586"
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/cryptobyte",

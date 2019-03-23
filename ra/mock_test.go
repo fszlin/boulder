@@ -6,6 +6,7 @@ import (
 	"google.golang.org/grpc"
 
 	core "github.com/letsencrypt/boulder/core/proto"
+	corepb "github.com/letsencrypt/boulder/core/proto"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 )
 
@@ -110,10 +111,6 @@ func (sa *mockInvalidAuthorizationsAuthority) NewPendingAuthorization(ctx contex
 	return nil, nil
 }
 
-func (sa *mockInvalidAuthorizationsAuthority) UpdatePendingAuthorization(ctx context.Context, in *core.Authorization, opts ...grpc.CallOption) (*core.Empty, error) {
-	return nil, nil
-}
-
 func (sa *mockInvalidAuthorizationsAuthority) FinalizeAuthorization(ctx context.Context, in *core.Authorization, opts ...grpc.CallOption) (*core.Empty, error) {
 	return nil, nil
 }
@@ -171,5 +168,13 @@ func (sa *mockInvalidAuthorizationsAuthority) SetOrderError(ctx context.Context,
 }
 
 func (sa *mockInvalidAuthorizationsAuthority) FinalizeOrder(ctx context.Context, in *core.Order, opts ...grpc.CallOption) (*core.Empty, error) {
+	return nil, nil
+}
+
+func (sa *mockInvalidAuthorizationsAuthority) RevokeCertificate(_ context.Context, _ *sapb.RevokeCertificateRequest, opts ...grpc.CallOption) (*core.Empty, error) {
+	return nil, nil
+}
+
+func (sa *mockInvalidAuthorizationsAuthority) GetAuthz2(_ context.Context, _ *sapb.AuthorizationID2, opts ...grpc.CallOption) (*corepb.Authorization, error) {
 	return nil, nil
 }
