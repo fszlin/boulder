@@ -1,6 +1,7 @@
 package bdns
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -12,7 +13,6 @@ import (
 	"github.com/jmhodges/clock"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/metrics"
 )
@@ -145,10 +145,9 @@ var (
 
 // DNSClient queries for DNS records
 type DNSClient interface {
-	LookupTXT(context.Context, string) (txts []string, authorities []string, err error)
+	LookupTXT(context.Context, string) (txts []string, err error)
 	LookupHost(context.Context, string) ([]net.IP, error)
 	LookupCAA(context.Context, string) ([]*dns.CAA, error)
-	LookupMX(context.Context, string) ([]string, error)
 }
 
 // DNSClientImpl represents a client that talks to an external resolver
@@ -357,15 +356,15 @@ type dnsResp struct {
 // LookupTXT sends a DNS query to find all TXT records associated with
 // the provided hostname which it returns along with the returned
 // DNS authority section.
-func (dnsClient *DNSClientImpl) LookupTXT(ctx context.Context, hostname string) ([]string, []string, error) {
+func (dnsClient *DNSClientImpl) LookupTXT(ctx context.Context, hostname string) ([]string, error) {
 	var txt []string
 	dnsType := dns.TypeTXT
 	r, err := dnsClient.exchangeOne(ctx, hostname, dnsType)
 	if err != nil {
-		return nil, nil, &DNSError{dnsType, hostname, err, -1}
+		return nil, &DNSError{dnsType, hostname, err, -1}
 	}
 	if r.Rcode != dns.RcodeSuccess {
-		return nil, nil, &DNSError{dnsType, hostname, nil, r.Rcode}
+		return nil, &DNSError{dnsType, hostname, nil, r.Rcode}
 	}
 
 	for _, answer := range r.Answer {
@@ -376,12 +375,7 @@ func (dnsClient *DNSClientImpl) LookupTXT(ctx context.Context, hostname string) 
 		}
 	}
 
-	authorities := []string{}
-	for _, a := range r.Ns {
-		authorities = append(authorities, a.String())
-	}
-
-	return txt, authorities, err
+	return txt, err
 }
 
 func isPrivateV4(ip net.IP) bool {
@@ -480,26 +474,4 @@ func (dnsClient *DNSClientImpl) LookupCAA(ctx context.Context, hostname string) 
 		}
 	}
 	return CAAs, nil
-}
-
-// LookupMX sends a DNS query to find a MX record associated hostname and returns the
-// record target.
-func (dnsClient *DNSClientImpl) LookupMX(ctx context.Context, hostname string) ([]string, error) {
-	dnsType := dns.TypeMX
-	r, err := dnsClient.exchangeOne(ctx, hostname, dnsType)
-	if err != nil {
-		return nil, &DNSError{dnsType, hostname, err, -1}
-	}
-	if r.Rcode != dns.RcodeSuccess {
-		return nil, &DNSError{dnsType, hostname, nil, r.Rcode}
-	}
-
-	var results []string
-	for _, answer := range r.Answer {
-		if mx, ok := answer.(*dns.MX); ok {
-			results = append(results, mx.Mx)
-		}
-	}
-
-	return results, nil
 }

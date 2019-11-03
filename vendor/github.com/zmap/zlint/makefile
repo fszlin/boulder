@@ -1,15 +1,26 @@
-all: zlint
+SHELL := /bin/bash
 
-zlint: cmd/zlint/zlint
-	cp cmd/zlint/zlint zlint
+CMDS = zlint zlint-gtld-update
+CMD_PREFIX = ./cmd/
+GO_ENV = GO111MODULE="on" GOFLAGS="-mod=vendor"
+BUILD = $(GO_ENV) go build
+TEST = $(GO_ENV) GORACE=halt_on_error=1 go test -race
 
-cmd/zlint/zlint:
-	cd cmd/zlint && go build
+all: $(CMDS)
+
+zlint:
+	$(BUILD) $(CMD_PREFIX)$(@)
+
+zlint-gtld-update:
+	$(BUILD) $(CMD_PREFIX)$(@)
 
 clean:
-	rm -f cmd/cmd/zlint zlint
+	rm -f $(CMDS)
 
 test:
-	GORACE=halt_on_error=1 go test -race ./...
+	$(TEST) ./...
 
-.PHONY: clean cmd/zlint/zlint zlint test
+format-check:
+	diff <(find . -name '*.go' -not -path './vendor/*' -print | xargs -n1 gofmt -l) <(printf "")
+
+.PHONY: clean zlint zlint-gtld-update test format-check

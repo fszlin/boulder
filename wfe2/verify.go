@@ -2,7 +2,6 @@ package wfe2
 
 import (
 	"context"
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
+	"github.com/letsencrypt/boulder/nonce"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/web"
 )
@@ -26,29 +26,28 @@ import (
 // POST requests with a JWS body must have the following Content-Type header
 const expectedJWSContentType = "application/jose+json"
 
-var sigAlgErr = errors.New("no signature algorithms suitable for given key type")
-
-func sigAlgorithmForECDSAKey(key *ecdsa.PublicKey) (jose.SignatureAlgorithm, error) {
-	params := key.Params()
-	switch params.Name {
-	case "P-256":
-		return jose.ES256, nil
-	case "P-384":
-		return jose.ES384, nil
-	case "P-521":
-		return jose.ES512, nil
-	}
-	return "", sigAlgErr
-}
-
-func sigAlgorithmForKey(key crypto.PublicKey) (jose.SignatureAlgorithm, error) {
-	switch k := key.(type) {
+func sigAlgorithmForKey(key *jose.JSONWebKey) (jose.SignatureAlgorithm, error) {
+	switch k := key.Key.(type) {
 	case *rsa.PublicKey:
 		return jose.RS256, nil
 	case *ecdsa.PublicKey:
-		return sigAlgorithmForECDSAKey(k)
+		switch k.Params().Name {
+		case "P-256":
+			return jose.ES256, nil
+		case "P-384":
+			return jose.ES384, nil
+		case "P-521":
+			return jose.ES512, nil
+		}
 	}
-	return "", sigAlgErr
+	return "", errors.New("JWK contains unsupported key type (expected RSA, or ECDSA P-256, P-384, or P-521")
+}
+
+var supportedAlgs = map[string]bool{
+	string(jose.RS256): true,
+	string(jose.ES256): true,
+	string(jose.ES384): true,
+	string(jose.ES512): true,
 }
 
 // Check that (1) there is a suitable algorithm for the provided key based on its
@@ -57,19 +56,22 @@ func sigAlgorithmForKey(key crypto.PublicKey) (jose.SignatureAlgorithm, error) {
 // that algorithm. Precondition: parsedJws must have exactly one signature on
 // it.
 func checkAlgorithm(key *jose.JSONWebKey, parsedJWS *jose.JSONWebSignature) error {
-	algorithm, err := sigAlgorithmForKey(key.Key)
+	sigHeaderAlg := parsedJWS.Signatures[0].Header.Algorithm
+	if !supportedAlgs[sigHeaderAlg] {
+		return fmt.Errorf(
+			"JWS signature header contains unsupported algorithm %q, expected one of RS256, ES256, ES384 or ES512",
+			parsedJWS.Signatures[0].Header.Algorithm,
+		)
+	}
+	expectedAlg, err := sigAlgorithmForKey(key)
 	if err != nil {
 		return err
 	}
-	jwsAlgorithm := parsedJWS.Signatures[0].Header.Algorithm
-	if jwsAlgorithm != string(algorithm) {
-		return fmt.Errorf(
-			"signature type '%s' in JWS header is not supported, expected one of RS256, ES256, ES384 or ES512",
-			jwsAlgorithm,
-		)
+	if sigHeaderAlg != string(expectedAlg) {
+		return fmt.Errorf("JWS signature header algorithm %q does not match expected algorithm %q for JWK", sigHeaderAlg, string(expectedAlg))
 	}
-	if key.Algorithm != "" && key.Algorithm != string(algorithm) {
-		return fmt.Errorf("algorithm '%s' on JWK is unacceptable", key.Algorithm)
+	if key.Algorithm != "" && key.Algorithm != string(expectedAlg) {
+		return fmt.Errorf("JWK key header algorithm %q does not match expected algorithm %q for JWK", key.Algorithm, string(expectedAlg))
 	}
 	return nil
 }
@@ -177,17 +179,27 @@ func (wfe *WebFrontEndImpl) validPOSTRequest(request *http.Request) *probs.Probl
 // nonceService knows about, otherwise a bad nonce problem is returned.
 // NOTE: this function assumes the JWS has already been verified with the
 // correct public key.
-func (wfe *WebFrontEndImpl) validNonce(jws *jose.JSONWebSignature) *probs.ProblemDetails {
+func (wfe *WebFrontEndImpl) validNonce(ctx context.Context, jws *jose.JSONWebSignature) *probs.ProblemDetails {
 	// validNonce is called after validPOSTRequest() and parseJWS() which
 	// defend against the incorrect number of signatures.
 	header := jws.Signatures[0].Header
-	nonce := header.Nonce
-	if len(nonce) == 0 {
+	if len(header.Nonce) == 0 {
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSMissingNonce"}).Inc()
 		return probs.BadNonce("JWS has no anti-replay nonce")
-	} else if !wfe.nonceService.Valid(nonce) {
+	}
+	var nonceValid bool
+	if wfe.remoteNonceService != nil {
+		valid, err := nonce.RemoteRedeem(ctx, wfe.noncePrefixMap, header.Nonce)
+		if err != nil {
+			return probs.ServerInternal("failed to verify nonce validity: %s", err)
+		}
+		nonceValid = valid
+	} else {
+		nonceValid = wfe.nonceService.Valid(header.Nonce)
+	}
+	if !nonceValid {
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSInvalidNonce"}).Inc()
-		return probs.BadNonce("JWS has an invalid anti-replay nonce: %q", nonce)
+		return probs.BadNonce("JWS has an invalid anti-replay nonce: %q", header.Nonce)
 	}
 	return nil
 }
@@ -304,6 +316,9 @@ func (wfe *WebFrontEndImpl) parseJWS(body []byte) (*jose.JSONWebSignature, *prob
 	parsedJWS, err := jose.ParseSigned(bodyStr)
 	if err != nil {
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSParseError"}).Inc()
+		if strings.HasPrefix(err.Error(), "failed to unmarshal JWK: square/go-jose: invalid EC public key, wrong length") {
+			return nil, probs.Malformed("Parse error reading JWS: EC public key has incorrect padding")
+		}
 		return nil, probs.Malformed("Parse error reading JWS")
 	}
 	if len(parsedJWS.Signatures) > 1 {
@@ -337,7 +352,12 @@ func (wfe *WebFrontEndImpl) parseJWSRequest(request *http.Request) (*jose.JSONWe
 		return nil, probs.ServerInternal("unable to read request body")
 	}
 
-	return wfe.parseJWS(bodyBytes)
+	jws, prob := wfe.parseJWS(bodyBytes)
+	if prob != nil {
+		return nil, prob
+	}
+
+	return jws, nil
 }
 
 // extractJWK extracts a JWK from a provided JWS or returns a problem. It
@@ -438,7 +458,7 @@ func (wfe *WebFrontEndImpl) lookupJWK(
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSKeyIDLookupFailed"}).Inc()
 		// Add an error to the log event with the internal error message
 		logEvent.AddError(fmt.Sprintf("Error calling SA.GetRegistration: %s", err.Error()))
-		return nil, nil, probs.ServerInternal("Error retreiving account %q", accountURL)
+		return nil, nil, probs.ServerInternal("Error retrieving account %q", accountURL)
 	}
 
 	// Verify the account is not deactivated
@@ -462,6 +482,7 @@ func (wfe *WebFrontEndImpl) lookupJWK(
 // done. If the JWS signature validates correctly then the JWS nonce value
 // and the JWS URL are verified to ensure that they are correct.
 func (wfe *WebFrontEndImpl) validJWSForKey(
+	ctx context.Context,
 	jws *jose.JSONWebSignature,
 	jwk *jose.JSONWebKey,
 	request *http.Request,
@@ -488,7 +509,7 @@ func (wfe *WebFrontEndImpl) validJWSForKey(
 	logEvent.Payload = string(payload)
 
 	// Check that the JWS contains a correct Nonce header
-	if prob := wfe.validNonce(jws); prob != nil {
+	if prob := wfe.validNonce(ctx, jws); prob != nil {
 		return nil, prob
 	}
 
@@ -530,7 +551,7 @@ func (wfe *WebFrontEndImpl) validJWSForAccount(
 	}
 
 	// Verify the JWS with the JWK from the SA
-	payload, prob := wfe.validJWSForKey(jws, pubKey, request, logEvent)
+	payload, prob := wfe.validJWSForKey(ctx, jws, pubKey, request, logEvent)
 	if prob != nil {
 		return nil, nil, nil, prob
 	}
@@ -575,6 +596,10 @@ func (wfe *WebFrontEndImpl) validPOSTAsGETForAccount(
 	if string(body) != "" {
 		return nil, probs.Malformed("POST-as-GET requests must have an empty payload")
 	}
+	// To make log analysis easier we choose to elevate the pseudo ACME HTTP
+	// method "POST-as-GET" to the logEvent's Method, replacing the
+	// http.MethodPost value.
+	logEvent.Method = "POST-as-GET"
 	return reg, prob
 }
 
@@ -590,6 +615,7 @@ func (wfe *WebFrontEndImpl) validPOSTAsGETForAccount(
 // the JWK that was embedded in the JWS. Otherwise if the valid JWS conditions
 // are not met or an error occurs only a problem is returned
 func (wfe *WebFrontEndImpl) validSelfAuthenticatedJWS(
+	ctx context.Context,
 	jws *jose.JSONWebSignature,
 	request *http.Request,
 	logEvent *web.RequestEvent) ([]byte, *jose.JSONWebKey, *probs.ProblemDetails) {
@@ -606,7 +632,7 @@ func (wfe *WebFrontEndImpl) validSelfAuthenticatedJWS(
 	}
 
 	// Verify the JWS with the embedded JWK
-	payload, prob := wfe.validJWSForKey(jws, pubKey, request, logEvent)
+	payload, prob := wfe.validJWSForKey(ctx, jws, pubKey, request, logEvent)
 	if prob != nil {
 		return nil, nil, prob
 	}
@@ -617,6 +643,7 @@ func (wfe *WebFrontEndImpl) validSelfAuthenticatedJWS(
 // validSelfAuthenticatedPOST checks that a given POST request has a valid JWS
 // using `validSelfAuthenticatedJWS`.
 func (wfe *WebFrontEndImpl) validSelfAuthenticatedPOST(
+	ctx context.Context,
 	request *http.Request,
 	logEvent *web.RequestEvent) ([]byte, *jose.JSONWebKey, *probs.ProblemDetails) {
 	// Parse the JWS from the POST request
@@ -625,7 +652,7 @@ func (wfe *WebFrontEndImpl) validSelfAuthenticatedPOST(
 		return nil, nil, prob
 	}
 	// Extract and validate the embedded JWK from the parsed JWS
-	return wfe.validSelfAuthenticatedJWS(jws, request, logEvent)
+	return wfe.validSelfAuthenticatedJWS(ctx, jws, request, logEvent)
 }
 
 // rolloverRequest is a client request to change the key for the account ID

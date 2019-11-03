@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,8 +17,6 @@ import (
 	"strings"
 	"text/template"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/jmhodges/clock"
 	"gopkg.in/go-gorp/gorp.v2"
@@ -303,6 +303,13 @@ func (m *mailer) findExpiringCertificates() error {
 			var cert core.Certificate
 			cert, err := sa.SelectCertificate(m.dbMap, "WHERE serial = ?", serial)
 			if err != nil {
+				// We can get an ErrNoRows when processing a serial number corresponding
+				// to a precertificate with no final certificate. Since this certificate
+				// is not being used by a subscriber, we don't send expiration email about
+				// it.
+				if err == sql.ErrNoRows {
+					continue
+				}
 				m.log.AuditErrf("expiration-mailer: Error loading cert %q: %s", cert.Serial, err)
 				return err
 			}

@@ -12,6 +12,7 @@ import (
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/ctpolicy"
+	"github.com/letsencrypt/boulder/ctpolicy/ctconfig"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
@@ -63,6 +64,11 @@ type config struct {
 		// hashes of known easily enumerable keys.
 		WeakKeyFile string
 
+		// BlockedKeyFile is the path to a YAML file containing Base64 encoded
+		// SHA256 hashes of DER encoded PKIX public keys that should be considered
+		// administratively blocked.
+		BlockedKeyFile string
+
 		OrderLifetime cmd.ConfigDuration
 
 		// CTLogGroups contains groupings of CT logs which we want SCTs from.
@@ -70,16 +76,15 @@ type config struct {
 		// in a group and the first SCT returned will be used. This allows
 		// us to comply with Chrome CT policy which requires one SCT from a
 		// Google log and one SCT from any other log included in their policy.
-		CTLogGroups2 []cmd.CTGroup
+		CTLogGroups2 []ctconfig.CTGroup
 		// InformationalCTLogs are a set of CT logs we will always submit to
 		// but won't ever use the SCTs from. This may be because we want to
 		// test them or because they are not yet approved by a browser/root
 		// program but we still want our certs to end up there.
-		InformationalCTLogs []cmd.LogDescription
+		InformationalCTLogs []ctconfig.LogDescription
 
 		// IssuerCertPath is the path to the intermediate used to issue certificates.
-		// It is required if the RevokeAtRA feature is enabled and is used to
-		// generate OCSP URLs to purge at revocation time.
+		// It is used to generate OCSP URLs to purge at revocation time.
 		IssuerCertPath string
 
 		Features map[string]bool
@@ -130,10 +135,6 @@ func main() {
 	err = pa.SetHostnamePolicyFile(c.RA.HostnamePolicyFile)
 	cmd.FailOnError(err, "Couldn't load hostname policy file")
 
-	if features.Enabled(features.RevokeAtRA) && (c.RA.AkamaiPurgerService == nil || c.RA.IssuerCertPath == "") {
-		cmd.Fail("If the RevokeAtRA feature is enabled the AkamaiPurgerService and IssuerCertPath config fields must be populated")
-	}
-
 	tlsConfig, err := c.RA.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 
@@ -157,14 +158,12 @@ func main() {
 
 	var apc akamaipb.AkamaiPurgerClient
 	var issuerCert *x509.Certificate
-	if features.Enabled(features.RevokeAtRA) {
-		apConn, err := bgrpc.ClientSetup(c.RA.AkamaiPurgerService, tlsConfig, clientMetrics, clk)
-		cmd.FailOnError(err, "Unable to create a Akamai Purger client")
-		apc = akamaipb.NewAkamaiPurgerClient(apConn)
+	apConn, err := bgrpc.ClientSetup(c.RA.AkamaiPurgerService, tlsConfig, clientMetrics, clk)
+	cmd.FailOnError(err, "Unable to create a Akamai Purger client")
+	apc = akamaipb.NewAkamaiPurgerClient(apConn)
 
-		issuerCert, err = core.LoadCert(c.RA.IssuerCertPath)
-		cmd.FailOnError(err, "Failed to load issuer certificate")
-	}
+	issuerCert, err = core.LoadCert(c.RA.IssuerCertPath)
+	cmd.FailOnError(err, "Failed to load issuer certificate")
 
 	// Boulder's components assume that there will always be CT logs configured.
 	// Issuing a certificate without SCTs embedded is a miss-issuance event in the
@@ -205,7 +204,7 @@ func main() {
 		pendingAuthorizationLifetime = time.Duration(c.RA.PendingAuthorizationLifetimeDays) * 24 * time.Hour
 	}
 
-	kp, err := goodkey.NewKeyPolicy(c.RA.WeakKeyFile)
+	kp, err := goodkey.NewKeyPolicy(c.RA.WeakKeyFile, c.RA.BlockedKeyFile)
 	cmd.FailOnError(err, "Unable to create key policy")
 
 	if c.RA.MaxNames == 0 {

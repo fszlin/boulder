@@ -1,25 +1,28 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/akamai"
+	akamaiProto "github.com/letsencrypt/boulder/akamai/proto"
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
-	"github.com/letsencrypt/boulder/revocation"
 	"github.com/letsencrypt/boulder/sa"
+	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/sa/satest"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
-	"golang.org/x/net/context"
 	"gopkg.in/go-gorp/gorp.v2"
 )
 
@@ -80,11 +83,9 @@ func setup(t *testing.T) (*OCSPUpdater, core.StorageAuthority, *gorp.DbMap, cloc
 		&mockCA{},
 		sa,
 		nil,
-		cmd.OCSPUpdaterConfig{
-			OldOCSPBatchSize:            1,
-			RevokedCertificateBatchSize: 1,
-			OldOCSPWindow:               cmd.ConfigDuration{Duration: time.Second},
-			RevokedCertificateWindow:    cmd.ConfigDuration{Duration: time.Second},
+		OCSPUpdaterConfig{
+			OldOCSPBatchSize: 1,
+			OldOCSPWindow:    cmd.ConfigDuration{Duration: time.Second},
 		},
 		"",
 		blog.NewMock(),
@@ -97,10 +98,10 @@ func setup(t *testing.T) (*OCSPUpdater, core.StorageAuthority, *gorp.DbMap, cloc
 func TestGenerateAndStoreOCSPResponse(t *testing.T) {
 	updater, sa, _, fc, cleanUp := setup(t)
 	defer cleanUp()
-	updater.ccu = &akamai.CachePurgeClient{}
 	issuer, err := core.LoadCert("../../test/test-ca2.pem")
 	test.AssertNotError(t, err, "Couldn't read test issuer certificate")
 	updater.issuer = issuer
+	updater.purgerService = akamaiProto.NewAkamaiPurgerClient(nil)
 
 	reg := satest.CreateWorkingRegistration(t, sa)
 	parsedCert, err := core.LoadCert("test-cert.pem")
@@ -116,23 +117,6 @@ func TestGenerateAndStoreOCSPResponse(t *testing.T) {
 	test.AssertNotError(t, err, "Couldn't generate OCSP response")
 	err = updater.storeResponse(meta)
 	test.AssertNotError(t, err, "Couldn't store certificate status")
-
-	secondMeta, purgeURLs, err := updater.generateRevokedResponse(ctx, status)
-	test.AssertNotError(t, err, "Couldn't generate revoked OCSP response")
-	err = updater.storeResponse(secondMeta)
-	test.AssertNotError(t, err, "Couldn't store certificate status")
-	test.AssertDeepEquals(t, purgeURLs, []string{
-		// akamai magic POST format
-		"http://127.0.0.1:4002/?body-md5=1f00f751a981b76c",
-		// GET format with // replaced with /
-		"http://127.0.0.1:4002/MFQwUjBQME4wTDAJBgUrDgMCGgUABBRBJaTET3lGgf1uVfnmEsA5Rr8viQQU+3hPEvlgFYMsnxd/NBmzLjbqQYkCEwD/ajxemKXeOt+gQo15uy0YcQs=",
-		// GET format with url-encoding
-		"http://127.0.0.1:4002/MFQwUjBQME4wTDAJBgUrDgMCGgUABBRBJaTET3lGgf1uVfnmEsA5Rr8viQQU%2B3hPEvlgFYMsnxd%2FNBmzLjbqQYkCEwD%2FajxemKXeOt%2BgQo15uy0YcQs%3D",
-	})
-
-	newStatus, err := sa.GetCertificateStatus(ctx, status.Serial)
-	test.AssertNotError(t, err, "Couldn't retrieve certificate status")
-	test.AssertByteEquals(t, meta.OCSPResponse, newStatus.OCSPResponse)
 }
 
 func TestGenerateOCSPResponses(t *testing.T) {
@@ -264,29 +248,6 @@ func TestFindStaleOCSPResponsesStaleMaxAge(t *testing.T) {
 	test.AssertEquals(t, certs[0].Serial, core.SerialToString(parsedCertA.SerialNumber))
 }
 
-func TestFindRevokedCertificatesToUpdate(t *testing.T) {
-	updater, sa, _, fc, cleanUp := setup(t)
-	defer cleanUp()
-
-	reg := satest.CreateWorkingRegistration(t, sa)
-	cert, err := core.LoadCert("test-cert.pem")
-	test.AssertNotError(t, err, "Couldn't read test certificate")
-	issued := fc.Now()
-	_, err = sa.AddCertificate(ctx, cert.Raw, reg.ID, nil, &issued)
-	test.AssertNotError(t, err, "Couldn't add test-cert.pem")
-
-	statuses, err := updater.findRevokedCertificatesToUpdate(10)
-	test.AssertNotError(t, err, "Failed to find revoked certificates")
-	test.AssertEquals(t, len(statuses), 0)
-
-	err = sa.MarkCertificateRevoked(ctx, core.SerialToString(cert.SerialNumber), revocation.KeyCompromise)
-	test.AssertNotError(t, err, "Failed to revoke certificate")
-
-	statuses, err = updater.findRevokedCertificatesToUpdate(10)
-	test.AssertNotError(t, err, "Failed to find revoked certificates")
-	test.AssertEquals(t, len(statuses), 1)
-}
-
 func TestOldOCSPResponsesTick(t *testing.T) {
 	updater, sa, _, fc, cleanUp := setup(t)
 	defer cleanUp()
@@ -312,12 +273,6 @@ func TestOldOCSPResponsesTick(t *testing.T) {
 // that are expired but whose certificate status rows do not have `IsExpired`
 // set.
 func TestOldOCSPResponsesTickIsExpired(t *testing.T) {
-	// Explicitly enable the CertStatusOptimizationsMigrated feature so the OCSP
-	// updater can use the `IsExpired` field. This must be done before `setup()`
-	// so the correct dbMap associations are used
-	_ = features.Set(map[string]bool{"CertStatusOptimizationsMigrated": true})
-	defer features.Reset()
-
 	updater, sa, dbMap, fc, cleanUp := setup(t)
 	defer cleanUp()
 
@@ -363,33 +318,6 @@ func TestOldOCSPResponsesTickIsExpired(t *testing.T) {
 	test.AssertEquals(t, cs.IsExpired, true)
 }
 
-func TestRevokedCertificatesTick(t *testing.T) {
-	updater, sa, _, fc, cleanUp := setup(t)
-	defer cleanUp()
-
-	reg := satest.CreateWorkingRegistration(t, sa)
-	parsedCert, err := core.LoadCert("test-cert.pem")
-	test.AssertNotError(t, err, "Couldn't read test certificate")
-	issued := fc.Now()
-	_, err = sa.AddCertificate(ctx, parsedCert.Raw, reg.ID, nil, &issued)
-	test.AssertNotError(t, err, "Couldn't add test-cert.pem")
-
-	err = sa.MarkCertificateRevoked(ctx, core.SerialToString(parsedCert.SerialNumber), revocation.KeyCompromise)
-	test.AssertNotError(t, err, "Failed to revoke certificate")
-
-	statuses, err := updater.findRevokedCertificatesToUpdate(10)
-	test.AssertNotError(t, err, "Failed to find revoked certificates")
-	test.AssertEquals(t, len(statuses), 1)
-
-	err = updater.revokedCertificatesTick(ctx, 10)
-	test.AssertNotError(t, err, "Failed to run revokedCertificatesTick")
-
-	status, err := sa.GetCertificateStatus(ctx, core.SerialToString(parsedCert.SerialNumber))
-	test.AssertNotError(t, err, "Failed to get certificate status")
-	test.AssertEquals(t, status.Status, core.OCSPStatusRevoked)
-	test.Assert(t, len(status.OCSPResponse) != 0, "Certificate status doesn't contain OCSP response")
-}
-
 func TestStoreResponseGuard(t *testing.T) {
 	updater, sa, _, fc, cleanUp := setup(t)
 	defer cleanUp()
@@ -404,7 +332,14 @@ func TestStoreResponseGuard(t *testing.T) {
 	status, err := sa.GetCertificateStatus(ctx, core.SerialToString(parsedCert.SerialNumber))
 	test.AssertNotError(t, err, "Failed to get certificate status")
 
-	err = sa.MarkCertificateRevoked(ctx, core.SerialToString(parsedCert.SerialNumber), 0)
+	serialStr := core.SerialToString(parsedCert.SerialNumber)
+	reason := int64(0)
+	revokedDate := fc.Now().UnixNano()
+	err = sa.RevokeCertificate(context.Background(), &sapb.RevokeCertificateRequest{
+		Serial: &serialStr,
+		Reason: &reason,
+		Date:   &revokedDate,
+	})
 	test.AssertNotError(t, err, "Failed to revoked certificate")
 
 	// Attempt to update OCSP response where status.Status is good but stored status
@@ -470,4 +405,70 @@ func TestLoopTickBackoff(t *testing.T) {
 	l.tick()
 	test.AssertEquals(t, l.failures, 0)
 	test.AssertEquals(t, l.clk.Now(), start)
+}
+
+func TestGenerateOCSPResponsePrecert(t *testing.T) {
+	// The schema required to insert a precertificate is only available in
+	// config-next at the time of writing.
+	if !strings.HasSuffix(os.Getenv("BOULDER_CONFIG_DIR"), "config-next") {
+		return
+	}
+
+	updater, sa, dbMap, fc, cleanUp := setup(t)
+	defer cleanUp()
+
+	reg := satest.CreateWorkingRegistration(t, sa)
+
+	// Use AddPrecertificate to set up a precertificate, serials, and
+	// certificateStatus row for the testcert.
+	certDER, err := ioutil.ReadFile("../../test/test-ca.der")
+	test.AssertNotError(t, err, "Couldn't read example cert DER")
+	serial := "00000000000000000000000000000000124d"
+	ocspResp := []byte{0, 0, 1}
+	regID := reg.ID
+	issuedTime := fc.Now().UnixNano()
+	_, err = sa.AddPrecertificate(ctx, &sapb.AddCertificateRequest{
+		Der:    certDER,
+		RegID:  &regID,
+		Ocsp:   ocspResp,
+		Issued: &issuedTime,
+	})
+	test.AssertNotError(t, err, "Couldn't add test-cert2.der")
+
+	// We need to set a fake "ocspLastUpdated" value for the precert we created
+	// in order to satisfy the "ocspStaleMaxAge" constraint.
+	fakeLastUpdate := fc.Now().Add(-time.Hour * 24 * 3)
+	_, err = dbMap.Exec(
+		"UPDATE certificateStatus SET ocspLastUpdated = ? WHERE serial = ?",
+		fakeLastUpdate,
+		serial)
+	test.AssertNotError(t, err, "Couldn't update ocspLastUpdated")
+
+	// There should be one stale ocsp response found for the precert
+	earliest := fc.Now().Add(-time.Hour)
+	certs, err := updater.findStaleOCSPResponses(earliest, 10)
+	test.AssertNotError(t, err, "Couldn't find stale responses")
+	test.AssertEquals(t, len(certs), 1)
+	test.AssertEquals(t, certs[0].Serial, serial)
+
+	// Disable PrecertificateOCSP.
+	err = features.Set(map[string]bool{"PrecertificateOCSP": false})
+	test.AssertNotError(t, err, "setting PrecertificateOCSP feature to off")
+
+	// Directly call generateResponse with the result, when the PrecertificateOCSP
+	// feature flag is disabled we expect this to error because no matching
+	// certificates row will be found.
+	updater.cac = &mockCA{time.Second}
+	_, err = updater.generateResponse(ctx, certs[0])
+	test.AssertError(t, err, "generateResponse for precert without PrecertificateOCSP did not error")
+
+	// Now enable PrecertificateOCSP.
+	err = features.Set(map[string]bool{"PrecertificateOCSP": true})
+	test.AssertNotError(t, err, "setting PrecertificateOCSP feature to off")
+
+	// Directly call generateResponse again with the same result. It should not
+	// error and should instead update the precertificate's OCSP status even
+	// though no certificate row exists.
+	_, err = updater.generateResponse(ctx, certs[0])
+	test.AssertNotError(t, err, "generateResponse for precert with PrecertificateOCSP errored")
 }

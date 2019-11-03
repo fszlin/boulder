@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/akamai"
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
@@ -21,8 +21,6 @@ import (
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/sa"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
-	"golang.org/x/crypto/ocsp"
-	"golang.org/x/net/context"
 )
 
 /*
@@ -57,7 +55,6 @@ type OCSPUpdater struct {
 
 	loops []*looper
 
-	ccu           *akamai.CachePurgeClient
 	purgerService akamaipb.AkamaiPurgerClient
 	// issuer is used to generate OCSP request URLs to purge
 	issuer *x509.Certificate
@@ -70,16 +67,14 @@ func newUpdater(
 	ca core.CertificateAuthority,
 	sac core.StorageAuthority,
 	apc akamaipb.AkamaiPurgerClient,
-	config cmd.OCSPUpdaterConfig,
+	config OCSPUpdaterConfig,
 	issuerPath string,
 	log blog.Logger,
 ) (*OCSPUpdater, error) {
-	if config.OldOCSPBatchSize == 0 ||
-		config.RevokedCertificateBatchSize == 0 {
+	if config.OldOCSPBatchSize == 0 {
 		return nil, fmt.Errorf("Loop batch sizes must be non-zero")
 	}
-	if config.OldOCSPWindow.Duration == 0 ||
-		config.RevokedCertificateWindow.Duration == 0 {
+	if config.OldOCSPWindow.Duration == 0 {
 		return nil, fmt.Errorf("Loop window sizes must be non-zero")
 	}
 	if config.OCSPStaleMaxAge.Duration == 0 {
@@ -101,6 +96,15 @@ func newUpdater(
 		ocspMinTimeToExpiry:          config.OCSPMinTimeToExpiry.Duration,
 		ocspStaleMaxAge:              config.OCSPStaleMaxAge.Duration,
 		parallelGenerateOCSPRequests: config.ParallelGenerateOCSPRequests,
+		purgerService:                apc,
+	}
+
+	if updater.purgerService != nil {
+		issuer, err := core.LoadCert(issuerPath)
+		if err != nil {
+			return nil, err
+		}
+		updater.issuer = issuer
 	}
 
 	// Setup loops
@@ -117,57 +121,11 @@ func newUpdater(
 		},
 	}
 
-	if !features.Enabled(features.RevokeAtRA) {
-		updater.loops = append(updater.loops,
-			&looper{
-				clk:                  clk,
-				stats:                stats.NewScope("RevokedCertificates"),
-				batchSize:            config.RevokedCertificateBatchSize,
-				tickDur:              config.RevokedCertificateWindow.Duration,
-				tickFunc:             updater.revokedCertificatesTick,
-				name:                 "RevokedCertificates",
-				failureBackoffFactor: config.SignFailureBackoffFactor,
-				failureBackoffMax:    config.SignFailureBackoffMax.Duration,
-			})
-	}
-
-	if config.AkamaiBaseURL != "" {
-		issuer, err := core.LoadCert(issuerPath)
-		if err != nil {
-			return nil, err
-		}
-		ccu, err := akamai.NewCachePurgeClient(
-			config.AkamaiBaseURL,
-			config.AkamaiClientToken,
-			config.AkamaiClientSecret,
-			config.AkamaiAccessToken,
-			config.AkamaiV3Network,
-			config.AkamaiPurgeRetries,
-			config.AkamaiPurgeRetryBackoff.Duration,
-			log,
-			stats,
-		)
-		if err != nil {
-			return nil, err
-		}
-		updater.ccu = ccu
-		updater.issuer = issuer
-	} else if apc != nil {
-		issuer, err := core.LoadCert(issuerPath)
-		if err != nil {
-			return nil, err
-		}
-		updater.issuer = issuer
-		updater.purgerService = apc
-	}
-
 	return &updater, nil
 }
 
 func (updater *OCSPUpdater) findStaleOCSPResponses(oldestLastUpdatedTime time.Time, batchSize int) ([]core.CertificateStatus, error) {
 	var statuses []core.CertificateStatus
-	// TODO(@cpu): Once the notafter-backfill cmd has been run & completed then
-	// the query below can be rewritten to use `AND NOT cs.isExpired`.
 	now := updater.clk.Now()
 	maxAgeCutoff := now.Add(-updater.ocspStaleMaxAge)
 
@@ -196,11 +154,6 @@ func (updater *OCSPUpdater) findStaleOCSPResponses(oldestLastUpdatedTime time.Ti
 	return statuses, err
 }
 
-type responseMeta struct {
-	*core.OCSPResponse
-	*core.CertificateStatus
-}
-
 func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.CertificateStatus) (*core.CertificateStatus, error) {
 	cert, err := sa.SelectCertificate(
 		updater.dbMap,
@@ -208,7 +161,20 @@ func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.Ce
 		status.Serial,
 	)
 	if err != nil {
-		return nil, err
+		// If PrecertificateOCSP is enabled and the error indicates there was no
+		// certificates table row then try to find a precertificate table row before
+		// giving up with an error.
+		if features.Enabled(features.PrecertificateOCSP) && err == sql.ErrNoRows {
+			cert, err = sa.SelectPrecertificate(updater.dbMap, status.Serial)
+			// If there was still a non-nil error return it. If we can't find
+			// a precert row something is amiss, we have a certificateStatus row with
+			// no matching certificate or precertificate.
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	signRequest := core.OCSPSigningRequest{
@@ -229,48 +195,10 @@ func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.Ce
 	return &status, nil
 }
 
-// generateRevokedResponse takes a core.CertificateStatus and updates it with a revoked OCSP response
-// for the certificate it represents. generateRevokedResponse then returns the updated status and a
-// list of OCSP request URLs that should be purged or an error.
-func (updater *OCSPUpdater) generateRevokedResponse(ctx context.Context, status core.CertificateStatus) (*core.CertificateStatus, []string, error) {
-	cert, err := updater.sac.GetCertificate(ctx, status.Serial)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	signRequest := core.OCSPSigningRequest{
-		CertDER:   cert.DER,
-		Status:    string(core.OCSPStatusRevoked),
-		Reason:    status.RevokedReason,
-		RevokedAt: status.RevokedDate,
-	}
-
-	ocspResponse, err := updater.cac.GenerateOCSP(ctx, signRequest)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	now := updater.clk.Now()
-	status.OCSPLastUpdated = now
-	status.OCSPResponse = ocspResponse
-
-	// If cache client is populated generate purge URLs
-	var purgeURLs []string
-	if updater.ccu != nil || updater.purgerService != nil {
-		purgeURLs, err = akamai.GeneratePurgeURLs(cert.DER, updater.issuer)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	return &status, purgeURLs, nil
-}
-
 func (updater *OCSPUpdater) storeResponse(status *core.CertificateStatus) error {
 	// Update the certificateStatus table with the new OCSP response, the status
 	// WHERE is used make sure we don't overwrite a revoked response with a one
-	// containing a 'good' status and that we don't do the inverse when the OCSP
-	// status should be 'good'.
+	// containing a 'good' status.
 	_, err := updater.dbMap.Exec(
 		`UPDATE certificateStatus
 		 SET ocspResponse=?,ocspLastUpdated=?
@@ -293,83 +221,6 @@ func (updater *OCSPUpdater) markExpired(status core.CertificateStatus) error {
 		status.Serial,
 	)
 	return err
-}
-
-func (updater *OCSPUpdater) findRevokedCertificatesToUpdate(batchSize int) ([]core.CertificateStatus, error) {
-	const query = "WHERE NOT isExpired AND status = ? AND ocspLastUpdated <= revokedDate LIMIT ?"
-	statuses, err := sa.SelectCertificateStatuses(
-		updater.dbMap,
-		query,
-		string(core.OCSPStatusRevoked),
-		batchSize,
-	)
-	return statuses, err
-}
-
-func (updater *OCSPUpdater) revokedCertificatesTick(ctx context.Context, batchSize int) error {
-	statuses, err := updater.findRevokedCertificatesToUpdate(batchSize)
-	if err != nil {
-		updater.stats.Inc("Errors.FindRevokedCertificates", 1)
-		updater.log.AuditErrf("Failed to find revoked certificates: %s", err)
-		return err
-	}
-	if len(statuses) == batchSize {
-		updater.stats.Inc("revokedCertificatesTick.FullTick", 1)
-	}
-
-	var allPurgeURLs []string
-	for _, status := range statuses {
-		// It's possible that, if our ticks are fast enough (mainly in tests), we
-		// will get a certificate status where the ocspLastUpdated == revokedDate
-		// and the certificate has already been revoked. In order to avoid
-		// generating a new response and purging the existing response, quickly
-		// check the actual response in this rare case.
-		if status.OCSPLastUpdated.Equal(status.RevokedDate) {
-			resp, err := ocsp.ParseResponse(status.OCSPResponse, nil)
-			if err != nil {
-				updater.log.AuditErrf("Failed to parse OCSP response: %s", err)
-				return err
-			}
-			if resp.Status == ocsp.Revoked {
-				// We already generated a revoked response, don't bother doing it again
-				continue
-			}
-		}
-		meta, purgeURLs, err := updater.generateRevokedResponse(ctx, status)
-		if err != nil {
-			updater.log.AuditErrf("Failed to generate revoked OCSP response: %s", err)
-			updater.stats.Inc("Errors.RevokedResponseGeneration", 1)
-			return err
-		}
-		allPurgeURLs = append(allPurgeURLs, purgeURLs...)
-		err = updater.storeResponse(meta)
-		if err != nil {
-			updater.stats.Inc("Errors.StoreRevokedResponse", 1)
-			updater.log.AuditErrf("Failed to store OCSP response: %s", err)
-			continue
-		}
-	}
-
-	if len(allPurgeURLs) > 0 {
-		if updater.ccu != nil {
-			err = updater.ccu.Purge(allPurgeURLs)
-			if err != nil {
-				updater.log.AuditErrf("Failed to purge OCSP response from CDN: %s", err)
-				return err
-			}
-		} else if updater.purgerService != nil {
-			go func() {
-				_, err = updater.purgerService.Purge(context.Background(), &akamaipb.PurgeRequest{
-					Urls: allPurgeURLs,
-				})
-				if err != nil {
-					updater.log.Errf("Request to Akamai purger service failed: %s", err)
-				}
-			}()
-		}
-	}
-
-	return nil
 }
 
 func (updater *OCSPUpdater) generateOCSPResponses(ctx context.Context, statuses []core.CertificateStatus, stats metrics.Scope) error {
@@ -495,9 +346,7 @@ func (l *looper) loop() error {
 }
 
 type config struct {
-	OCSPUpdater cmd.OCSPUpdaterConfig
-
-	Statsd cmd.StatsdConfig
+	OCSPUpdater OCSPUpdaterConfig
 
 	Syslog cmd.SyslogConfig
 
@@ -506,7 +355,39 @@ type config struct {
 	}
 }
 
-func setupClients(c cmd.OCSPUpdaterConfig, stats metrics.Scope, clk clock.Clock) (
+// OCSPUpdaterConfig provides the various window tick times and batch sizes needed
+// for the OCSP (and SCT) updater
+type OCSPUpdaterConfig struct {
+	cmd.ServiceConfig
+	cmd.DBConfig
+
+	OldOCSPWindow cmd.ConfigDuration
+
+	OldOCSPBatchSize int
+
+	OCSPMinTimeToExpiry          cmd.ConfigDuration
+	OCSPStaleMaxAge              cmd.ConfigDuration
+	ParallelGenerateOCSPRequests int
+
+	AkamaiBaseURL           string
+	AkamaiClientToken       string
+	AkamaiClientSecret      string
+	AkamaiAccessToken       string
+	AkamaiV3Network         string
+	AkamaiPurgeRetries      int
+	AkamaiPurgeRetryBackoff cmd.ConfigDuration
+
+	SignFailureBackoffFactor float64
+	SignFailureBackoffMax    cmd.ConfigDuration
+
+	SAService            *cmd.GRPCClientConfig
+	OCSPGeneratorService *cmd.GRPCClientConfig
+	AkamaiPurgerService  *cmd.GRPCClientConfig
+
+	Features map[string]bool
+}
+
+func setupClients(c OCSPUpdaterConfig, stats metrics.Scope, clk clock.Clock) (
 	core.CertificateAuthority,
 	core.StorageAuthority,
 	akamaipb.AkamaiPurgerClient,
@@ -525,15 +406,15 @@ func setupClients(c cmd.OCSPUpdaterConfig, stats metrics.Scope, clk clock.Clock)
 	// with a plain caPB.NewOCSPGeneratorClient.
 	cac := bgrpc.NewCertificateAuthorityClient(nil, capb.NewOCSPGeneratorClient(caConn))
 
-	conn, err := bgrpc.ClientSetup(c.SAService, tls, clientMetrics, clk)
+	saConn, err := bgrpc.ClientSetup(c.SAService, tls, clientMetrics, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
-	sac := bgrpc.NewStorageAuthorityClient(sapb.NewStorageAuthorityClient(conn))
+	sac := bgrpc.NewStorageAuthorityClient(sapb.NewStorageAuthorityClient(saConn))
 
 	var apc akamaipb.AkamaiPurgerClient
 	if c.AkamaiPurgerService != nil {
-		conn, err := bgrpc.ClientSetup(c.AkamaiPurgerService, tls, clientMetrics, clk)
+		apcConn, err := bgrpc.ClientSetup(c.AkamaiPurgerService, tls, clientMetrics, clk)
 		cmd.FailOnError(err, "Failed ot load credentials and create gRPC connection to Akamai Purger service")
-		apc = akamaipb.NewAkamaiPurgerClient(conn)
+		apc = akamaipb.NewAkamaiPurgerClient(apcConn)
 	}
 
 	return cac, sac, apc

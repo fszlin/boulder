@@ -12,7 +12,6 @@
     },
     "grpc": {
       "address": ":9095",
-      "maxConcurrentStreams": 2000,
       "clientNames": [
         "admin-revoker.boulder",
         "ca.boulder",
@@ -25,8 +24,8 @@
       ]
     },
     "features": {
-      "AllowRenewalFirstRL": true,
-      "SetIssuedNamesRenewalBit": true
+      "DeleteUnusedChallenges": true,
+      "FasterGetOrderForNames": true
     }
   },
 

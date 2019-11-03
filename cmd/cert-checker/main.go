@@ -23,6 +23,7 @@ import (
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/features"
+	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/policy"
@@ -135,27 +136,41 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 		return err
 	}
 
+	var initialID int
+	err = c.dbMap.SelectOne(
+		&initialID,
+		"SELECT id FROM certificates WHERE issued >= :issued AND expires >= :now LIMIT 1",
+		args,
+	)
+	if err != nil {
+		return err
+	}
+	if initialID > 0 {
+		// decrement the initial ID so that we select below as we aren't using >=
+		initialID -= 1
+	}
+
 	// Retrieve certs in batches of 1000 (the size of the certificate channel)
 	// so that we don't eat unnecessary amounts of memory and avoid the 16MB MySQL
 	// packet limit.
 	args["limit"] = batchSize
-	args["lastSerial"] = ""
+	args["id"] = initialID
 	for offset := 0; offset < count; {
 		certs, err := sa.SelectCertificates(
 			c.dbMap,
-			"WHERE issued >= :issued AND expires >= :now AND serial > :lastSerial LIMIT :limit",
+			"WHERE id > :id AND expires >= :now ORDER BY id LIMIT :limit",
 			args,
 		)
 		if err != nil {
 			return err
 		}
 		for _, cert := range certs {
-			c.certs <- cert
+			c.certs <- cert.Certificate
 		}
 		if len(certs) == 0 {
 			break
 		}
-		args["lastSerial"] = certs[len(certs)-1].Serial
+		args["id"] = certs[len(certs)-1].ID
 		offset += len(certs)
 	}
 
@@ -164,9 +179,9 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 	return nil
 }
 
-func (c *certChecker) processCerts(wg *sync.WaitGroup, badResultsOnly bool) {
+func (c *certChecker) processCerts(wg *sync.WaitGroup, badResultsOnly bool, ignoredLints map[string]bool) {
 	for cert := range c.certs {
-		problems := c.checkCert(cert)
+		problems := c.checkCert(cert, ignoredLints)
 		valid := len(problems) == 0
 		c.rMu.Lock()
 		if !badResultsOnly || (badResultsOnly && !valid) {
@@ -205,7 +220,7 @@ var expectedExtensionContent = map[string][]byte{
 	"1.3.6.1.5.5.7.1.24": []byte{0x30, 0x03, 0x02, 0x01, 0x05}, // Must staple feature
 }
 
-func (c *certChecker) checkCert(cert core.Certificate) (problems []string) {
+func (c *certChecker) checkCert(cert core.Certificate, ignoredLints map[string]bool) (problems []string) {
 	// Check digests match
 	if cert.Digest != core.Fingerprint256(cert.DER) {
 		problems = append(problems, "Stored digest doesn't match certificate digest")
@@ -219,14 +234,14 @@ func (c *certChecker) checkCert(cert core.Certificate) (problems []string) {
 		// Run zlint checks
 		results := zlint.LintCertificate(parsedCert)
 		for name, res := range results.Results {
-			// ignore notices and warnings
-			if res.Status >= lints.Error {
-				prob := fmt.Sprintf("zlint %s: %s", res.Status, name)
-				if res.Details != "" {
-					prob = fmt.Sprintf("%s %s", prob, res.Details)
-				}
-				problems = append(problems, prob)
+			if ignoredLints[name] || res.Status <= lints.Pass {
+				continue
 			}
+			prob := fmt.Sprintf("zlint %s: %s", res.Status, name)
+			if res.Details != "" {
+				prob = fmt.Sprintf("%s %s", prob, res.Details)
+			}
+			problems = append(problems, prob)
 		}
 		// Check stored serial is correct
 		storedSerial, err := core.StringToSerial(cert.Serial)
@@ -267,10 +282,10 @@ func (c *certChecker) checkCert(cert core.Certificate) (problems []string) {
 		}
 		// Check that the PA is still willing to issue for each name in DNSNames + CommonName
 		for _, name := range append(parsedCert.DNSNames, parsedCert.Subject.CommonName) {
-			id := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: name}
+			id := identifier.ACMEIdentifier{Type: identifier.DNS, Value: name}
 			// TODO(https://github.com/letsencrypt/boulder/issues/3371): Distinguish
 			// between certificates issued by v1 and v2 API.
-			if err = c.pa.WillingToIssueWildcard(id); err != nil {
+			if err = c.pa.WillingToIssueWildcards([]identifier.ACMEIdentifier{id}); err != nil {
 				problems = append(problems, fmt.Sprintf("Policy Authority isn't willing to issue for '%s': %s", name, err))
 			} else {
 				// For defense-in-depth, even if the PA was willing to issue for a name
@@ -314,12 +329,14 @@ type config struct {
 		BadResultsOnly      bool
 		CheckPeriod         cmd.ConfigDuration
 
+		// IgnoredLints is a list of zlint names. Any lint results from a lint in
+		// the IgnoredLists list are ignored regardles of LintStatus level.
+		IgnoredLints []string
+
 		Features map[string]bool
 	}
 
 	PA cmd.PAConfig
-
-	Statsd cmd.StatsdConfig
 
 	Syslog cmd.SyslogConfig
 }
@@ -387,6 +404,11 @@ func main() {
 	)
 	fmt.Fprintf(os.Stderr, "# Getting certificates issued in the last %s\n", config.CertChecker.CheckPeriod)
 
+	ignoredLintsMap := make(map[string]bool)
+	for _, name := range config.CertChecker.IgnoredLints {
+		ignoredLintsMap[name] = true
+	}
+
 	// Since we grab certificates in batches we don't want this to block, when it
 	// is finished it will close the certificate channel which allows the range
 	// loops in checker.processCerts to break
@@ -401,7 +423,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			s := checker.clock.Now()
-			checker.processCerts(wg, config.CertChecker.BadResultsOnly)
+			checker.processCerts(wg, config.CertChecker.BadResultsOnly, ignoredLintsMap)
 			scope.TimingDuration("certChecker.processingLatency", time.Since(s))
 		}()
 	}

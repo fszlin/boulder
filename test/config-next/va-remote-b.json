@@ -1,7 +1,7 @@
 {
   "va": {
     "CAASERVFAILExceptions": "test/caa-servfail-exceptions.txt",
-    "userAgent": "boulder",
+    "userAgent": "boulder-remote-b",
     "debugAddr": ":8012",
     "portConfig": {
       "httpPort": 80,
@@ -21,15 +21,13 @@
     },
     "grpc": {
       "address": ":9098",
-      "maxConcurrentStreams": 2000,
       "clientNames": [
         "va.boulder"
       ]
     },
     "features": {
       "CAAValidationMethods": true,
-      "CAAAccountURI": true,
-      "SimplifiedVAHTTP": true
+      "CAAAccountURI": true
     },
     "accountURIPrefixes": [
       "http://boulder:4000/acme/reg/"

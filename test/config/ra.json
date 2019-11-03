@@ -3,19 +3,15 @@
     "rateLimitPoliciesFilename": "test/rate-limit-policies.yml",
     "maxConcurrentRPCServerRequests": 100000,
     "maxContactsPerRegistration": 100,
-    "dnsTries": 3,
-    "dnsResolvers": [
-      "127.0.0.1:8053",
-      "127.0.0.1:8054"
-    ],
     "debugAddr": ":8002",
-    "hostnamePolicyFile": "test/hostname-policy.json",
+    "hostnamePolicyFile": "test/hostname-policy.yaml",
     "maxNames": 100,
     "reuseValidAuthz": true,
     "authorizationLifetimeDays": 30,
     "pendingAuthorizationLifetimeDays": 7,
-    "weakKeyDirectory": "test/example-weak-keys.json",
+    "weakKeyFile": "test/example-weak-keys.json",
     "orderLifetime": "168h",
+    "issuerCertPath":  "test/test-ca2.pem",
     "tls": {
       "caCertFile": "test/grpc-creds/minica.pem",
       "certFile": "test/grpc-creds/ra.boulder/cert.pem",
@@ -37,35 +33,41 @@
       "serverAddress": "sa.boulder:9095",
       "timeout": "15s"
     },
+    "akamaiPurgerService": {
+      "serverAddress": "akamai-purger.boulder:9099",
+      "timeout": "15s"
+    },
     "grpc": {
       "address": ":9094",
-      "maxConcurrentStreams": 2000,
       "clientNames": [
         "wfe.boulder",
         "admin-revoker.boulder"
       ]
     },
     "features": {
-      "TLSSNIRevalidation": true
+      "NewAuthorizationSchema": true,
+      "EarlyOrderRateLimit": true
     },
     "CTLogGroups2": [
       {
         "name": "a",
+        "stagger": "500ms",
         "logs": [
           {
             "uri": "http://boulder:4500",
             "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYggOxPnPkzKBIhTacSYoIfnSL2jPugcbUKx83vFMvk5gKAz/AGe87w20riuPwEGn229hKVbEKHFB61NIqNHC3Q==",
-            "submitFinalCert": true
+            "submitFinalCert": false
           },
           {
             "uri": "http://boulder:4501",
             "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKtnFevaXV/kB8dmhCNZHmxKVLcHX1plaAsY9LrKilhYxdmQZiu36LvAvosTsqMVqRK9a96nC8VaxAdaHUbM8EA==",
-            "submitFinalCert": true
+            "submitFinalCert": false
           }
         ]
       },
       {
         "name": "b",
+        "stagger": "500ms",
         "logs": [
           {
             "uri": "http://boulder:4510",
@@ -73,8 +75,27 @@
             "submitFinalCert": true
           },
           {
-            "uri": "http://boulder:4511",
-            "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFRu37ZRLg8lT4rVQwMwh4oAOpXb4Sx+9hgQ+JFCjmAv3oDV+sDOMsC7hULkGTn+LB5L1SRo/XIY4Kw5V+nFXgg==",
+            "name": "temporal test set",
+            "shards": [
+              {
+                "uri": "http://boulder:4511",
+                "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFRu37ZRLg8lT4rVQwMwh4oAOpXb4Sx+9hgQ+JFCjmAv3oDV+sDOMsC7hULkGTn+LB5L1SRo/XIY4Kw5V+nFXgg==",
+                "windowStart": "2006-01-02T15:04:05Z",
+                "windowEnd": "2017-01-02T15:04:05Z"
+              },
+              {
+                "uri": "http://boulder:4511",
+                "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFRu37ZRLg8lT4rVQwMwh4oAOpXb4Sx+9hgQ+JFCjmAv3oDV+sDOMsC7hULkGTn+LB5L1SRo/XIY4Kw5V+nFXgg==",
+                "windowStart": "2017-01-02T15:04:05Z",
+                "windowEnd": "2022-01-02T15:04:05Z"
+              },
+              {
+                "uri": "http://boulder:4511",
+                "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFRu37ZRLg8lT4rVQwMwh4oAOpXb4Sx+9hgQ+JFCjmAv3oDV+sDOMsC7hULkGTn+LB5L1SRo/XIY4Kw5V+nFXgg==",
+                "windowStart": "2022-01-02T15:04:05Z",
+                "windowEnd": "2050-01-02T15:04:05Z"
+              }
+            ],
             "submitFinalCert": true
           }
         ]
@@ -100,10 +121,5 @@
   "syslog": {
     "stdoutlevel": 6,
     "sysloglevel": 4
-  },
-
-  "common": {
-    "dnsTimeout": "1s",
-    "dnsAllowLoopbackAddresses": true
   }
 }

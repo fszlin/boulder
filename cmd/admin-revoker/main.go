@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"database/sql"
 	"flag"
@@ -10,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 
-	"golang.org/x/net/context"
 	"gopkg.in/go-gorp/gorp.v2"
 
 	"github.com/letsencrypt/boulder/cmd"
@@ -31,13 +31,11 @@ usage:
 admin-revoker serial-revoke --config <path> <serial> <reason-code>
 admin-revoker reg-revoke --config <path> <registration-id> <reason-code>
 admin-revoker list-reasons --config <path>
-admin-revoker auth-revoke --config <path> <domain>
 
 command descriptions:
   serial-revoke   Revoke a single certificate by the hex serial number
   reg-revoke      Revoke all certificates associated with a registration ID
   list-reasons    List all revocation reason codes
-  auth-revoke     Revoke all pending/valid authorizations for a domain
 
 args:
   config    File path to the configuration file for this service
@@ -222,15 +220,6 @@ func main() {
 		for _, k := range codes {
 			fmt.Printf("%d: %s\n", k, revocation.ReasonToString[k])
 		}
-
-	case command == "auth-revoke" && len(args) == 1:
-		domain := args[0]
-		_, logger, _, sac := setupContext(c)
-		ident := core.AcmeIdentifier{Value: domain, Type: core.IdentifierDNS}
-		authsRevoked, pendingAuthsRevoked, err := sac.RevokeAuthorizationsByDomain(ctx, ident)
-		cmd.FailOnError(err, fmt.Sprintf("Failed to revoke authorizations for %s", ident.Value))
-		logger.Infof("Revoked %d pending authorizations and %d final authorizations",
-			pendingAuthsRevoked, authsRevoked)
 
 	default:
 		usage()

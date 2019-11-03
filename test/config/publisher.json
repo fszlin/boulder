@@ -1,11 +1,11 @@
 {
   "publisher": {
+    "userAgent": "boulder/1.0",
     "maxConcurrentRPCServerRequests": 100000,
     "submissionTimeout": "5s",
     "debugAddr": ":8009",
     "grpc": {
       "address": ":9091",
-      "maxConcurrentStreams": 2000,
       "clientNames": [
         "ra.boulder",
         "ocsp-updater.boulder"

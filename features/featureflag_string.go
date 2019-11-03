@@ -4,9 +4,45 @@ package features
 
 import "strconv"
 
-const _FeatureFlag_name = "unusedPerformValidationRPCACME13KeyRolloverSimplifiedVAHTTPTLSSNIRevalidationAllowRenewalFirstRLCAAValidationMethodsCAAAccountURIProbeCTLogsHeadNonceStatusOKNewAuthorizationSchemaRevokeAtRASetIssuedNamesRenewalBitEarlyOrderRateLimit"
+func _() {
+	// An "invalid array index" compiler error signifies that the constant values have changed.
+	// Re-run the stringer command to generate them again.
+	var x [1]struct{}
+	_ = x[unused-0]
+	_ = x[PerformValidationRPC-1]
+	_ = x[ACME13KeyRollover-2]
+	_ = x[SimplifiedVAHTTP-3]
+	_ = x[TLSSNIRevalidation-4]
+	_ = x[AllowRenewalFirstRL-5]
+	_ = x[SetIssuedNamesRenewalBit-6]
+	_ = x[FasterRateLimit-7]
+	_ = x[ProbeCTLogs-8]
+	_ = x[RevokeAtRA-9]
+	_ = x[NewAuthorizationSchema-10]
+	_ = x[DisableAuthz2Orders-11]
+	_ = x[EarlyOrderRateLimit-12]
+	_ = x[FasterGetOrderForNames-13]
+	_ = x[CAAValidationMethods-14]
+	_ = x[CAAAccountURI-15]
+	_ = x[HeadNonceStatusOK-16]
+	_ = x[EnforceMultiVA-17]
+	_ = x[MultiVAFullResults-18]
+	_ = x[RemoveWFE2AccountID-19]
+	_ = x[CheckRenewalFirst-20]
+	_ = x[MandatoryPOSTAsGET-21]
+	_ = x[AllowV1Registration-22]
+	_ = x[ParallelCheckFailedValidation-23]
+	_ = x[DeleteUnusedChallenges-24]
+	_ = x[V1DisableNewValidations-25]
+	_ = x[PrecertificateOCSP-26]
+	_ = x[PrecertificateRevocation-27]
+	_ = x[StripDefaultSchemePort-28]
+	_ = x[GetAuthorizationsPerf-29]
+}
 
-var _FeatureFlag_index = [...]uint8{0, 6, 26, 43, 59, 77, 96, 116, 129, 140, 157, 179, 189, 213, 232}
+const _FeatureFlag_name = "unusedPerformValidationRPCACME13KeyRolloverSimplifiedVAHTTPTLSSNIRevalidationAllowRenewalFirstRLSetIssuedNamesRenewalBitFasterRateLimitProbeCTLogsRevokeAtRANewAuthorizationSchemaDisableAuthz2OrdersEarlyOrderRateLimitFasterGetOrderForNamesCAAValidationMethodsCAAAccountURIHeadNonceStatusOKEnforceMultiVAMultiVAFullResultsRemoveWFE2AccountIDCheckRenewalFirstMandatoryPOSTAsGETAllowV1RegistrationParallelCheckFailedValidationDeleteUnusedChallengesV1DisableNewValidationsPrecertificateOCSPPrecertificateRevocationStripDefaultSchemePortGetAuthorizationsPerf"
+
+var _FeatureFlag_index = [...]uint16{0, 6, 26, 43, 59, 77, 96, 120, 135, 146, 156, 178, 197, 216, 238, 258, 271, 288, 302, 320, 339, 356, 374, 393, 422, 444, 467, 485, 509, 531, 552}
 
 func (i FeatureFlag) String() string {
 	if i < 0 || i >= FeatureFlag(len(_FeatureFlag_index)-1) {

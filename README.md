@@ -72,7 +72,7 @@ Make sure you have a local copy of Boulder in your [`$GOPATH`](https://golang.or
     git clone https://github.com/letsencrypt/boulder/ $GOPATH/src/github.com/letsencrypt/boulder
     cd $GOPATH/src/github.com/letsencrypt/boulder
 
-Additionally, make sure you have Docker Engine 1.10.0+ and Docker Compose 1.6.0+ installed. If you do not, you can follow Docker's [installation instructions](https://docs.docker.com/compose/install/).
+Additionally, make sure you have Docker Engine 1.13.0+ and Docker Compose 1.10.0+ installed. If you do not, you can follow Docker's [installation instructions](https://docs.docker.com/compose/install/).
 
 We recommend having **at least 2GB of RAM** available on your Docker host. In practice using less RAM may result in the MariaDB container failing in non-obvious ways.
 
@@ -106,21 +106,17 @@ Alternatively, you can override the docker-compose.yml default with an environme
 
 Boulder's default VA configuration (`test/config/va.json`) is configured to connect to port 5002 to validate HTTP-01 challenges and port 5001 to validate TLS-ALPN-01 challenges. If you want to solve challenges with a client running on your host you should make sure it uses these ports to respond to validation requests, or update the VA configuration's `portConfig` to use ports 80 and 443 to match how the VA operates in production and staging environments. If you use a host-based firewall (e.g. `ufw` or `iptables`) make sure you allow connections from the Docker instance to your host on the required ports.
 
-If a base image changes (i.e. `letsencrypt/boulder-tools`) you will need to rebuild images for both the boulder and bhsm containers and re-create them. The quickest way to do this is with this command:
-
-    ./docker-rebuild.sh
-
 
 ### Working with Certbot
 
-Check out the Certbot client from https://github.com/certbot/certbot and follow their setup instructions. Once you've got the client set up, you'll probably want to run it against your local Boulder. There are a number of command line flags that are necessary to run the client against a local Boulder, and without root access. The simplest way to run the client locally is to source a file that provides an alias for certbot (`certbot_test`) that has all those flags:
+Check out the Certbot client from https://github.com/certbot/certbot and follow their setup instructions. Once you've got the client set up, you'll probably want to run it against your local Boulder. There are a number of command line flags that are necessary to run the client against a local Boulder, and without root access. The simplest way to run the client locally is to use a convenient alias for certbot (`certbot_test`) with a custom `SERVER` environment variable:
 
-    source ~/certbot/tests/integration/_common.sh
-    certbot_test certonly -a standalone -d example.com
+    SERVER=http://localhost:4001/directory certbot_test certonly --standalone -d test.example.com
 
 Your local Boulder instance uses a fake DNS resolver that returns 127.0.0.1 for any query, so you can use any value for the -d flag. To return an answer other than `127.0.0.1` change the Boulder `FAKE_DNS` environment variable to another IP address.
 
-By default Certbot will connect to the ACME v2 API over HTTP. You can customize the `SERVER` environment variable with an alternative ACME directory URL if required.
+To use the legacy ACME v1 API over change `SERVER` to `http://localhost:4000/directory`.
+
 
 ### Working with another ACME Client
 

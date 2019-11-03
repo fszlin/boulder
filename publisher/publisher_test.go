@@ -1,6 +1,7 @@
 package publisher
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -24,7 +25,6 @@ import (
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
 
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -263,6 +263,7 @@ func setup(t *testing.T) (*Impl, *x509.Certificate, *ecdsa.PrivateKey) {
 	intermediatePEM, _ := pem.Decode([]byte(testIntermediate))
 
 	pub := New(nil,
+		"test-user-agent/1.0",
 		log,
 		metrics.NewNoopScope())
 	pub.issuerBundle = append(pub.issuerBundle, ct.ASN1Cert{Data: intermediatePEM.Bytes})
@@ -281,7 +282,7 @@ func addLog(t *testing.T, pub *Impl, port int, pubKey *ecdsa.PublicKey) *Log {
 	uri := fmt.Sprintf("http://localhost:%d", port)
 	der, err := x509.MarshalPKIXPublicKey(pubKey)
 	test.AssertNotError(t, err, "Failed to marshal key")
-	newLog, err := NewLog(uri, base64.StdEncoding.EncodeToString(der), log)
+	newLog, err := NewLog(uri, base64.StdEncoding.EncodeToString(der), "test-user-agent/1.0", log)
 	test.AssertNotError(t, err, "Couldn't create log")
 	test.AssertEquals(t, newLog.uri, fmt.Sprintf("http://localhost:%d", port))
 	return newLog
@@ -369,11 +370,11 @@ func TestLogCache(t *testing.T) {
 	}
 
 	// Adding a log with an invalid base64 public key should error
-	_, err := cache.AddLog("www.test.com", "1234", log)
+	_, err := cache.AddLog("www.test.com", "1234", "test-user-agent/1.0", log)
 	test.AssertError(t, err, "AddLog() with invalid base64 pk didn't error")
 
 	// Adding a log with an invalid URI should error
-	_, err = cache.AddLog(":", "", log)
+	_, err = cache.AddLog(":", "", "test-user-agent/1.0", log)
 	test.AssertError(t, err, "AddLog() with an invalid log URI didn't error")
 
 	// Create one keypair & base 64 public key
@@ -391,21 +392,21 @@ func TestLogCache(t *testing.T) {
 	k2b64 := base64.StdEncoding.EncodeToString(der2)
 
 	// Adding the first log should not produce an error
-	l1, err := cache.AddLog("http://log.one.example.com", k1b64, log)
+	l1, err := cache.AddLog("http://log.one.example.com", k1b64, "test-user-agent/1.0", log)
 	test.AssertNotError(t, err, "cache.AddLog() failed for log 1")
 	test.AssertEquals(t, cache.Len(), 1)
 	test.AssertEquals(t, l1.uri, "http://log.one.example.com")
 	test.AssertEquals(t, l1.logID, k1b64)
 
 	// Adding it again should not produce any errors, or increase the Len()
-	l1, err = cache.AddLog("http://log.one.example.com", k1b64, log)
+	l1, err = cache.AddLog("http://log.one.example.com", k1b64, "test-user-agent/1.0", log)
 	test.AssertNotError(t, err, "cache.AddLog() failed for second add of log 1")
 	test.AssertEquals(t, cache.Len(), 1)
 	test.AssertEquals(t, l1.uri, "http://log.one.example.com")
 	test.AssertEquals(t, l1.logID, k1b64)
 
 	// Adding a second log should not error and should increase the Len()
-	l2, err := cache.AddLog("http://log.two.example.com", k2b64, log)
+	l2, err := cache.AddLog("http://log.two.example.com", k2b64, "test-user-agent/1.0", log)
 	test.AssertNotError(t, err, "cache.AddLog() failed for log 2")
 	test.AssertEquals(t, cache.Len(), 2)
 	test.AssertEquals(t, l2.uri, "http://log.two.example.com")
@@ -434,44 +435,49 @@ func TestLogErrorBody(t *testing.T) {
 	test.AssertEquals(t, len(log.GetAllMatching("well this isn't good now is it")), 1)
 }
 
-func TestProbeLogs(t *testing.T) {
-	pub, _, k := setup(t)
+func TestHTTPStatusMetric(t *testing.T) {
+	pub, leaf, k := setup(t)
 
-	srvA := logSrv(k)
-	defer srvA.Close()
-	portA, err := getPort(srvA.URL)
+	badSrv := errorBodyLogSrv()
+	defer badSrv.Close()
+	port, err := getPort(badSrv.URL)
 	test.AssertNotError(t, err, "Failed to get test server port")
-	srvB := errorBodyLogSrv()
-	defer srvB.Close()
-	portB, err := getPort(srvB.URL)
+	logURI := fmt.Sprintf("http://localhost:%d", port)
+
+	pkDER, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
+	test.AssertNotError(t, err, "Failed to marshal key")
+	pkB64 := base64.StdEncoding.EncodeToString(pkDER)
+	_, err = pub.SubmitToSingleCTWithResult(context.Background(), &pubpb.Request{
+		LogURL:       &logURI,
+		LogPublicKey: &pkB64,
+		Der:          leaf.Raw,
+	})
+	test.AssertError(t, err, "SubmitToSingleCTWithResult didn't fail")
+	test.AssertEquals(t, test.CountHistogramSamples(pub.metrics.submissionLatency.With(prometheus.Labels{
+		"log":        logURI,
+		"status":     "error",
+		"httpStatus": "400",
+	})), 1)
+
+	pub, leaf, k = setup(t)
+	pkDER, err = x509.MarshalPKIXPublicKey(&k.PublicKey)
+	test.AssertNotError(t, err, "Failed to marshal key")
+	pkB64 = base64.StdEncoding.EncodeToString(pkDER)
+	workingSrv := logSrv(k)
+	defer workingSrv.Close()
+	port, err = getPort(workingSrv.URL)
 	test.AssertNotError(t, err, "Failed to get test server port")
+	logURI = fmt.Sprintf("http://localhost:%d", port)
 
-	addLog := func(uri string) {
-		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		test.AssertNotError(t, err, "ecdsa.GenerateKey() failed for k")
-		der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
-		test.AssertNotError(t, err, "x509.MarshalPKIXPublicKey(der) failed")
-		kb64 := base64.StdEncoding.EncodeToString(der)
-		_, err = pub.ctLogsCache.AddLog(uri, kb64, pub.log)
-		test.AssertNotError(t, err, "Failed to add log to logCache")
-	}
-
-	addLog(fmt.Sprintf("http://localhost:%d", portA))
-	addLog(fmt.Sprintf("http://localhost:%d", portB))
-	addLog("http://blackhole:9999")
-
-	pub.ProbeLogs()
-
-	test.AssertEquals(t, test.CountHistogramSamples(pub.metrics.probeLatency.With(prometheus.Labels{
-		"log":    fmt.Sprintf("http://localhost:%d", portA),
-		"status": "200 OK",
-	})), 1)
-	test.AssertEquals(t, test.CountHistogramSamples(pub.metrics.probeLatency.With(prometheus.Labels{
-		"log":    fmt.Sprintf("http://localhost:%d", portB),
-		"status": "400 Bad Request",
-	})), 1)
-	test.AssertEquals(t, test.CountHistogramSamples(pub.metrics.probeLatency.With(prometheus.Labels{
-		"log":    "http://blackhole:9999",
-		"status": "error",
+	_, err = pub.SubmitToSingleCTWithResult(context.Background(), &pubpb.Request{
+		LogURL:       &logURI,
+		LogPublicKey: &pkB64,
+		Der:          leaf.Raw,
+	})
+	test.AssertNotError(t, err, "SubmitToSingleCTWithResult failed")
+	test.AssertEquals(t, test.CountHistogramSamples(pub.metrics.submissionLatency.With(prometheus.Labels{
+		"log":        logURI,
+		"status":     "success",
+		"httpStatus": "",
 	})), 1)
 }

@@ -15,6 +15,7 @@ import (
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
+	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/wfe"
@@ -35,13 +36,19 @@ type config struct {
 
 		SubscriberAgreementURL string
 
-		AcceptRevocationReason bool
-		AllowAuthzDeactivation bool
-
 		TLS cmd.TLSConfig
 
 		RAService *cmd.GRPCClientConfig
 		SAService *cmd.GRPCClientConfig
+		// GetNonceService contains a gRPC config for any nonce-service instances
+		// which we want to retrieve nonces from. In a multi-DC deployment this
+		// should refer to any local nonce-service instances.
+		GetNonceService *cmd.GRPCClientConfig
+		// RedeemNonceServices contains a map of nonce-service prefixes to
+		// gRPC configs we want to use to redeem nonces. In a multi-DC deployment
+		// this should contain all nonce-services from all DCs as we want to be
+		// able to redeem nonces generated at any DC.
+		RedeemNonceServices map[string]cmd.GRPCClientConfig
 
 		Features map[string]bool
 
@@ -52,6 +59,11 @@ type config struct {
 		// DirectoryWebsite is used for the /directory response's "meta" element's
 		// "website" field.
 		DirectoryWebsite string
+
+		// BlockedKeyFile is the path to a YAML file containing Base64 encoded
+		// SHA256 hashes of DER encoded PKIX public keys that should be considered
+		// administratively blocked.
+		BlockedKeyFile string
 	}
 
 	Syslog cmd.SyslogConfig
@@ -61,7 +73,7 @@ type config struct {
 	}
 }
 
-func setupWFE(c config, logger blog.Logger, stats metrics.Scope, clk clock.Clock) (core.RegistrationAuthority, core.StorageAuthority) {
+func setupWFE(c config, logger blog.Logger, stats metrics.Scope, clk clock.Clock) (core.RegistrationAuthority, core.StorageAuthority, noncepb.NonceServiceClient, map[string]noncepb.NonceServiceClient) {
 	tlsConfig, err := c.WFE.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 
@@ -74,7 +86,20 @@ func setupWFE(c config, logger blog.Logger, stats metrics.Scope, clk clock.Clock
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
 	sac := bgrpc.NewStorageAuthorityClient(sapb.NewStorageAuthorityClient(saConn))
 
-	return rac, sac
+	var rns noncepb.NonceServiceClient
+	npm := map[string]noncepb.NonceServiceClient{}
+	if c.WFE.GetNonceService != nil {
+		rnsConn, err := bgrpc.ClientSetup(c.WFE.GetNonceService, tlsConfig, clientMetrics, clk)
+		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to get nonce service")
+		rns = noncepb.NewNonceServiceClient(rnsConn)
+		for prefix, serviceConfig := range c.WFE.RedeemNonceServices {
+			conn, err := bgrpc.ClientSetup(&serviceConfig, tlsConfig, clientMetrics, clk)
+			cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to redeem nonce service")
+			npm[prefix] = noncepb.NewNonceServiceClient(conn)
+		}
+	}
+
+	return rac, sac, rns, npm
 }
 
 func main() {
@@ -98,18 +123,17 @@ func main() {
 
 	clk := cmd.Clock()
 
-	kp, err := goodkey.NewKeyPolicy("") // don't load any weak keys
+	// don't load any weak keys, but do load blocked keys
+	kp, err := goodkey.NewKeyPolicy("", c.WFE.BlockedKeyFile)
 	cmd.FailOnError(err, "Unable to create key policy")
-	wfe, err := wfe.NewWebFrontEndImpl(scope, clk, kp, logger)
+	rac, sac, rns, npm := setupWFE(c, logger, scope, clk)
+	wfe, err := wfe.NewWebFrontEndImpl(scope, clk, kp, rns, npm, logger)
 	cmd.FailOnError(err, "Unable to create WFE")
-	rac, sac := setupWFE(c, logger, scope, clk)
 	wfe.RA = rac
 	wfe.SA = sac
 
 	wfe.SubscriberAgreementURL = c.WFE.SubscriberAgreementURL
 	wfe.AllowOrigins = c.WFE.AllowOrigins
-	wfe.AcceptRevocationReason = c.WFE.AcceptRevocationReason
-	wfe.AllowAuthzDeactivation = c.WFE.AllowAuthzDeactivation
 	wfe.DirectoryCAAIdentity = c.WFE.DirectoryCAAIdentity
 	wfe.DirectoryWebsite = c.WFE.DirectoryWebsite
 

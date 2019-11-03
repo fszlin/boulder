@@ -96,7 +96,11 @@ func Req(fileName string) (*ocsp.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	cert, err := parse(contents)
+	return ReqDER(contents, *expectStatus)
+}
+
+func ReqDER(der []byte, expectStatus int) (*ocsp.Response, error) {
+	cert, err := parse(der)
 	if err != nil {
 		return nil, fmt.Errorf("parsing certificate: %s", err)
 	}
@@ -146,7 +150,7 @@ func Req(fileName string) (*ocsp.Response, error) {
 	if len(respBytes) == 0 {
 		return nil, fmt.Errorf("empty reponse body")
 	}
-	return parseAndPrint(respBytes, cert, issuer)
+	return parseAndPrint(respBytes, cert, issuer, expectStatus)
 }
 
 func sendHTTPRequest(req []byte, ocspURL *url.URL) (*http.Response, error) {
@@ -190,14 +194,14 @@ func getOCSPURL(cert *x509.Certificate) (*url.URL, error) {
 	return ocspURL, nil
 }
 
-func parseAndPrint(respBytes []byte, cert, issuer *x509.Certificate) (*ocsp.Response, error) {
+func parseAndPrint(respBytes []byte, cert, issuer *x509.Certificate, expectStatus int) (*ocsp.Response, error) {
 	fmt.Printf("\nDecoding body: %s\n", base64.StdEncoding.EncodeToString(respBytes))
 	resp, err := ocsp.ParseResponseForCert(respBytes, cert, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("parsing response: %s", err)
 	}
-	if resp.Status != *expectStatus {
-		return nil, fmt.Errorf("wrong CertStatus %d, expected %d", resp.Status, *expectStatus)
+	if resp.Status != expectStatus {
+		return nil, fmt.Errorf("wrong CertStatus %d, expected %d", resp.Status, expectStatus)
 	}
 	timeTilExpiry := time.Until(resp.NextUpdate)
 	tooSoonDuration := time.Duration(*tooSoon) * time.Hour

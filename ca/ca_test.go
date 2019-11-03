@@ -1,7 +1,7 @@
 package ca
 
 import (
-	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,22 +23,26 @@ import (
 	cfsslConfig "github.com/cloudflare/cfssl/config"
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/signer"
+	"github.com/cloudflare/cfssl/signer/local"
 	"github.com/google/certificate-transparency-go"
 	cttls "github.com/google/certificate-transparency-go/tls"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/zmap/zlint/lints"
 	"golang.org/x/crypto/ocsp"
-	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/ca/config"
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
+	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/policy"
+	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -136,8 +141,8 @@ var (
 	// |TestIssueCertificate| quite a bit, and since it isn't clear that that
 	// would be useful, we've avoided adding that case, at least for now.
 	issuanceModes = []IssuanceMode{
-		{name: "precertificate", issuePrecertificate: true, issueCertificateForPrecertificate: false},
-		{name: "certificate-for-precertificate", issuePrecertificate: false, issueCertificateForPrecertificate: true},
+		{name: "precertificate", issueCertificateForPrecertificate: false},
+		{name: "certificate-for-precertificate", issueCertificateForPrecertificate: true},
 	}
 )
 
@@ -162,7 +167,7 @@ type testCtx struct {
 	keyPolicy goodkey.KeyPolicy
 	fc        clock.FakeClock
 	stats     metrics.Scope
-	logger    blog.Logger
+	logger    *blog.Mock
 }
 
 type mockSA struct {
@@ -172,6 +177,14 @@ type mockSA struct {
 func (m *mockSA) AddCertificate(ctx context.Context, der []byte, _ int64, _ []byte, _ *time.Time) (string, error) {
 	m.certificate.DER = der
 	return "", nil
+}
+
+func (m *mockSA) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*corepb.Empty, error) {
+	return &corepb.Empty{}, nil
+}
+
+func (m *mockSA) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*corepb.Empty, error) {
+	return &corepb.Empty{}, nil
 }
 
 var caKey crypto.Signer
@@ -191,12 +204,13 @@ func init() {
 }
 
 func setup(t *testing.T) *testCtx {
+	features.Reset()
 	fc := clock.NewFake()
 	fc.Add(1 * time.Hour)
 
 	pa, err := policy.New(nil)
 	test.AssertNotError(t, err, "Couldn't create PA")
-	err = pa.SetHostnamePolicyFile("../test/hostname-policy.json")
+	err = pa.SetHostnamePolicyFile("../test/hostname-policy.yaml")
 	test.AssertNotError(t, err, "Couldn't set hostname policy")
 
 	allowedExtensions := []cfsslConfig.OID{
@@ -318,28 +332,25 @@ type TestCertificateIssuance struct {
 
 type IssuanceMode struct {
 	name                              string
-	issuePrecertificate               bool
 	issueCertificateForPrecertificate bool
 }
 
-func TestIssueCertificate(t *testing.T) {
+func TestIssuePrecertificate(t *testing.T) {
 	testCases := []struct {
 		name    string
 		csr     []byte
-		setup   func(t *testing.T) (*CertificateAuthorityImpl, *mockSA)
 		subTest func(t *testing.T, i *TestCertificateIssuance)
 	}{
-		{"IssueCertificate", CNandSANCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestIssueCertificate},
-		{"ValidityUsesCAClock", CNandSANCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestValidityUsesCAClock},
-		{"AllowNoCN", NoCNCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestAllowNoCN},
-		{"ProfileSelectionRSA", CNandSANCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestProfileSelectionRSA},
-		{"ProfileSelectionECDSA", ECDSACSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestProfileSelectionECDSA},
-		{"MustStapleWhenDisabled", MustStapleCSR, issueCertificateSubTestMustStapleDisabledSetup, issueCertificateSubTestMustStapleWhenDisabled},
-		{"MustStapleWhenEnabled", MustStapleCSR, issueCertificateSubTestMustStapleEnabledSetup, issueCertificateSubTestMustStapleWhenEnabled},
-		{"MustStapleDuplicate", DuplicateMustStapleCSR, issueCertificateSubTestMustStapleEnabledSetup, issueCertificateSubTestMustStapleWhenEnabled},
-		{"UnknownExtension", UnsupportedExtensionCSR, issueCertificateSubTestMustStapleEnabledSetup, issueCertificateSubTestUnknownExtension},
-		{"CTPoisonExtension", CTPoisonExtensionCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestCTPoisonExtension},
-		{"CTPoisonExtensionEmpty", CTPoisonExtensionEmptyCSR, issueCertificateSubTestDefaultSetup, issueCertificateSubTestCTPoisonExtension},
+		{"IssuePrecertificate", CNandSANCSR, issueCertificateSubTestIssuePrecertificate},
+		{"ValidityUsesCAClock", CNandSANCSR, issueCertificateSubTestValidityUsesCAClock},
+		{"AllowNoCN", NoCNCSR, issueCertificateSubTestAllowNoCN},
+		{"ProfileSelectionRSA", CNandSANCSR, issueCertificateSubTestProfileSelectionRSA},
+		{"ProfileSelectionECDSA", ECDSACSR, issueCertificateSubTestProfileSelectionECDSA},
+		{"MustStaple", MustStapleCSR, issueCertificateSubTestMustStaple},
+		{"MustStapleDuplicate", DuplicateMustStapleCSR, issueCertificateSubTestMustStaple},
+		{"UnknownExtension", UnsupportedExtensionCSR, issueCertificateSubTestUnknownExtension},
+		{"CTPoisonExtension", CTPoisonExtensionCSR, issueCertificateSubTestCTPoisonExtension},
+		{"CTPoisonExtensionEmpty", CTPoisonExtensionEmptyCSR, issueCertificateSubTestCTPoisonExtension},
 	}
 
 	for _, testCase := range testCases {
@@ -348,7 +359,7 @@ func TestIssueCertificate(t *testing.T) {
 		// the precertificates previously generated from the preceding
 		// "precertificate" test. See also the comment above |issuanceModes|.
 		for _, mode := range issuanceModes {
-			ca, sa := testCase.setup(t)
+			ca, sa := issueCertificateSubTestSetup(t)
 
 			t.Run(mode.name+"-"+testCase.name, func(t *testing.T) {
 				req, err := x509.ParseCertificateRequest(testCase.csr)
@@ -357,25 +368,16 @@ func TestIssueCertificate(t *testing.T) {
 				issueReq := &caPB.IssueCertificateRequest{Csr: testCase.csr, RegistrationID: &arbitraryRegID}
 
 				var certDER []byte
-				if mode.issuePrecertificate {
-					response, err := ca.IssuePrecertificate(ctx, issueReq)
+				response, err := ca.IssuePrecertificate(ctx, issueReq)
 
-					test.AssertNotError(t, err, "Failed to issue precertificate")
-					certDER = response.DER
-				} else {
-					coreCert, err := ca.IssueCertificate(ctx, issueReq)
-					test.AssertNotError(t, err, "Failed to issue certificate")
-					certDER = coreCert.DER
-
-					// Verify that the cert got stored in the DB
-					test.Assert(t, bytes.Equal(certDER, sa.certificate.DER), "Retrieved cert not equal to issued cert.")
-				}
+				test.AssertNotError(t, err, "Failed to issue precertificate")
+				certDER = response.DER
 
 				cert, err := x509.ParseCertificate(certDER)
 				test.AssertNotError(t, err, "Certificate failed to parse")
 
 				poisonExtension := findExtension(cert.Extensions, OIDExtensionCTPoison)
-				test.AssertEquals(t, mode.issuePrecertificate, poisonExtension != nil)
+				test.AssertEquals(t, true, poisonExtension != nil)
 				if poisonExtension != nil {
 					test.AssertEquals(t, poisonExtension.Critical, true)
 					test.AssertDeepEquals(t, poisonExtension.Value, []byte{0x05, 0x00}) // ASN.1 DER NULL
@@ -396,7 +398,7 @@ func TestIssueCertificate(t *testing.T) {
 	}
 }
 
-func issueCertificateSubTestDefaultSetup(t *testing.T) (*CertificateAuthorityImpl, *mockSA) {
+func issueCertificateSubTestSetup(t *testing.T) (*CertificateAuthorityImpl, *mockSA) {
 	testCtx := setup(t)
 	sa := &mockSA{}
 	ca, err := NewCertificateAuthorityImpl(
@@ -415,7 +417,7 @@ func issueCertificateSubTestDefaultSetup(t *testing.T) (*CertificateAuthorityImp
 	return ca, sa
 }
 
-func issueCertificateSubTestIssueCertificate(t *testing.T, i *TestCertificateIssuance) {
+func issueCertificateSubTestIssuePrecertificate(t *testing.T, i *TestCertificateIssuance) {
 	cert := i.cert
 
 	test.AssertEquals(t, cert.Subject.CommonName, "not-example.com")
@@ -472,7 +474,7 @@ func TestMultipleIssuers(t *testing.T) {
 		nil)
 	test.AssertNotError(t, err, "Failed to remake CA")
 
-	issuedCert, err := ca.IssueCertificate(ctx, &caPB.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: &arbitraryRegID})
+	issuedCert, err := ca.IssuePrecertificate(ctx, &caPB.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: &arbitraryRegID})
 	test.AssertNotError(t, err, "Failed to issue certificate")
 
 	cert, err := x509.ParseCertificate(issuedCert.DER)
@@ -499,7 +501,7 @@ func TestOCSP(t *testing.T) {
 
 	issueReq := caPB.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: &arbitraryRegID}
 
-	cert, err := ca.IssueCertificate(ctx, &issueReq)
+	cert, err := ca.IssuePrecertificate(ctx, &issueReq)
 	test.AssertNotError(t, err, "Failed to issue")
 	parsedCert, err := x509.ParseCertificate(cert.DER)
 	test.AssertNotError(t, err, "Failed to parse cert")
@@ -547,8 +549,8 @@ func TestOCSP(t *testing.T) {
 		nil)
 	test.AssertNotError(t, err, "Failed to remake CA")
 
-	// Now issue a new cert, signed by newIssuerCert
-	newCert, err := ca.IssueCertificate(ctx, &issueReq)
+	// Now issue a new precert, signed by newIssuerCert
+	newCert, err := ca.IssuePrecertificate(ctx, &issueReq)
 	test.AssertNotError(t, err, "Failed to issue newCert")
 	parsedNewCert, err := x509.ParseCertificate(newCert.DER)
 	test.AssertNotError(t, err, "Failed to parse newCert")
@@ -586,6 +588,7 @@ func TestInvalidCSRs(t *testing.T) {
 		csrPath      string
 		check        func(t *testing.T, ca *CertificateAuthorityImpl, sa *mockSA)
 		errorMessage string
+		errorType    berrors.ErrorType
 	}{
 		// Test that the CA rejects CSRs that have no names.
 		//
@@ -593,7 +596,7 @@ func TestInvalidCSRs(t *testing.T) {
 		// * Random RSA public key.
 		// * CN = [none]
 		// * DNSNames = [none]
-		{"RejectNoHostnames", "./testdata/no_names.der.csr", nil, "Issued certificate with no names"},
+		{"RejectNoHostnames", "./testdata/no_names.der.csr", nil, "Issued certificate with no names", berrors.BadCSR},
 
 		// Test that the CA rejects CSRs that have too many names.
 		//
@@ -601,7 +604,7 @@ func TestInvalidCSRs(t *testing.T) {
 		// * Random public key
 		// * CN = [none]
 		// * DNSNames = not-example.com, www.not-example.com, mail.example.com
-		{"RejectTooManyHostnames", "./testdata/too_many_names.der.csr", nil, "Issued certificate with too many names"},
+		{"RejectTooManyHostnames", "./testdata/too_many_names.der.csr", nil, "Issued certificate with too many names", berrors.BadCSR},
 
 		// Test that the CA rejects CSRs that have public keys that are too short.
 		//
@@ -609,59 +612,53 @@ func TestInvalidCSRs(t *testing.T) {
 		// * Random public key -- 512 bits long
 		// * CN = (none)
 		// * DNSNames = not-example.com, www.not-example.com, mail.not-example.com
-		{"RejectShortKey", "./testdata/short_key.der.csr", nil, "Issued a certificate with too short a key."},
+		{"RejectShortKey", "./testdata/short_key.der.csr", nil, "Issued a certificate with too short a key.", berrors.BadPublicKey},
 
 		// CSR generated by Go:
 		// * Random RSA public key.
 		// * CN = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com
 		// * DNSNames = [none]
-		{"RejectLongCommonName", "./testdata/long_cn.der.csr", nil, "Issued a certificate with a CN over 64 bytes."},
+		{"RejectLongCommonName", "./testdata/long_cn.der.csr", nil, "Issued a certificate with a CN over 64 bytes.", berrors.BadCSR},
 
 		// CSR generated by OpenSSL:
 		// Edited signature to become invalid.
-		{"RejectWrongSignature", "./testdata/invalid_signature.der.csr", nil, "Issued a certificate based on a CSR with an invalid signature."},
+		{"RejectWrongSignature", "./testdata/invalid_signature.der.csr", nil, "Issued a certificate based on a CSR with an invalid signature.", berrors.BadCSR},
 
 		// CSR generated by Go:
 		// * Random public key
 		// * CN = not-example.com
 		// * Includes an extensionRequest attribute for an empty TLS Feature extension
-		{"TLSFeatureUnknown", "./testdata/tls_feature_unknown.der.csr", issueCertificateSubTestTLSFeatureUnknown, "Issued a certificate based on a CSR with an empty TLS feature extension."},
+		{"TLSFeatureUnknown", "./testdata/tls_feature_unknown.der.csr", issueCertificateSubTestTLSFeatureUnknown, "Issued a certificate based on a CSR with an empty TLS feature extension.", berrors.Malformed},
 	}
 
 	for _, testCase := range testCases {
-		for _, mode := range issuanceModes {
-			testCtx := setup(t)
-			sa := &mockSA{}
-			ca, err := NewCertificateAuthorityImpl(
-				testCtx.caConfig,
-				sa,
-				testCtx.pa,
-				testCtx.fc,
-				testCtx.stats,
-				testCtx.issuers,
-				testCtx.keyPolicy,
-				testCtx.logger,
-				nil)
-			test.AssertNotError(t, err, "Failed to create CA")
+		testCtx := setup(t)
+		sa := &mockSA{}
+		ca, err := NewCertificateAuthorityImpl(
+			testCtx.caConfig,
+			sa,
+			testCtx.pa,
+			testCtx.fc,
+			testCtx.stats,
+			testCtx.issuers,
+			testCtx.keyPolicy,
+			testCtx.logger,
+			nil)
+		test.AssertNotError(t, err, "Failed to create CA")
 
-			t.Run(mode.name+"-"+testCase.name, func(t *testing.T) {
-				serializedCSR := mustRead(testCase.csrPath)
-				issueReq := &caPB.IssueCertificateRequest{Csr: serializedCSR, RegistrationID: &arbitraryRegID}
-				if !mode.issuePrecertificate {
-					_, err = ca.IssueCertificate(ctx, issueReq)
-				} else {
-					_, err = ca.IssuePrecertificate(ctx, issueReq)
-				}
+		t.Run(testCase.name, func(t *testing.T) {
+			serializedCSR := mustRead(testCase.csrPath)
+			issueReq := &caPB.IssueCertificateRequest{Csr: serializedCSR, RegistrationID: &arbitraryRegID}
+			_, err = ca.IssuePrecertificate(ctx, issueReq)
 
-				test.Assert(t, berrors.Is(err, berrors.Malformed), "Incorrect error type returned")
-				test.AssertEquals(t, signatureCountByPurpose("cert", ca.signatureCount), 0)
+			test.Assert(t, berrors.Is(err, testCase.errorType), "Incorrect error type returned")
+			test.AssertEquals(t, signatureCountByPurpose("cert", ca.signatureCount), 0)
 
-				test.AssertError(t, err, testCase.errorMessage)
-				if testCase.check != nil {
-					testCase.check(t, ca, sa)
-				}
-			})
-		}
+			test.AssertError(t, err, testCase.errorMessage)
+			if testCase.check != nil {
+				testCase.check(t, ca, sa)
+			}
+		})
 	}
 }
 
@@ -686,7 +683,7 @@ func TestRejectValidityTooLong(t *testing.T) {
 	test.AssertNotError(t, err, "Failed to parse time")
 	testCtx.fc.Set(future)
 	// Test that the CA rejects CSRs that would expire after the intermediate cert
-	_, err = ca.IssueCertificate(ctx, &caPB.IssueCertificateRequest{Csr: NoCNCSR, RegistrationID: &arbitraryRegID})
+	_, err = ca.IssuePrecertificate(ctx, &caPB.IssueCertificateRequest{Csr: NoCNCSR, RegistrationID: &arbitraryRegID})
 	test.AssertError(t, err, "Cannot issue a certificate that expires after the intermediate certificate")
 	test.Assert(t, berrors.Is(err, berrors.InternalServer), "Incorrect error type returned")
 }
@@ -776,18 +773,6 @@ func issueCertificateSubTestProfileSelectionECDSA(t *testing.T, i *TestCertifica
 	test.AssertEquals(t, i.cert.KeyUsage, expectedKeyUsage)
 }
 
-func issueCertificateSubTestMustStapleDisabledSetup(t *testing.T) (*CertificateAuthorityImpl, *mockSA) {
-	ca, sa := issueCertificateSubTestDefaultSetup(t)
-	ca.enableMustStaple = false
-	return ca, sa
-}
-
-func issueCertificateSubTestMustStapleEnabledSetup(t *testing.T) (*CertificateAuthorityImpl, *mockSA) {
-	ca, sa := issueCertificateSubTestDefaultSetup(t)
-	ca.enableMustStaple = true
-	return ca, sa
-}
-
 func countMustStaple(t *testing.T, cert *x509.Certificate) (count int) {
 	oidTLSFeature := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
 	for _, ext := range cert.Extensions {
@@ -800,30 +785,12 @@ func countMustStaple(t *testing.T, cert *x509.Certificate) (count int) {
 	return count
 }
 
-func issueCertificateSubTestMustStapleWhenDisabled(t *testing.T, i *TestCertificateIssuance) {
-	// With ca.enableMustStaple = false, should issue successfully and not add
-	// Must Staple.
-	certType := "certificate"
-	if i.mode.issuePrecertificate {
-		certType = "precertificate"
-	}
+func issueCertificateSubTestMustStaple(t *testing.T, i *TestCertificateIssuance) {
+	// a TLS feature extension should put a must-staple extension into the cert. Even
+	// if there are multiple TLS Feature extensions, only one extension should be included.
 	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionTLSFeature, i.ca.csrExtensionCount), 1)
 	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionTLSFeatureInvalid, i.ca.csrExtensionCount), 0)
-	test.AssertEquals(t, signatureCountByPurpose(certType, i.ca.signatureCount), 1)
-	test.AssertEquals(t, countMustStaple(t, i.cert), 0)
-}
-
-func issueCertificateSubTestMustStapleWhenEnabled(t *testing.T, i *TestCertificateIssuance) {
-	// With ca.enableMustStaple = true, a TLS feature extension should put a must-staple
-	// extension into the cert. Even if there are multiple TLS Feature extensions, only
-	// one extension should be included.
-	certType := "certificate"
-	if i.mode.issuePrecertificate {
-		certType = "precertificate"
-	}
-	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionTLSFeature, i.ca.csrExtensionCount), 1)
-	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionTLSFeatureInvalid, i.ca.csrExtensionCount), 0)
-	test.AssertEquals(t, signatureCountByPurpose(certType, i.ca.signatureCount), 1)
+	test.AssertEquals(t, signatureCountByPurpose("precertificate", i.ca.signatureCount), 1)
 	test.AssertEquals(t, countMustStaple(t, i.cert), 1)
 }
 
@@ -834,19 +801,12 @@ func issueCertificateSubTestTLSFeatureUnknown(t *testing.T, ca *CertificateAutho
 
 func issueCertificateSubTestUnknownExtension(t *testing.T, i *TestCertificateIssuance) {
 	// Unsupported extensions in the CSR should be silently ignored.
-	certType := "certificate"
-	if i.mode.issuePrecertificate {
-		certType = "precertificate"
-	}
 	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionOther, i.ca.csrExtensionCount), 1)
-	test.AssertEquals(t, signatureCountByPurpose(certType, i.ca.signatureCount), 1)
+	test.AssertEquals(t, signatureCountByPurpose("precertificate", i.ca.signatureCount), 1)
 
 	// NOTE: The hard-coded value here will have to change over time as Boulder
 	// adds new (unrequested) extensions to certificates.
-	expectedExtensionCount := 9
-	if i.mode.issuePrecertificate {
-		expectedExtensionCount += 1
-	}
+	expectedExtensionCount := 10
 	test.AssertEquals(t, len(i.cert.Extensions), expectedExtensionCount)
 }
 
@@ -855,12 +815,8 @@ func issueCertificateSubTestCTPoisonExtension(t *testing.T, i *TestCertificateIs
 	// unknown extension, whether it has a valid or invalid value. The check
 	// for whether or not the poison extension is present in the issued
 	// certificate/precertificate is done in the caller.
-	certType := "certificate"
-	if i.mode.issuePrecertificate {
-		certType = "precertificate"
-	}
 	test.AssertEquals(t, test.CountCounterVec(csrExtensionCategory, csrExtensionOther, i.ca.csrExtensionCount), 1)
-	test.AssertEquals(t, signatureCountByPurpose(certType, i.ca.signatureCount), 1)
+	test.AssertEquals(t, signatureCountByPurpose("precertificate", i.ca.signatureCount), 1)
 }
 
 func findExtension(extensions []pkix.Extension, id asn1.ObjectIdentifier) *pkix.Extension {
@@ -946,7 +902,8 @@ type queueSA struct {
 	fail      bool
 	duplicate bool
 
-	issued *time.Time
+	issued        *time.Time
+	issuedPrecert *time.Time
 }
 
 func (qsa *queueSA) AddCertificate(_ context.Context, _ []byte, _ int64, _ []byte, issued *time.Time) (string, error) {
@@ -959,6 +916,82 @@ func (qsa *queueSA) AddCertificate(_ context.Context, _ []byte, _ int64, _ []byt
 	return "", nil
 }
 
+func (qsa *queueSA) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*corepb.Empty, error) {
+	if qsa.fail {
+		return nil, errors.New("bad")
+	} else if qsa.duplicate {
+		return nil, berrors.DuplicateError("is a dupe")
+	}
+	issued := time.Unix(0, *req.Issued)
+	qsa.issuedPrecert = &issued
+	return nil, nil
+}
+
+func (qsa *queueSA) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*corepb.Empty, error) {
+	return &corepb.Empty{}, nil
+}
+
+// TestPrecertOrphanQueue tests that IssuePrecertificate writes precertificates
+// to the orphan queue if storage fails, and that `integrateOrphan` later
+// successfully writes those precertificates to the database. To do this, it
+// uses the `queueSA` mock, which allows us to flip on and off a "fail" bit that
+// decides whether it errors in response to storage requests.
+func TestPrecertOrphanQueue(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "orphan-queue-tmp")
+	defer os.Remove(tmpDir)
+	test.AssertNotError(t, err, "Failed to create temp directory")
+	orphanQueue, err := goque.OpenQueue(tmpDir)
+	test.AssertNotError(t, err, "Failed to open orphaned certificate queue")
+
+	qsa := &queueSA{fail: true}
+	testCtx := setup(t)
+	fakeNow := time.Date(2019, 9, 20, 0, 0, 0, 0, time.UTC)
+	testCtx.fc.Set(fakeNow)
+	ca, err := NewCertificateAuthorityImpl(
+		testCtx.caConfig,
+		qsa,
+		testCtx.pa,
+		testCtx.fc,
+		testCtx.stats,
+		testCtx.issuers,
+		testCtx.keyPolicy,
+		testCtx.logger,
+		orphanQueue)
+	test.AssertNotError(t, err, "Failed to create CA")
+
+	_ = features.Set(map[string]bool{"PrecertificateOCSP": true})
+
+	err = ca.integrateOrphan()
+	if err != goque.ErrEmpty {
+		t.Fatalf("Unexpected error, wanted %q, got %q", goque.ErrEmpty, err)
+	}
+
+	var one int64 = 1
+	_, err = ca.IssuePrecertificate(context.Background(), &caPB.IssueCertificateRequest{
+		RegistrationID: &one,
+		OrderID:        &one,
+		Csr:            CNandSANCSR,
+	})
+	test.AssertError(t, err, "Expected IssuePrecertificate to fail with `failSA`")
+
+	matches := testCtx.logger.GetAllMatching(`orphaning precertificate.* regID=\[1\], orderID=\[1\]`)
+	if len(matches) != 1 {
+		t.Errorf("no log line, or incorrect log line for orphaned precertificate:\n%s",
+			strings.Join(testCtx.logger.GetAllMatching(".*"), "\n"))
+	}
+
+	qsa.fail = false
+	err = ca.integrateOrphan()
+	test.AssertNotError(t, err, "integrateOrphan failed")
+	if !qsa.issuedPrecert.Equal(fakeNow) {
+		t.Errorf("expected issued time to be %s, got %s", fakeNow, *qsa.issued)
+	}
+	err = ca.integrateOrphan()
+	if err != goque.ErrEmpty {
+		t.Fatalf("Unexpected error, wanted %q, got %q", goque.ErrEmpty, err)
+	}
+}
+
 func TestOrphanQueue(t *testing.T) {
 	tmpDir, err := ioutil.TempDir("", "orphan-queue-tmp")
 	defer os.Remove(tmpDir)
@@ -968,6 +1001,11 @@ func TestOrphanQueue(t *testing.T) {
 
 	qsa := &queueSA{fail: true}
 	testCtx := setup(t)
+	fakeNow, err := time.Parse("Mon Jan 2 15:04:05 2006", "Mon Jan 2 15:04:05 2006")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCtx.fc.Set(fakeNow)
 	ca, err := NewCertificateAuthorityImpl(
 		testCtx.caConfig,
 		qsa,
@@ -991,23 +1029,25 @@ func TestOrphanQueue(t *testing.T) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		DNSNames:     []string{"test.invalid"},
-		NotBefore:    time.Time{}.Add(time.Hour * 24),
+		NotBefore:    fakeNow.Add(-time.Hour),
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
 	test.AssertNotError(t, err, "Failed to generate test cert")
-	_, err = ca.generateOCSPAndStoreCertificate(
+	_, err = ca.storeCertificate(
 		context.Background(),
 		1,
 		1,
 		tmpl.SerialNumber,
 		certDER,
 	)
-	test.AssertError(t, err, "generateOCSPAndStoreCertificate didn't fail when AddCertificate failed")
+	test.AssertError(t, err, "storeCertificate didn't fail when AddCertificate failed")
 
 	qsa.fail = false
 	err = ca.integrateOrphan()
 	test.AssertNotError(t, err, "integrateOrphan failed")
-	test.AssertEquals(t, *qsa.issued, time.Time{}.Add(time.Hour*24).Add(-time.Hour))
+	if !qsa.issued.Equal(fakeNow) {
+		t.Errorf("expected issued time to be %s, got %s", fakeNow, *qsa.issued)
+	}
 	err = ca.integrateOrphan()
 	if err != goque.ErrEmpty {
 		t.Fatalf("Unexpected error, wanted %q, got %q", goque.ErrEmpty, err)
@@ -1023,7 +1063,9 @@ func TestOrphanQueue(t *testing.T) {
 	qsa.duplicate = true
 	err = ca.integrateOrphan()
 	test.AssertNotError(t, err, "integrateOrphan failed with duplicate cert")
-	test.AssertEquals(t, *qsa.issued, time.Time{}.Add(time.Hour*24).Add(-time.Hour))
+	if !qsa.issued.Equal(fakeNow) {
+		t.Errorf("expected issued time to be %s, got %s", fakeNow, *qsa.issued)
+	}
 	err = ca.integrateOrphan()
 	if err != goque.ErrEmpty {
 		t.Fatalf("Unexpected error, wanted %q, got %q", goque.ErrEmpty, err)
@@ -1032,14 +1074,14 @@ func TestOrphanQueue(t *testing.T) {
 	// add cert to queue, and recreate queue to make sure it still has the cert
 	qsa.fail = true
 	qsa.duplicate = false
-	_, err = ca.generateOCSPAndStoreCertificate(
+	_, err = ca.storeCertificate(
 		context.Background(),
 		1,
 		1,
 		tmpl.SerialNumber,
 		certDER,
 	)
-	test.AssertError(t, err, "generateOCSPAndStoreCertificate didn't fail when AddCertificate failed")
+	test.AssertError(t, err, "storeCertificate didn't fail when AddCertificate failed")
 	err = orphanQueue.Close()
 	test.AssertNotError(t, err, "Failed to close the queue cleanly")
 	orphanQueue, err = goque.OpenQueue(tmpDir)
@@ -1050,9 +1092,77 @@ func TestOrphanQueue(t *testing.T) {
 	qsa.fail = false
 	err = ca.integrateOrphan()
 	test.AssertNotError(t, err, "integrateOrphan failed")
-	test.AssertEquals(t, *qsa.issued, time.Time{}.Add(time.Hour*24).Add(-time.Hour))
+	if !qsa.issued.Equal(fakeNow) {
+		t.Errorf("expected issued time to be %s, got %s", fakeNow, *qsa.issued)
+	}
 	err = ca.integrateOrphan()
 	if err != goque.ErrEmpty {
 		t.Fatalf("Unexpected error, wanted %q, got %q", goque.ErrEmpty, err)
 	}
+}
+
+type linttrapSigner struct {
+	lintErr error
+}
+
+func (s *linttrapSigner) Sign(signer.SignRequest) ([]byte, error) {
+	return nil, s.lintErr
+}
+
+func (s *linttrapSigner) SignFromPrecert(*x509.Certificate, []ct.SignedCertificateTimestamp) ([]byte, error) {
+	return nil, errors.New("SignFromPrecert not implemented for linttrapSigner")
+}
+
+func TestIssuePrecertificateLinting(t *testing.T) {
+	testCtx := setup(t)
+	sa := &mockSA{}
+	ca, err := NewCertificateAuthorityImpl(
+		testCtx.caConfig,
+		sa,
+		testCtx.pa,
+		testCtx.fc,
+		testCtx.stats,
+		testCtx.issuers,
+		testCtx.keyPolicy,
+		testCtx.logger,
+		nil)
+	test.AssertNotError(t, err, "Failed to create CA")
+
+	// Reconfigure the CA's eeSigner to be a linttrapSigner that always returns
+	// two LintResults.
+	ca.defaultIssuer.eeSigner = &linttrapSigner{
+		lintErr: &local.LintError{
+			ErrorResults: map[string]lints.LintResult{
+				"foobar": lints.LintResult{
+					Status:  lints.Error,
+					Details: "foobar is error",
+				},
+				"foobar2": lints.LintResult{
+					Status:  lints.Warn,
+					Details: "foobar2 is warning",
+				},
+			},
+		},
+	}
+
+	// Clear the mock logger
+	testCtx.logger.Clear()
+
+	// Attempt to issue a pre-certificate
+	_, err = ca.IssuePrecertificate(ctx, &caPB.IssueCertificateRequest{
+		Csr:            CNandSANCSR,
+		RegistrationID: &arbitraryRegID,
+	})
+	// It should error
+	test.AssertError(t, err, "expected err from IssuePrecertificate with linttrapSigner")
+	// The local.LintError should have been converted to an internal server error
+	// berror with the correct message.
+	test.Assert(t, berrors.Is(err, berrors.InternalServer), "Incorrect error type returned")
+	test.AssertEquals(t, err.Error(), "failed to sign certificate: pre-issuance linting found 2 error results")
+
+	// We also expect that an AUDIT level error is logged that includes the expect
+	// serialized JSON lintErrors
+	regex := `ERR: \[AUDIT\] Signing failed: serial=\[.*\] err=\[pre-issuance linting found 2 error results\] lintErrors=\{"foobar":\{"result":"error","details":"foobar is error"\},"foobar2":\{"result":"warn","details":"foobar2 is warning"\}\}`
+	matches := testCtx.logger.GetAllMatching(regex)
+	test.AssertEquals(t, len(matches), 1)
 }

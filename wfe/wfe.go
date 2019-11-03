@@ -2,6 +2,7 @@ package wfe
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -18,18 +19,20 @@ import (
 
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
 	jose "gopkg.in/square/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
+	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/metrics/measured_http"
 	"github.com/letsencrypt/boulder/nonce"
+	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	"github.com/letsencrypt/boulder/probs"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/revocation"
@@ -42,19 +45,21 @@ import (
 // lowercase plus hyphens. If you violate that assumption you should update
 // measured_http.
 const (
-	directoryPath  = "/directory"
-	newRegPath     = "/acme/new-reg"
-	regPath        = "/acme/reg/"
-	newAuthzPath   = "/acme/new-authz"
-	authzPath      = "/acme/authz/"
-	challengePath  = "/acme/challenge/"
-	newCertPath    = "/acme/new-cert"
-	certPath       = "/acme/cert/"
-	revokeCertPath = "/acme/revoke-cert"
-	termsPath      = "/terms"
-	issuerPath     = "/acme/issuer-cert"
-	buildIDPath    = "/build"
-	rolloverPath   = "/acme/key-change"
+	directoryPath = "/directory"
+	newRegPath    = "/acme/new-reg"
+	regPath       = "/acme/reg/"
+	newAuthzPath  = "/acme/new-authz"
+	// For user-facing URLs we use a "v3" suffix to avoid potential confusiong
+	// regarding ACMEv2.
+	authzv2Path     = "/acme/authz-v3/"
+	challengev2Path = "/acme/chall-v3/"
+	newCertPath     = "/acme/new-cert"
+	certPath        = "/acme/cert/"
+	revokeCertPath  = "/acme/revoke-cert"
+	termsPath       = "/terms"
+	issuerPath      = "/acme/issuer-cert"
+	buildIDPath     = "/build"
+	rolloverPath    = "/acme/key-change"
 )
 
 // WebFrontEndImpl provides all the logic for Boulder's web-facing interface,
@@ -87,7 +92,9 @@ type WebFrontEndImpl struct {
 	DirectoryWebsite string
 
 	// Register of anti-replay nonces
-	nonceService *nonce.NonceService
+	nonceService       *nonce.NonceService
+	remoteNonceService noncepb.NonceServiceClient
+	noncePrefixMap     map[string]noncepb.NonceServiceClient
 
 	// Key policy.
 	keyPolicy goodkey.KeyPolicy
@@ -98,9 +105,6 @@ type WebFrontEndImpl struct {
 	// Maximum duration of a request
 	RequestTimeout time.Duration
 
-	AcceptRevocationReason bool
-	AllowAuthzDeactivation bool
-
 	csrSignatureAlgs *prometheus.CounterVec
 }
 
@@ -109,13 +113,10 @@ func NewWebFrontEndImpl(
 	stats metrics.Scope,
 	clk clock.Clock,
 	keyPolicy goodkey.KeyPolicy,
+	remoteNonceService noncepb.NonceServiceClient,
+	noncePrefixMap map[string]noncepb.NonceServiceClient,
 	logger blog.Logger,
 ) (WebFrontEndImpl, error) {
-	nonceService, err := nonce.NewNonceService(stats)
-	if err != nil {
-		return WebFrontEndImpl{}, err
-	}
-
 	csrSignatureAlgs := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "csrSignatureAlgs",
@@ -125,14 +126,25 @@ func NewWebFrontEndImpl(
 	)
 	stats.MustRegister(csrSignatureAlgs)
 
-	return WebFrontEndImpl{
-		log:              logger,
-		clk:              clk,
-		nonceService:     nonceService,
-		stats:            stats,
-		keyPolicy:        keyPolicy,
-		csrSignatureAlgs: csrSignatureAlgs,
-	}, nil
+	wfe := WebFrontEndImpl{
+		log:                logger,
+		clk:                clk,
+		stats:              stats,
+		keyPolicy:          keyPolicy,
+		csrSignatureAlgs:   csrSignatureAlgs,
+		remoteNonceService: remoteNonceService,
+		noncePrefixMap:     noncePrefixMap,
+	}
+
+	if wfe.remoteNonceService == nil {
+		nonceService, err := nonce.NewNonceService(stats, 0, "")
+		if err != nil {
+			return WebFrontEndImpl{}, err
+		}
+		wfe.nonceService = nonceService
+	}
+
+	return wfe, nil
 }
 
 // HandleFunc registers a handler at the given path. It's
@@ -166,13 +178,27 @@ func (wfe *WebFrontEndImpl) HandleFunc(mux *http.ServeMux, pattern string, h web
 	methodsStr := strings.Join(methods, ", ")
 	handler := http.StripPrefix(pattern, web.NewTopHandler(wfe.log,
 		web.WFEHandlerFunc(func(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-			// We do not propagate errors here, because (1) they should be
-			// transient, and (2) they fail closed.
-			nonce, err := wfe.nonceService.Nonce()
-			if err == nil {
-				response.Header().Set("Replay-Nonce", nonce)
+			// Historically we did not return a error to the client
+			// if we failed to get a new nonce. We preserve that
+			// behavior if using the built in nonce service, but
+			// if we get a failure using the new remote nonce service
+			// we return an internal server error so that it is
+			// clearer both in our metrics and to the client that
+			// something is wrong.
+			if wfe.remoteNonceService != nil {
+				nonceMsg, err := wfe.remoteNonceService.Nonce(ctx, &corepb.Empty{})
+				if err != nil {
+					wfe.sendError(response, logEvent, probs.ServerInternal("unable to get nonce"), err)
+					return
+				}
+				response.Header().Set("Replay-Nonce", nonceMsg.Nonce)
 			} else {
-				logEvent.AddError("unable to make nonce: %s", err)
+				nonce, err := wfe.nonceService.Nonce()
+				if err == nil {
+					response.Header().Set("Replay-Nonce", nonce)
+				} else {
+					logEvent.AddError("unable to make nonce: %s", err)
+				}
 			}
 
 			logEvent.Endpoint = pattern
@@ -280,8 +306,8 @@ func (wfe *WebFrontEndImpl) Handler() http.Handler {
 	wfe.HandleFunc(m, newAuthzPath, wfe.NewAuthorization, "POST")
 	wfe.HandleFunc(m, newCertPath, wfe.NewCertificate, "POST")
 	wfe.HandleFunc(m, regPath, wfe.Registration, "POST")
-	wfe.HandleFunc(m, authzPath, wfe.Authorization, "GET", "POST")
-	wfe.HandleFunc(m, challengePath, wfe.Challenge, "GET", "POST")
+	wfe.HandleFunc(m, authzv2Path, wfe.AuthorizationV2, "GET", "POST")
+	wfe.HandleFunc(m, challengev2Path, wfe.ChallengeV2, "GET", "POST")
 	wfe.HandleFunc(m, certPath, wfe.Certificate, "GET")
 	wfe.HandleFunc(m, revokeCertPath, wfe.RevokeCertificate, "POST")
 	wfe.HandleFunc(m, termsPath, wfe.Terms, "GET")
@@ -535,13 +561,24 @@ func (wfe *WebFrontEndImpl) verifyPOST(ctx context.Context, logEvent *web.Reques
 	logEvent.Payload = string(payload)
 
 	// Check that the request has a known anti-replay nonce
-	nonce := parsedJws.Signatures[0].Header.Nonce
-	if len(nonce) == 0 {
+	nonceStr := parsedJws.Signatures[0].Header.Nonce
+	if len(nonceStr) == 0 {
 		wfe.stats.Inc("Errors.JWSMissingNonce", 1)
 		return nil, nil, reg, probs.BadNonce("JWS has no anti-replay nonce")
-	} else if !wfe.nonceService.Valid(nonce) {
+	}
+	var nonceValid bool
+	if wfe.remoteNonceService != nil {
+		valid, err := nonce.RemoteRedeem(ctx, wfe.noncePrefixMap, nonceStr)
+		if err != nil {
+			return nil, nil, reg, probs.ServerInternal("failed to verify nonce validity: %s", err)
+		}
+		nonceValid = valid
+	} else {
+		nonceValid = wfe.nonceService.Valid(nonceStr)
+	}
+	if !nonceValid {
 		wfe.stats.Inc("Errors.JWSInvalidNonce", 1)
-		return nil, nil, reg, probs.BadNonce("JWS has invalid anti-replay nonce %s", nonce)
+		return nil, nil, reg, probs.BadNonce("JWS has invalid anti-replay nonce %s", nonceStr)
 	}
 
 	// Check that the "resource" field is present and has the correct value
@@ -594,6 +631,13 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 		return
 	}
 
+	if !features.Enabled(features.AllowV1Registration) {
+		wfe.sendError(response, logEvent, probs.Unauthorized("Account creation on ACMEv1 is disabled. "+
+			"Please upgrade your ACME client to a version that supports ACMEv2 / RFC 8555. "+
+			"See https://community.letsencrypt.org/t/end-of-life-plan-for-acmev1/88430 for details."), nil)
+		return
+	}
+
 	var init core.Registration
 	err = json.Unmarshal(body, &init)
 	if err != nil {
@@ -624,6 +668,18 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 
 	reg, err := wfe.RA.NewRegistration(ctx, init)
 	if err != nil {
+		if berrors.Is(err, berrors.Duplicate) {
+			existingReg, err := wfe.SA.GetRegistrationByKey(ctx, key)
+			if err != nil {
+				// return error even if berrors.NotFound, as the duplicate key error we got from
+				// ra.NewRegistration indicates it _does_ already exist.
+				wfe.sendError(response, logEvent, probs.ServerInternal("couldn't retrieve the registration"), err)
+				return
+			}
+			response.Header().Set("Location", web.RelativeEndpoint(request, fmt.Sprintf("%s%d", regPath, existingReg.ID)))
+			wfe.sendError(response, logEvent, probs.Conflict("Registration key is already in use"), err)
+			return
+		}
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new registration"), err)
 		return
 	}
@@ -674,7 +730,7 @@ func (wfe *WebFrontEndImpl) NewAuthorization(ctx context.Context, logEvent *web.
 		wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling JSON"), err)
 		return
 	}
-	if init.Identifier.Type == core.IdentifierDNS {
+	if init.Identifier.Type == identifier.DNS {
 		logEvent.DNSName = init.Identifier.Value
 	}
 
@@ -687,7 +743,7 @@ func (wfe *WebFrontEndImpl) NewAuthorization(ctx context.Context, logEvent *web.
 	logEvent.Created = authz.ID
 
 	// Make a URL for this authz, then blow away the ID and RegID before serializing
-	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
+	authzURL := urlForAuthz(authz, request)
 	wfe.prepAuthorizationForDisplay(request, &authz)
 
 	response.Header().Add("Location", authzURL)
@@ -702,16 +758,25 @@ func (wfe *WebFrontEndImpl) NewAuthorization(ctx context.Context, logEvent *web.
 }
 
 func (wfe *WebFrontEndImpl) regHoldsAuthorizations(ctx context.Context, regID int64, names []string) (bool, error) {
-	authz, err := wfe.SA.GetValidAuthorizations(ctx, regID, names, wfe.clk.Now())
+	now := wfe.clk.Now().UnixNano()
+	authzMapPB, err := wfe.SA.GetValidAuthorizations2(ctx, &sapb.GetValidAuthorizationsRequest{
+		RegistrationID: &regID,
+		Domains:        names,
+		Now:            &now,
+	})
 	if err != nil {
 		return false, err
 	}
-	if len(names) != len(authz) {
+	authzMap, err := bgrpc.PBToAuthzMap(authzMapPB)
+	if err != nil {
+		return false, err
+	}
+	if len(names) != len(authzMap) {
 		return false, nil
 	}
 	missingNames := false
 	for _, name := range names {
-		if _, present := authz[name]; !present {
+		if _, present := authzMap[name]; !present {
 			missingNames = true
 		}
 	}
@@ -798,7 +863,7 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *web
 	}
 
 	reason := revocation.Reason(0)
-	if revokeRequest.Reason != nil && wfe.AcceptRevocationReason {
+	if revokeRequest.Reason != nil {
 		if _, present := revocation.UserAllowedReasons[*revokeRequest.Reason]; !present {
 			wfe.sendError(response, logEvent, probs.Malformed("unsupported revocation reason code provided"), nil)
 			return
@@ -928,104 +993,59 @@ func (wfe *WebFrontEndImpl) NewCertificate(ctx context.Context, logEvent *web.Re
 	}
 }
 
-// Challenge handles POST requests to challenge URLs.  Such requests are clients'
+// ChallengeV2 handles POST requests to challenge URLs belonging to
+// authzv2-style authorizations.  Such requests are clients'
 // responses to the server's challenges.
-func (wfe *WebFrontEndImpl) Challenge(
+func (wfe *WebFrontEndImpl) ChallengeV2(
 	ctx context.Context,
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
 	request *http.Request) {
-
 	notFound := func() {
 		wfe.sendError(response, logEvent, probs.NotFound("No such challenge"), nil)
 	}
-
-	// Challenge URIs are of the form /acme/challenge/<auth id>/<challenge id>
-	// or /acme/challenge/v2/<auth id>/<challenge id> depending on the authorization
-	// version. Here we parse out the authorization and challenge IDs and retrieve
-	// the authorization.
 	slug := strings.Split(request.URL.Path, "/")
-	if len(slug) != 2 && len(slug) != 3 {
+	if len(slug) != 2 {
 		notFound()
 		return
 	}
-	var authorizationID string
-	var challengeID interface{}
-	var err error
-	var v2 bool
-	if len(slug) == 3 {
-		if !features.Enabled(features.NewAuthorizationSchema) || slug[0] != "v2" {
-			notFound()
-			return
-		}
-		v2 = true
-		authorizationID, challengeID = slug[1], slug[2]
-	} else {
-		authorizationID = slug[0]
-		challengeID, err = strconv.ParseInt(slug[1], 10, 64)
-		if err != nil {
-			notFound()
-			return
-		}
+	authorizationID, err := strconv.ParseInt(slug[0], 10, 64)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid authorization ID"), nil)
+		return
 	}
-
-	var authz core.Authorization
-	if v2 {
-		id, err := strconv.ParseInt(authorizationID, 10, 64)
-		if err != nil {
+	challengeID := slug[1]
+	authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authorizationID})
+	if err != nil {
+		if berrors.Is(err, berrors.NotFound) {
 			notFound()
-			return
-		}
-		authzPB, err := wfe.SA.GetAuthz2(ctx, &sapb.AuthorizationID2{Id: &id})
-		if err != nil {
-			if berrors.Is(err, berrors.NotFound) {
-				notFound()
-			} else {
-				wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			}
-			return
-		}
-		authz, err = bgrpc.PBToAuthz(authzPB)
-		if err != nil {
+		} else {
 			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			return
 		}
-	} else {
-		authz, err = wfe.SA.GetAuthorization(ctx, authorizationID)
-		if err != nil {
-			if berrors.Is(err, berrors.NotFound) {
-				notFound()
-			} else {
-				wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			}
-			return
-		}
+		return
+	}
+	authz, err := bgrpc.PBToAuthz(authzPB)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+		return
+	}
+	challengeIndex := authz.FindChallengeByStringID(challengeID)
+	if challengeIndex == -1 {
+		notFound()
+		return
 	}
 
-	// After expiring, challenges are inaccessible
 	if authz.Expires == nil || authz.Expires.Before(wfe.clk.Now()) {
 		wfe.sendError(response, logEvent, probs.NotFound("Expired authorization"), nil)
 		return
 	}
 
-	// Check that the requested challenge exists within the authorization
-	var challengeIndex int
-	if authz.V2 {
-		challengeIndex = authz.FindChallengeByStringID(challengeID.(string))
-	} else {
-		challengeIndex = authz.FindChallenge(challengeID.(int64))
-	}
-	if challengeIndex == -1 {
-		notFound()
-		return
-	}
-	challenge := authz.Challenges[challengeIndex]
-
-	if authz.Identifier.Type == core.IdentifierDNS {
+	if authz.Identifier.Type == identifier.DNS {
 		logEvent.DNSName = authz.Identifier.Value
 	}
 	logEvent.Status = string(authz.Status)
 
+	challenge := authz.Challenges[challengeIndex]
 	switch request.Method {
 	case "GET", "HEAD":
 		wfe.getChallenge(ctx, response, request, authz, &challenge, logEvent)
@@ -1040,13 +1060,7 @@ func (wfe *WebFrontEndImpl) Challenge(
 // the client by filling in its URI field and clearing its ID field.
 func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz core.Authorization, challenge *core.Challenge) {
 	// Update the challenge URI to be relative to the HTTP request Host
-	if authz.V2 {
-		challenge.URI = web.RelativeEndpoint(request, fmt.Sprintf("%sv2/%s/%s", challengePath, authz.ID, challenge.StringID()))
-	} else {
-		challenge.URI = web.RelativeEndpoint(request, fmt.Sprintf("%s%s/%d", challengePath, authz.ID, challenge.ID))
-	}
-	// Ensure the challenge ID isn't written. 0 is considered "empty" for the purpose of the JSON omitempty tag.
-	challenge.ID = 0
+	challenge.URI = web.RelativeEndpoint(request, fmt.Sprintf("%s%s/%s", challengev2Path, authz.ID, challenge.StringID()))
 
 	// Historically the Type field of a problem was always prefixed with a static
 	// error namespace. To support the V2 API and migrating to the correct IETF
@@ -1070,6 +1084,7 @@ func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz
 func (wfe *WebFrontEndImpl) prepAuthorizationForDisplay(request *http.Request, authz *core.Authorization) {
 	for i := range authz.Challenges {
 		wfe.prepChallengeForDisplay(request, *authz, &authz.Challenges[i])
+		authz.Combinations = append(authz.Combinations, []int{i})
 	}
 	authz.ID = ""
 	authz.RegistrationID = 0
@@ -1085,7 +1100,7 @@ func (wfe *WebFrontEndImpl) getChallenge(
 
 	wfe.prepChallengeForDisplay(request, authz, challenge)
 
-	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
+	authzURL := urlForAuthz(authz, request)
 	response.Header().Add("Location", challenge.URI)
 	response.Header().Add("Link", link(authzURL, "up"))
 
@@ -1176,7 +1191,7 @@ func (wfe *WebFrontEndImpl) postChallenge(
 	challenge := returnAuthz.Challenges[challengeIndex]
 	wfe.prepChallengeForDisplay(request, authz, &challenge)
 
-	authzURL := web.RelativeEndpoint(request, authzPath+string(authz.ID))
+	authzURL := urlForAuthz(authz, request)
 	response.Header().Add("Location", challenge.URI)
 	response.Header().Add("Link", link(authzURL, "up"))
 
@@ -1315,46 +1330,48 @@ func (wfe *WebFrontEndImpl) deactivateAuthorization(ctx context.Context, authz *
 	return true
 }
 
-// Authorization is used by clients to submit an update to one of their
-// authorizations.
-func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
+// AuthorizationV2 is used by clients to submit an update to an authzv2-style
+// authorization.
+func (wfe *WebFrontEndImpl) AuthorizationV2(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
 	// Requests to this handler should have a path that leads to a known authz
 	id := request.URL.Path
 	var authz core.Authorization
 	var err error
-	if features.Enabled(features.NewAuthorizationSchema) && strings.HasPrefix(id, "/v2/") {
-		authzID, err := strconv.ParseInt(id[4:], 10, 64)
-		if err != nil {
-			wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
-			return
-		}
-		authzPB, err := wfe.SA.GetAuthz2(ctx, &sapb.AuthorizationID2{Id: &authzID})
-		if err != nil {
-			if berrors.Is(err, berrors.NotFound) {
-				wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
-			} else {
-				wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			}
-			return
-		}
-		authz, err = bgrpc.PBToAuthz(authzPB)
-		if err != nil {
+	notFound := func() {
+		wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
+	}
+	authzID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid authorization ID"), nil)
+		return
+	}
+	authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authzID})
+	if err != nil {
+		if berrors.Is(err, berrors.NotFound) {
+			notFound()
+		} else {
 			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			return
 		}
-	} else {
-		authz, err = wfe.SA.GetAuthorization(ctx, id)
-		if err != nil {
-			if berrors.Is(err, berrors.NotFound) {
-				wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
-			} else {
-				wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
-			}
-			return
-		}
+		return
+	}
+	authz, err = bgrpc.PBToAuthz(authzPB)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+		return
 	}
 
-	if authz.Identifier.Type == core.IdentifierDNS {
+	wfe.authorizationCommon(ctx, logEvent, response, request, authz)
+}
+
+// authorizationCommon handles logic that is common to both AuthorizationV2 and
+// Authorization.
+func (wfe *WebFrontEndImpl) authorizationCommon(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request,
+	authz core.Authorization) {
+	if authz.Identifier.Type == identifier.DNS {
 		logEvent.DNSName = authz.Identifier.Value
 	}
 	logEvent.Status = string(authz.Status)
@@ -1365,7 +1382,7 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 		return
 	}
 
-	if wfe.AllowAuthzDeactivation && request.Method == "POST" {
+	if request.Method == "POST" {
 		// If the deactivation fails return early as errors and return codes
 		// have already been set. Otherwise continue so that the user gets
 		// sent the deactivated authorization.
@@ -1378,7 +1395,7 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 
 	response.Header().Add("Link", link(web.RelativeEndpoint(request, newCertPath), "next"))
 
-	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, authz)
+	err := wfe.writeJsonResponse(response, logEvent, http.StatusOK, authz)
 	if err != nil {
 		// InternalServerError because this is a failure to decode from our DB.
 		wfe.sendError(response, logEvent, probs.ServerInternal("Failed to JSON marshal authz"), err)
@@ -1595,4 +1612,8 @@ func (wfe *WebFrontEndImpl) addIssuingCertificateURLs(response http.ResponseWrit
 		response.Header().Add("Link", link(parsedURI.String(), "up"))
 	}
 	return nil
+}
+
+func urlForAuthz(authz core.Authorization, request *http.Request) string {
+	return web.RelativeEndpoint(request, authzv2Path+string(authz.ID))
 }

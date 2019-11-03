@@ -50,9 +50,13 @@ const (
 	UnknownLintSource LintSource = iota
 	CABFBaselineRequirements
 	RFC5280
+	RFC5480
 	RFC5891
 	ZLint
 	AWSLabs
+	EtsiEsi // ETSI - Electronic Signatures and Infrastructures (ESI)
+	CABFEVGuidelines
+	AppleCTPolicy // https://support.apple.com/en-us/HT205280
 )
 
 // A Lint struct represents a single lint, e.g.

@@ -1,16 +1,17 @@
 package core
 
 import (
+	"context"
 	"crypto/x509"
 	"net"
 	"net/http"
 	"time"
 
-	"golang.org/x/net/context"
 	jose "gopkg.in/square/go-jose.v2"
 
 	caPB "github.com/letsencrypt/boulder/ca/proto"
 	corepb "github.com/letsencrypt/boulder/core/proto"
+	"github.com/letsencrypt/boulder/identifier"
 	pubpb "github.com/letsencrypt/boulder/publisher/proto"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/revocation"
@@ -93,9 +94,6 @@ type RegistrationAuthority interface {
 // CertificateAuthority defines the public interface for the Boulder CA
 type CertificateAuthority interface {
 	// [RegistrationAuthority]
-	IssueCertificate(ctx context.Context, issueReq *caPB.IssueCertificateRequest) (Certificate, error)
-
-	// [RegistrationAuthority]
 	IssuePrecertificate(ctx context.Context, issueReq *caPB.IssueCertificateRequest) (*caPB.IssuePrecertificateResponse, error)
 
 	// [RegistrationAuthority]
@@ -106,9 +104,9 @@ type CertificateAuthority interface {
 
 // PolicyAuthority defines the public interface for the Boulder PA
 type PolicyAuthority interface {
-	WillingToIssue(domain AcmeIdentifier) error
-	WillingToIssueWildcard(domain AcmeIdentifier) error
-	ChallengesFor(domain AcmeIdentifier) (challenges []Challenge, validCombinations [][]int, err error)
+	WillingToIssue(domain identifier.ACMEIdentifier) error
+	WillingToIssueWildcards(identifiers []identifier.ACMEIdentifier) error
+	ChallengesFor(domain identifier.ACMEIdentifier) ([]Challenge, error)
 	ChallengeTypeEnabled(t string) bool
 }
 
@@ -120,9 +118,9 @@ type StorageGetter interface {
 	GetValidAuthorizations(ctx context.Context, regID int64, domains []string, now time.Time) (map[string]*Authorization, error)
 	GetPendingAuthorization(ctx context.Context, req *sapb.GetPendingAuthorizationRequest) (*Authorization, error)
 	GetCertificate(ctx context.Context, serial string) (Certificate, error)
+	GetPrecertificate(ctx context.Context, req *sapb.Serial) (*corepb.Certificate, error)
 	GetCertificateStatus(ctx context.Context, serial string) (CertificateStatus, error)
 	CountCertificatesByNames(ctx context.Context, domains []string, earliest, latest time.Time) (countByDomain []*sapb.CountByNames_MapElement, err error)
-	CountCertificatesByExactNames(ctx context.Context, domains []string, earliest, latest time.Time) (countByDomain []*sapb.CountByNames_MapElement, err error)
 	CountRegistrationsByIP(ctx context.Context, ip net.IP, earliest, latest time.Time) (int, error)
 	CountRegistrationsByIPRange(ctx context.Context, ip net.IP, earliest, latest time.Time) (int, error)
 	CountPendingAuthorizations(ctx context.Context, regID int64) (int, error)
@@ -135,7 +133,14 @@ type StorageGetter interface {
 	GetValidOrderAuthorizations(ctx context.Context, req *sapb.GetValidOrderAuthorizationsRequest) (map[string]*Authorization, error)
 	CountInvalidAuthorizations(ctx context.Context, req *sapb.CountInvalidAuthorizationsRequest) (count *sapb.Count, err error)
 	GetAuthorizations(ctx context.Context, req *sapb.GetAuthorizationsRequest) (*sapb.Authorizations, error)
-	GetAuthz2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Authorization, error)
+	// New authz2 methods
+	GetAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Authorization, error)
+	GetAuthorizations2(ctx context.Context, req *sapb.GetAuthorizationsRequest) (*sapb.Authorizations, error)
+	GetPendingAuthorization2(ctx context.Context, req *sapb.GetPendingAuthorizationRequest) (*corepb.Authorization, error)
+	CountPendingAuthorizations2(ctx context.Context, req *sapb.RegistrationID) (*sapb.Count, error)
+	GetValidOrderAuthorizations2(ctx context.Context, req *sapb.GetValidOrderAuthorizationsRequest) (*sapb.Authorizations, error)
+	CountInvalidAuthorizations2(ctx context.Context, req *sapb.CountInvalidAuthorizationsRequest) (*sapb.Count, error)
+	GetValidAuthorizations2(ctx context.Context, req *sapb.GetValidAuthorizationsRequest) (*sapb.Authorizations, error)
 }
 
 // StorageAdder are the Boulder SA's write/update methods
@@ -144,9 +149,9 @@ type StorageAdder interface {
 	UpdateRegistration(ctx context.Context, reg Registration) error
 	NewPendingAuthorization(ctx context.Context, authz Authorization) (Authorization, error)
 	FinalizeAuthorization(ctx context.Context, authz Authorization) error
-	MarkCertificateRevoked(ctx context.Context, serial string, reasonCode revocation.Reason) error
 	AddCertificate(ctx context.Context, der []byte, regID int64, ocsp []byte, issued *time.Time) (digest string, err error)
-	RevokeAuthorizationsByDomain(ctx context.Context, domain AcmeIdentifier) (finalized, pending int64, err error)
+	AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*corepb.Empty, error)
+	AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*corepb.Empty, error)
 	DeactivateRegistration(ctx context.Context, id int64) error
 	DeactivateAuthorization(ctx context.Context, id string) error
 	NewOrder(ctx context.Context, order *corepb.Order) (*corepb.Order, error)
@@ -155,6 +160,10 @@ type StorageAdder interface {
 	AddPendingAuthorizations(ctx context.Context, req *sapb.AddPendingAuthorizationsRequest) (*sapb.AuthorizationIDs, error)
 	SetOrderError(ctx context.Context, order *corepb.Order) error
 	RevokeCertificate(ctx context.Context, req *sapb.RevokeCertificateRequest) error
+	// New authz2 methods
+	NewAuthorizations2(ctx context.Context, req *sapb.AddPendingAuthorizationsRequest) (*sapb.Authorization2IDs, error)
+	FinalizeAuthorization2(ctx context.Context, req *sapb.FinalizeAuthorizationRequest) error
+	DeactivateAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Empty, error)
 }
 
 // StorageAuthority interface represents a simple key/value

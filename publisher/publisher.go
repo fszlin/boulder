@@ -1,9 +1,11 @@
 package publisher
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
@@ -16,13 +18,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/certificate-transparency-go"
+	ct "github.com/google/certificate-transparency-go"
 	ctClient "github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
-	"github.com/google/certificate-transparency-go/tls"
 	cttls "github.com/google/certificate-transparency-go/tls"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/canceled"
 	"github.com/letsencrypt/boulder/core"
@@ -48,7 +48,7 @@ type logCache struct {
 
 // AddLog adds a *Log to the cache by constructing the statName, client and
 // verifier for the given uri & base64 public key.
-func (c *logCache) AddLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
+func (c *logCache) AddLog(uri, b64PK, userAgent string, logger blog.Logger) (*Log, error) {
 	// Lock the mutex for reading to check the cache
 	c.RLock()
 	log, present := c.logs[b64PK]
@@ -64,7 +64,7 @@ func (c *logCache) AddLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
 	defer c.Unlock()
 
 	// Construct a Log, add it to the cache, and return it to the caller
-	log, err := NewLog(uri, b64PK, logger)
+	log, err := NewLog(uri, b64PK, userAgent, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func (la logAdaptor) Printf(s string, args ...interface{}) {
 }
 
 // NewLog returns an initialized Log struct
-func NewLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
+func NewLog(uri, b64PK, userAgent string, logger blog.Logger) (*Log, error) {
 	url, err := url.Parse(uri)
 	if err != nil {
 		return nil, err
@@ -111,6 +111,7 @@ func NewLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
 	opts := jsonclient.Options{
 		Logger:    logAdaptor{logger},
 		PublicKey: pemPK,
+		UserAgent: userAgent,
 	}
 	httpClient := &http.Client{
 		// We set the HTTP client timeout to about half of what we expect
@@ -131,6 +132,18 @@ func NewLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
 			MaxIdleConns:        http.DefaultTransport.(*http.Transport).MaxIdleConns,
 			IdleConnTimeout:     http.DefaultTransport.(*http.Transport).IdleConnTimeout,
 			TLSHandshakeTimeout: http.DefaultTransport.(*http.Transport).TLSHandshakeTimeout,
+			// In Boulder Issue 3821[0] we found that HTTP/2 support was causing hard
+			// to diagnose intermittent freezes in CT submission. Disabling HTTP/2 with
+			// an environment variable resolved the freezes but is not a stable fix.
+			//
+			// Per the Go `http` package docs we can make this change persistent by
+			// changing the `http.Transport` config:
+			//   "Programs that must disable HTTP/2 can do so by setting
+			//   Transport.TLSNextProto (for clients) or Server.TLSNextProto (for
+			//   servers) to a non-nil, empty map"
+			//
+			// [0]: https://github.com/letsencrypt/boulder/issues/3821
+			TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
 		},
 	}
 	client, err := ctClient.New(url.String(), httpClient, opts)
@@ -138,26 +151,10 @@ func NewLog(uri, b64PK string, logger blog.Logger) (*Log, error) {
 		return nil, fmt.Errorf("making CT client: %s", err)
 	}
 
-	// TODO: Maybe this isn't necessary any more now that ctClient can check sigs?
-	pkBytes, err := base64.StdEncoding.DecodeString(b64PK)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to decode base64 log public key")
-	}
-	pk, err := x509.ParsePKIXPublicKey(pkBytes)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to parse log public key")
-	}
-
-	verifier, err := ct.NewSignatureVerifier(pk)
-	if err != nil {
-		return nil, err
-	}
-
 	return &Log{
-		logID:    b64PK,
-		uri:      url.String(),
-		client:   client,
-		verifier: verifier,
+		logID:  b64PK,
+		uri:    url.String(),
+		client: client,
 	}, nil
 }
 
@@ -177,7 +174,7 @@ func initMetrics(stats metrics.Scope) *pubMetrics {
 			Help:    "Time taken to submit a certificate to a CT log",
 			Buckets: metrics.InternetFacingBuckets,
 		},
-		[]string{"log", "status"},
+		[]string{"log", "status", "httpStatus"},
 	)
 	stats.MustRegister(submissionLatency)
 
@@ -200,6 +197,7 @@ func initMetrics(stats metrics.Scope) *pubMetrics {
 // Impl defines a Publisher
 type Impl struct {
 	log          blog.Logger
+	userAgent    string
 	issuerBundle []ct.ASN1Cert
 	ctLogsCache  logCache
 	metrics      *pubMetrics
@@ -209,11 +207,13 @@ type Impl struct {
 // to requested CT logs
 func New(
 	bundle []ct.ASN1Cert,
+	userAgent string,
 	logger blog.Logger,
 	stats metrics.Scope,
 ) *Impl {
 	return &Impl{
 		issuerBundle: bundle,
+		userAgent:    userAgent,
 		ctLogsCache: logCache{
 			logs: make(map[string]*Log),
 		},
@@ -236,7 +236,7 @@ func (pub *Impl) SubmitToSingleCTWithResult(ctx context.Context, req *pubpb.Requ
 	// Add a log URL/pubkey to the cache, if already present the
 	// existing *Log will be returned, otherwise one will be constructed, added
 	// and returned.
-	ctLog, err := pub.ctLogsCache.AddLog(*req.LogURL, *req.LogPublicKey, pub.log)
+	ctLog, err := pub.ctLogsCache.AddLog(*req.LogURL, *req.LogPublicKey, pub.userAgent, pub.log)
 	if err != nil {
 		pub.log.AuditErrf("Making Log: %s", err)
 		return nil, err
@@ -266,7 +266,7 @@ func (pub *Impl) SubmitToSingleCTWithResult(ctx context.Context, req *pubpb.Requ
 		return nil, err
 	}
 
-	sctBytes, err := tls.Marshal(*sct)
+	sctBytes, err := cttls.Marshal(*sct)
 	if err != nil {
 		return nil, err
 	}
@@ -294,32 +294,23 @@ func (pub *Impl) singleLogSubmit(
 		if canceled.Is(err) {
 			status = "canceled"
 		}
+		httpStatus := ""
+		if rspError, ok := err.(ctClient.RspError); ok && rspError.StatusCode != 0 {
+			httpStatus = fmt.Sprintf("%d", rspError.StatusCode)
+		}
 		pub.metrics.submissionLatency.With(prometheus.Labels{
-			"log":    ctLog.uri,
-			"status": status,
+			"log":        ctLog.uri,
+			"status":     status,
+			"httpStatus": httpStatus,
 		}).Observe(took)
 		return nil, err
 	}
 	pub.metrics.submissionLatency.With(prometheus.Labels{
-		"log":    ctLog.uri,
-		"status": "success",
+		"log":        ctLog.uri,
+		"status":     "success",
+		"httpStatus": "",
 	}).Observe(took)
 
-	// Generate log entry so we can verify the signature in the returned SCT
-	eType := ct.X509LogEntryType
-	if isPrecert {
-		eType = ct.PrecertLogEntryType
-	}
-	// Note: The timestamp on the merkle tree leaf is not actually used in
-	// the SCT signature validation so it is left as 0 here
-	leaf, err := ct.MerkleTreeLeafFromRawChain(chain, eType, 0)
-	if err != nil {
-		return nil, err
-	}
-	err = ctLog.verifier.VerifySCTSignature(*sct, ct.LogEntry{Leaf: *leaf})
-	if err != nil {
-		return nil, err
-	}
 	timestamp := time.Unix(int64(sct.Timestamp)/1000, 0)
 	if timestamp.Sub(time.Now()) > time.Minute {
 		return nil, fmt.Errorf("SCT Timestamp was too far in the future (%s)", timestamp)
@@ -406,40 +397,4 @@ func CreateTestingSignedSCT(req []string, k *ecdsa.PrivateKey, precert bool, tim
 
 	jsonSCT, _ := json.Marshal(jsonSCTObj)
 	return jsonSCT
-}
-
-// ProbeLogs sends a HTTP GET request to each of the logs in the
-// publisher logCache and records the latency and status of the
-// response.
-func (pub *Impl) ProbeLogs() {
-	wg := new(sync.WaitGroup)
-	for _, log := range pub.ctLogsCache.LogURIs() {
-		wg.Add(1)
-		go func(uri string) {
-			defer wg.Done()
-			c := http.Client{
-				Timeout: time.Minute*2 + time.Second*30,
-			}
-			url, err := url.Parse(uri)
-			if err != nil {
-				pub.log.Errf("failed to parse log URI: %s", err)
-			}
-			url.Path = ct.GetSTHPath
-			s := time.Now()
-			resp, err := c.Get(url.String())
-			took := time.Since(s).Seconds()
-			var status string
-			if err == nil {
-				defer func() { _ = resp.Body.Close() }()
-				status = resp.Status
-			} else {
-				status = "error"
-			}
-			pub.metrics.probeLatency.With(prometheus.Labels{
-				"log":    uri,
-				"status": status,
-			}).Observe(took)
-		}(log)
-	}
-	wg.Wait()
 }

@@ -3,6 +3,8 @@ package probs
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/letsencrypt/boulder/identifier"
 )
 
 // Error types that can be used in ACME payloads
@@ -12,7 +14,6 @@ const (
 	ServerInternalProblem        = ProblemType("serverInternal")
 	TLSProblem                   = ProblemType("tls")
 	UnauthorizedProblem          = ProblemType("unauthorized")
-	UnknownHostProblem           = ProblemType("unknownHost")
 	RateLimitedProblem           = ProblemType("rateLimited")
 	BadNonceProblem              = ProblemType("badNonce")
 	InvalidEmailProblem          = ProblemType("invalidEmail")
@@ -24,6 +25,8 @@ const (
 	OrderNotReadyProblem         = ProblemType("orderNotReady")
 	BadSignatureAlgorithmProblem = ProblemType("badSignatureAlgorithm")
 	BadPublicKeyProblem          = ProblemType("badPublicKey")
+	BadRevocationReasonProblem   = ProblemType("badRevocationReason")
+	BadCSRProblem                = ProblemType("badCSR")
 
 	V1ErrorNS = "urn:acme:error:"
 	V2ErrorNS = "urn:ietf:params:acme:error:"
@@ -40,10 +43,32 @@ type ProblemDetails struct {
 	// HTTPStatus is the HTTP status code the ProblemDetails should probably be sent
 	// as.
 	HTTPStatus int `json:"status,omitempty"`
+	// SubProblems are optional additional per-identifier problems. See
+	// RFC 8555 Section 6.7.1: https://tools.ietf.org/html/rfc8555#section-6.7.1
+	SubProblems []SubProblemDetails `json:"subproblems,omitempty"`
+}
+
+// SubProblemDetails represents sub-problems specific to an identifier that are
+// related to a top-level ProblemDetails.
+// See RFC 8555 Section 6.7.1: https://tools.ietf.org/html/rfc8555#section-6.7.1
+type SubProblemDetails struct {
+	ProblemDetails
+	Identifier identifier.ACMEIdentifier `json:"identifier"`
 }
 
 func (pd *ProblemDetails) Error() string {
 	return fmt.Sprintf("%s :: %s", pd.Type, pd.Detail)
+}
+
+// WithSubProblems returns a new ProblemsDetails instance created by adding the
+// provided subProbs to the existing ProblemsDetail.
+func (pd *ProblemDetails) WithSubProblems(subProbs []SubProblemDetails) *ProblemDetails {
+	return &ProblemDetails{
+		Type:        pd.Type,
+		Detail:      pd.Detail,
+		HTTPStatus:  pd.HTTPStatus,
+		SubProblems: append(pd.SubProblems, subProbs...),
+	}
 }
 
 // statusTooManyRequests is the HTTP status code meant for rate limiting
@@ -64,11 +89,11 @@ func ProblemDetailsToStatusCode(prob *ProblemDetails) int {
 		BadSignatureAlgorithmProblem,
 		BadPublicKeyProblem,
 		TLSProblem,
-		UnknownHostProblem,
 		BadNonceProblem,
 		InvalidEmailProblem,
 		RejectedIdentifierProblem,
-		AccountDoesNotExistProblem:
+		AccountDoesNotExistProblem,
+		BadRevocationReasonProblem:
 		return http.StatusBadRequest
 	case ServerInternalProblem:
 		return http.StatusInternalServerError
@@ -233,15 +258,6 @@ func ConnectionFailure(detail string, a ...interface{}) *ProblemDetails {
 	}
 }
 
-// UnknownHost returns a ProblemDetails representing an UnknownHostProblem error
-func UnknownHost(detail string, a ...interface{}) *ProblemDetails {
-	return &ProblemDetails{
-		Type:       UnknownHostProblem,
-		Detail:     fmt.Sprintf(detail, a...),
-		HTTPStatus: http.StatusBadRequest,
-	}
-}
-
 // RateLimited returns a ProblemDetails representing a RateLimitedProblem error
 func RateLimited(detail string, a ...interface{}) *ProblemDetails {
 	return &ProblemDetails{
@@ -294,5 +310,24 @@ func OrderNotReady(detail string, a ...interface{}) *ProblemDetails {
 		Type:       OrderNotReadyProblem,
 		Detail:     fmt.Sprintf(detail, a...),
 		HTTPStatus: http.StatusForbidden,
+	}
+}
+
+// BadRevocationReason returns a ProblemDetails representing
+// a BadRevocationReasonProblem
+func BadRevocationReason(detail string, a ...interface{}) *ProblemDetails {
+	return &ProblemDetails{
+		Type:       BadRevocationReasonProblem,
+		Detail:     fmt.Sprintf(detail, a...),
+		HTTPStatus: http.StatusBadRequest,
+	}
+}
+
+// BadCSR returns a ProblemDetails representing a BadCSRProblem.
+func BadCSR(detail string, a ...interface{}) *ProblemDetails {
+	return &ProblemDetails{
+		Type:       BadCSRProblem,
+		Detail:     fmt.Sprintf(detail, a...),
+		HTTPStatus: http.StatusBadRequest,
 	}
 }

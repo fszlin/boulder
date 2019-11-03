@@ -23,7 +23,13 @@ type config struct {
 
 		PortConfig cmd.PortConfig
 
-		CAADistributedResolver *cmd.CAADistributedResolverConfig
+		// CAADistributedResolverConfig specifies the HTTP client setup and interfaces
+		// needed to resolve CAA addresses over multiple paths
+		CAADistributedResolver struct {
+			Timeout     cmd.ConfigDuration
+			MaxFailures int
+			Proxies     []string
+		}
 
 		// The number of times to try a DNS query (that has a temporary error)
 		// before giving up. May be short-circuited by deadlines. A zero value
@@ -37,6 +43,13 @@ type config struct {
 		Features map[string]bool
 
 		AccountURIPrefixes []string
+
+		// A filename pointing to a YAML file containing MultiVAPolicy contents.
+		// This file will be set up to live-reload the contents of the policy file
+		// such that the VA can use the specified disabledDomains and
+		// disabledAccounts lists to determine whether or not to enforce multi-VA
+		// consensus for an account/domain.
+		MultiVAPolicyFile string
 	}
 
 	Syslog cmd.SyslogConfig
@@ -128,7 +141,7 @@ func main() {
 				remotes,
 				va.RemoteVA{
 					ValidationAuthority: bgrpc.NewValidationAuthorityGRPCClient(vaConn),
-					Addresses:           rva.ServerAddress,
+					Address:             rva.ServerAddress,
 				},
 			)
 		}
@@ -144,7 +157,8 @@ func main() {
 		scope,
 		clk,
 		logger,
-		c.VA.AccountURIPrefixes)
+		c.VA.AccountURIPrefixes,
+		c.VA.MultiVAPolicyFile)
 	cmd.FailOnError(err, "Unable to create VA server")
 
 	serverMetrics := bgrpc.NewServerMetrics(scope)

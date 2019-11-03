@@ -4,12 +4,13 @@
     "maxConcurrentRPCServerRequests": 100000,
     "maxContactsPerRegistration": 100,
     "debugAddr": ":8002",
-    "hostnamePolicyFile": "test/hostname-policy.json",
+    "hostnamePolicyFile": "test/hostname-policy.yaml",
     "maxNames": 100,
     "reuseValidAuthz": true,
     "authorizationLifetimeDays": 30,
     "pendingAuthorizationLifetimeDays": 7,
-    "weakKeyDirectory": "test/example-weak-keys.json",
+    "weakKeyFile": "test/example-weak-keys.json",
+    "blockedKeyFile": "test/example-blocked-keys.yaml",
     "orderLifetime": "168h",
     "issuerCertPath":  "test/test-ca2.pem",
     "tls": {
@@ -39,14 +40,12 @@
     },
     "grpc": {
       "address": ":9094",
-      "maxConcurrentStreams": 2000,
       "clientNames": [
         "wfe.boulder",
         "admin-revoker.boulder"
       ]
     },
     "features": {
-      "RevokeAtRA": true,
       "EarlyOrderRateLimit": true
     },
     "CTLogGroups2": [
@@ -57,12 +56,12 @@
           {
             "uri": "http://boulder:4500",
             "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYggOxPnPkzKBIhTacSYoIfnSL2jPugcbUKx83vFMvk5gKAz/AGe87w20riuPwEGn229hKVbEKHFB61NIqNHC3Q==",
-            "submitFinalCert": true
+            "submitFinalCert": false
           },
           {
             "uri": "http://boulder:4501",
             "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKtnFevaXV/kB8dmhCNZHmxKVLcHX1plaAsY9LrKilhYxdmQZiu36LvAvosTsqMVqRK9a96nC8VaxAdaHUbM8EA==",
-            "submitFinalCert": true
+            "submitFinalCert": false
           }
         ]
       },
@@ -122,10 +121,5 @@
   "syslog": {
     "stdoutlevel": 6,
     "sysloglevel": 4
-  },
-
-  "common": {
-    "dnsTimeout": "30s",
-    "dnsAllowLoopbackAddresses": true
   }
 }

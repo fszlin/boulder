@@ -1,7 +1,7 @@
 language: go
 
 go:
-  - "1.12"
+  - "1.13.2"
 
 go_import_path: github.com/letsencrypt/boulder
 
@@ -10,7 +10,6 @@ addons:
     - le.wtf
     - boulder
     - boulder-mysql
-    - boulder-rabbitmq
 
 sudo: required
 
@@ -34,16 +33,17 @@ env:
     #
     # Current Go version build tasks:
     #
-    - RUN="vet fmt migrations integration errcheck ineffassign generate dashlint rpm"
+    - RUN="lints integration generate rpm" BOULDER_CONFIG_DIR="test/config"
     # Config changes that have landed in master but not yet been applied to
     # production can be made in boulder-config-next.json.
     - RUN="integration" BOULDER_CONFIG_DIR="test/config-next"
     - RUN="unit"
     - RUN="unit-next" BOULDER_CONFIG_DIR="test/config-next"
-    # godep-restore runs with a separate container because it needs to fetch
+    - RUN="start"
+    # gomod-vendor runs with a separate container because it needs to fetch
     # packages from GitHub et. al., which is incompatible with the DNS server
     # override in the boulder container (used for service discovery).
-    - RUN="godep-restore" CONTAINER="netaccess"
+    - RUN="gomod-vendor" CONTAINER="netaccess"
     - RUN="coverage" CONTAINER="netaccess"
 
 matrix:

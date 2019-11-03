@@ -1,15 +1,17 @@
 package policy
 
 import (
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/letsencrypt/boulder/core"
+	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
+	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/test"
+	"gopkg.in/yaml.v2"
 )
 
 var log = blog.UseMock()
@@ -106,23 +108,28 @@ func TestWillingToIssue(t *testing.T) {
 		`foo.bd`,
 	}
 
-	shouldBeBlacklisted := []string{
+	shouldBeBlocked := []string{
 		`highvalue.website1.org`,
 		`website2.co.uk`,
 		`www.website3.com`,
 		`lots.of.labels.website4.com`,
+		`banned.in.dc.com`,
+		`bad.brains.banned.in.dc.com`,
 	}
-	blacklistContents := []string{
+	blocklistContents := []string{
 		`website2.com`,
 		`website2.org`,
 		`website2.co.uk`,
 		`website3.com`,
 		`website4.com`,
 	}
-	exactBlacklistContents := []string{
+	exactBlocklistContents := []string{
 		`www.website1.org`,
 		`highvalue.website1.org`,
 		`dl.website1.org`,
+	}
+	adminBlockedContents := []string{
+		`banned.in.dc.com`,
 	}
 
 	shouldBeAccepted := []string{
@@ -136,70 +143,74 @@ func TestWillingToIssue(t *testing.T) {
 		"www.web-site2.com",
 	}
 
+	policy := blockedNamesPolicy{
+		HighRiskBlockedNames: blocklistContents,
+		ExactBlockedNames:    exactBlocklistContents,
+		AdminBlockedNames:    adminBlockedContents,
+	}
+
+	yamlPolicyBytes, err := yaml.Marshal(policy)
+	test.AssertNotError(t, err, "Couldn't YAML serialize blocklist")
+	yamlPolicyFile, _ := ioutil.TempFile("", "test-blocklist.*.yaml")
+	defer os.Remove(yamlPolicyFile.Name())
+	err = ioutil.WriteFile(yamlPolicyFile.Name(), yamlPolicyBytes, 0640)
+	test.AssertNotError(t, err, "Couldn't write YAML blocklist")
+
 	pa := paImpl(t)
 
-	blacklistBytes, err := json.Marshal(blacklistJSON{
-		Blacklist:      blacklistContents,
-		ExactBlacklist: exactBlacklistContents,
-	})
-	test.AssertNotError(t, err, "Couldn't serialize blacklist")
-	f, _ := ioutil.TempFile("", "test-blacklist.txt")
-	defer os.Remove(f.Name())
-	err = ioutil.WriteFile(f.Name(), blacklistBytes, 0640)
-	test.AssertNotError(t, err, "Couldn't write blacklist")
-	err = pa.SetHostnamePolicyFile(f.Name())
+	err = pa.SetHostnamePolicyFile(yamlPolicyFile.Name())
 	test.AssertNotError(t, err, "Couldn't load rules")
 
 	// Test for invalid identifier type
-	identifier := core.AcmeIdentifier{Type: "ip", Value: "example.com"}
-	err = pa.WillingToIssue(identifier)
+	ident := identifier.ACMEIdentifier{Type: "ip", Value: "example.com"}
+	err = pa.WillingToIssue(ident)
 	if err != errInvalidIdentifier {
-		t.Error("Identifier was not correctly forbidden: ", identifier)
+		t.Error("Identifier was not correctly forbidden: ", ident)
 	}
 
 	// Test syntax errors
 	for _, tc := range testCases {
-		identifier := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: tc.domain}
-		err := pa.WillingToIssue(identifier)
+		ident := identifier.DNSIdentifier(tc.domain)
+		err := pa.WillingToIssue(ident)
 		if err != tc.err {
 			t.Errorf("WillingToIssue(%q) = %q, expected %q", tc.domain, err, tc.err)
 		}
 	}
 
 	// Invalid encoding
-	err = pa.WillingToIssue(core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "www.xn--m.com"})
+	err = pa.WillingToIssue(identifier.DNSIdentifier("www.xn--m.com"))
 	test.AssertError(t, err, "WillingToIssue didn't fail on a malformed IDN")
 	// Valid encoding
-	err = pa.WillingToIssue(core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "www.xn--mnich-kva.com"})
+	err = pa.WillingToIssue(identifier.DNSIdentifier("www.xn--mnich-kva.com"))
 	test.AssertNotError(t, err, "WillingToIssue failed on a properly formed IDN")
 	// IDN TLD
-	err = pa.WillingToIssue(core.AcmeIdentifier{Type: core.IdentifierDNS, Value: "xn--example--3bhk5a.xn--p1ai"})
+	err = pa.WillingToIssue(identifier.DNSIdentifier("xn--example--3bhk5a.xn--p1ai"))
 	test.AssertNotError(t, err, "WillingToIssue failed on a properly formed domain with IDN TLD")
 	features.Reset()
 
 	// Test domains that are equal to public suffixes
 	for _, domain := range shouldBeTLDError {
-		identifier := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: domain}
-		err := pa.WillingToIssue(identifier)
+		ident := identifier.DNSIdentifier(domain)
+		err := pa.WillingToIssue(ident)
 		if err != errICANNTLD {
-			t.Error("Identifier was not correctly forbidden: ", identifier, err)
+			t.Error("Identifier was not correctly forbidden: ", ident, err)
 		}
 	}
 
-	// Test blacklisting
-	for _, domain := range shouldBeBlacklisted {
-		identifier := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: domain}
-		err := pa.WillingToIssue(identifier)
-		if err != errBlacklisted {
-			t.Error("Identifier was not correctly forbidden: ", identifier, err)
+	// Test expected blocked domains
+	for _, domain := range shouldBeBlocked {
+		ident := identifier.DNSIdentifier(domain)
+		err := pa.WillingToIssue(ident)
+		if err != errPolicyForbidden {
+			t.Error("Identifier was not correctly forbidden: ", ident, err)
 		}
 	}
 
 	// Test acceptance of good names
 	for _, domain := range shouldBeAccepted {
-		identifier := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: domain}
-		if err := pa.WillingToIssue(identifier); err != nil {
-			t.Error("Identifier was incorrectly forbidden: ", identifier, err)
+		ident := identifier.DNSIdentifier(domain)
+		if err := pa.WillingToIssue(ident); err != nil {
+			t.Error("Identifier was incorrectly forbidden: ", ident, err)
 		}
 	}
 }
@@ -213,94 +224,150 @@ func TestWillingToIssueWildcard(t *testing.T) {
 	}
 	pa := paImpl(t)
 
-	bannedBytes, err := json.Marshal(blacklistJSON{
-		Blacklist:      bannedDomains,
-		ExactBlacklist: exactBannedDomains,
+	bannedBytes, err := yaml.Marshal(blockedNamesPolicy{
+		HighRiskBlockedNames: bannedDomains,
+		ExactBlockedNames:    exactBannedDomains,
 	})
 	test.AssertNotError(t, err, "Couldn't serialize banned list")
-	f, _ := ioutil.TempFile("", "test-wildcard-banlist.txt")
+	f, _ := ioutil.TempFile("", "test-wildcard-banlist.*.yaml")
 	defer os.Remove(f.Name())
 	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
 	err = pa.SetHostnamePolicyFile(f.Name())
 	test.AssertNotError(t, err, "Couldn't load policy contents from file")
 
-	makeDNSIdent := func(domain string) core.AcmeIdentifier {
-		return core.AcmeIdentifier{
-			Type:  core.IdentifierDNS,
-			Value: domain,
-		}
-	}
-
 	testCases := []struct {
 		Name        string
-		Ident       core.AcmeIdentifier
+		Ident       identifier.ACMEIdentifier
 		ExpectedErr error
 	}{
 		{
 			Name:        "Non-DNS identifier",
-			Ident:       core.AcmeIdentifier{Type: "nickname", Value: "cpu"},
+			Ident:       identifier.ACMEIdentifier{Type: "nickname", Value: "cpu"},
 			ExpectedErr: errInvalidIdentifier,
 		},
 		{
 			Name:        "Too many wildcards",
-			Ident:       makeDNSIdent("ok.*.whatever.*.example.com"),
+			Ident:       identifier.DNSIdentifier("ok.*.whatever.*.example.com"),
 			ExpectedErr: errTooManyWildcards,
 		},
 		{
 			Name:        "Misplaced wildcard",
-			Ident:       makeDNSIdent("ok.*.whatever.example.com"),
+			Ident:       identifier.DNSIdentifier("ok.*.whatever.example.com"),
 			ExpectedErr: errMalformedWildcard,
 		},
 		{
 			Name:        "Missing ICANN TLD",
-			Ident:       makeDNSIdent("*.ok.madeup"),
+			Ident:       identifier.DNSIdentifier("*.ok.madeup"),
 			ExpectedErr: errNonPublic,
 		},
 		{
 			Name:        "Wildcard for ICANN TLD",
-			Ident:       makeDNSIdent("*.com"),
+			Ident:       identifier.DNSIdentifier("*.com"),
 			ExpectedErr: errICANNTLDWildcard,
 		},
 		{
 			Name:        "Forbidden base domain",
-			Ident:       makeDNSIdent("*.zombo.gov.us"),
-			ExpectedErr: errBlacklisted,
+			Ident:       identifier.DNSIdentifier("*.zombo.gov.us"),
+			ExpectedErr: errPolicyForbidden,
 		},
 		// We should not allow getting a wildcard for that would cover an exact
 		// blocklist domain
 		{
-			Name:        "Wildcard for ExactBlacklist base domain",
-			Ident:       makeDNSIdent("*.letsdecrypt.org"),
-			ExpectedErr: errBlacklisted,
+			Name:        "Wildcard for ExactBlocklist base domain",
+			Ident:       identifier.DNSIdentifier("*.letsdecrypt.org"),
+			ExpectedErr: errPolicyForbidden,
 		},
 		// We should allow a wildcard for a domain that doesn't match the exact
-		// blacklist domain
+		// blocklist domain
 		{
-			Name:        "Wildcard for non-matching subdomain of ExactBlacklist domain",
-			Ident:       makeDNSIdent("*.lowvalue.letsdecrypt.org"),
+			Name:        "Wildcard for non-matching subdomain of ExactBlocklist domain",
+			Ident:       identifier.DNSIdentifier("*.lowvalue.letsdecrypt.org"),
 			ExpectedErr: nil,
 		},
-		// We should allow getting a wildcard for an exact blacklist domain since it
+		// We should allow getting a wildcard for an exact blocklist domain since it
 		// only covers subdomains, not the exact name.
 		{
-			Name:        "Wildcard for ExactBlacklist domain",
-			Ident:       makeDNSIdent("*.highvalue.letsdecrypt.org"),
+			Name:        "Wildcard for ExactBlocklist domain",
+			Ident:       identifier.DNSIdentifier("*.highvalue.letsdecrypt.org"),
 			ExpectedErr: nil,
 		},
 		{
 			Name:        "Valid wildcard domain",
-			Ident:       makeDNSIdent("*.everything.is.possible.at.zombo.com"),
+			Ident:       identifier.DNSIdentifier("*.everything.is.possible.at.zombo.com"),
 			ExpectedErr: nil,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			result := pa.WillingToIssueWildcard(tc.Ident)
+			result := pa.willingToIssueWildcard(tc.Ident)
 			test.AssertEquals(t, result, tc.ExpectedErr)
 		})
 	}
+}
+
+// TestWillingToIssueWildcards tests that more than one rejected identifier
+// results in an error with suberrors.
+func TestWillingToIssueWildcards(t *testing.T) {
+	banned := []string{
+		"letsdecrypt.org",
+	}
+	pa := paImpl(t)
+
+	bannedBytes, err := yaml.Marshal(blockedNamesPolicy{
+		HighRiskBlockedNames: banned,
+		ExactBlockedNames:    banned,
+	})
+	test.AssertNotError(t, err, "Couldn't serialize banned list")
+	f, _ := ioutil.TempFile("", "test-wildcard-banlist.*.yaml")
+	defer os.Remove(f.Name())
+	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
+	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
+	err = pa.SetHostnamePolicyFile(f.Name())
+	test.AssertNotError(t, err, "Couldn't load policy contents from file")
+
+	idents := []identifier.ACMEIdentifier{
+		identifier.DNSIdentifier("perfectly-fine.com"),
+		identifier.DNSIdentifier("letsdecrypt.org"),
+		identifier.DNSIdentifier("ok.*.this.is.a.*.weird.one.com"),
+		identifier.DNSIdentifier("also-perfectly-fine.com"),
+	}
+
+	err = pa.WillingToIssueWildcards(idents)
+	test.AssertError(t, err, "Expected err from WillingToIssueWildcards")
+
+	berr, ok := err.(*berrors.BoulderError)
+	test.AssertEquals(t, ok, true)
+	test.AssertEquals(t, len(berr.SubErrors), 2)
+	test.AssertEquals(t, berr.Error(), "Cannot issue for \"letsdecrypt.org\": The ACME server refuses to issue a certificate for this domain name, because it is forbidden by policy (and 1 more problems. Refer to sub-problems for more information.)")
+
+	subErrMap := make(map[string]berrors.SubBoulderError, len(berr.SubErrors))
+
+	for _, subErr := range berr.SubErrors {
+		subErrMap[subErr.Identifier.Value] = subErr
+	}
+
+	subErrA, foundA := subErrMap["letsdecrypt.org"]
+	subErrB, foundB := subErrMap["ok.*.this.is.a.*.weird.one.com"]
+	test.AssertEquals(t, foundA, true)
+	test.AssertEquals(t, foundB, true)
+
+	test.AssertEquals(t, subErrA.Type, berrors.RejectedIdentifier)
+	test.AssertEquals(t, subErrB.Type, berrors.Malformed)
+
+	// Test willing to issue with only *one* bad identifier.
+	err = pa.WillingToIssueWildcards([]identifier.ACMEIdentifier{
+		identifier.DNSIdentifier("letsdecrypt.org"),
+	})
+	// It should error
+	test.AssertError(t, err, "Expected err from WillingToIssueWildcards")
+
+	berr, ok = err.(*berrors.BoulderError)
+	test.AssertEquals(t, ok, true)
+	// There should be *no* suberrors because there was only one error overall.
+	test.AssertEquals(t, len(berr.SubErrors), 0)
+	test.AssertEquals(t, berr.Error(), "Cannot issue for \"letsdecrypt.org\": The ACME server refuses to issue a certificate for this domain name, because it is forbidden by policy")
 }
 
 var accountKeyJSON = `{
@@ -312,15 +379,12 @@ var accountKeyJSON = `{
 func TestChallengesFor(t *testing.T) {
 	pa := paImpl(t)
 
-	challenges, combinations, err := pa.ChallengesFor(core.AcmeIdentifier{})
+	challenges, err := pa.ChallengesFor(identifier.ACMEIdentifier{})
 	test.AssertNotError(t, err, "ChallengesFor failed")
 
 	test.Assert(t, len(challenges) == len(enabledChallenges), "Wrong number of challenges returned")
-	test.Assert(t, len(combinations) == len(enabledChallenges), "Wrong number of combinations returned")
 
 	seenChalls := make(map[string]bool)
-	// Expected only if the pseudo-RNG is seeded with 99.
-	expectedCombos := [][]int{{1}, {0}}
 	for _, challenge := range challenges {
 		test.Assert(t, !seenChalls[challenge.Type], "should not already have seen this type")
 		seenChalls[challenge.Type] = true
@@ -328,14 +392,13 @@ func TestChallengesFor(t *testing.T) {
 		test.Assert(t, enabledChallenges[challenge.Type], "Unsupported challenge returned")
 	}
 	test.AssertEquals(t, len(seenChalls), len(enabledChallenges))
-	test.AssertDeepEquals(t, expectedCombos, combinations)
 
 }
 
 func TestChallengesForWildcard(t *testing.T) {
 	// wildcardIdent is an identifier for a wildcard domain name
-	wildcardIdent := core.AcmeIdentifier{
-		Type:  core.IdentifierDNS,
+	wildcardIdent := identifier.ACMEIdentifier{
+		Type:  identifier.DNS,
 		Value: "*.zombo.com",
 	}
 
@@ -352,7 +415,7 @@ func TestChallengesForWildcard(t *testing.T) {
 		core.ChallengeTypeDNS01:  false,
 	}
 	pa := mustConstructPA(t, enabledChallenges)
-	_, _, err := pa.ChallengesFor(wildcardIdent)
+	_, err := pa.ChallengesFor(wildcardIdent)
 	test.AssertError(t, err, "ChallengesFor did not error for a wildcard ident "+
 		"when DNS-01 was disabled")
 	test.AssertEquals(t, err.Error(), "Challenges requested for wildcard "+
@@ -362,17 +425,16 @@ func TestChallengesForWildcard(t *testing.T) {
 	// should return only one DNS-01 type challenge
 	enabledChallenges[core.ChallengeTypeDNS01] = true
 	pa = mustConstructPA(t, enabledChallenges)
-	challenges, combinations, err := pa.ChallengesFor(wildcardIdent)
+	challenges, err := pa.ChallengesFor(wildcardIdent)
 	test.AssertNotError(t, err, "ChallengesFor errored for a wildcard ident "+
 		"unexpectedly")
-	test.AssertEquals(t, len(combinations), 1)
 	test.AssertEquals(t, len(challenges), 1)
 	test.AssertEquals(t, challenges[0].Type, core.ChallengeTypeDNS01)
 }
 
-// TestMalformedExactBlacklist tests that loading a JSON policy file with an
-// invalid exact blacklist entry will fail as expected.
-func TestMalformedExactBlacklist(t *testing.T) {
+// TestMalformedExactBlocklist tests that loading a YAML policy file with an
+// invalid exact blocklist entry will fail as expected.
+func TestMalformedExactBlocklist(t *testing.T) {
 	pa := paImpl(t)
 
 	exactBannedDomains := []string{
@@ -383,23 +445,23 @@ func TestMalformedExactBlacklist(t *testing.T) {
 		"placeholder.domain.not.important.for.this.test.com",
 	}
 
-	// Create JSON for the exactBannedDomains
-	bannedBytes, err := json.Marshal(blacklistJSON{
-		Blacklist:      bannedDomains,
-		ExactBlacklist: exactBannedDomains,
+	// Create YAML for the exactBannedDomains
+	bannedBytes, err := yaml.Marshal(blockedNamesPolicy{
+		HighRiskBlockedNames: bannedDomains,
+		ExactBlockedNames:    exactBannedDomains,
 	})
 	test.AssertNotError(t, err, "Couldn't serialize banned list")
 
-	// Create a temp file for the JSON contents
-	f, _ := ioutil.TempFile("", "test-invalid-exactblacklist.json")
+	// Create a temp file for the YAML contents
+	f, _ := ioutil.TempFile("", "test-invalid-exactblocklist.*.yaml")
 	defer os.Remove(f.Name())
-	// Write the JSON to the temp file
+	// Write the YAML to the temp file
 	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
 
-	// Try to use the JSON tempfile as the hostname policy. It should produce an
-	// error since the exact blacklist contents are malformed.
+	// Try to use the YAML tempfile as the hostname policy. It should produce an
+	// error since the exact blocklist contents are malformed.
 	err = pa.SetHostnamePolicyFile(f.Name())
-	test.AssertError(t, err, "Loaded invalid exact blacklist content without error")
-	test.AssertEquals(t, err.Error(), "Malformed exact blacklist entry, only one label: \"com\"")
+	test.AssertError(t, err, "Loaded invalid exact blocklist content without error")
+	test.AssertEquals(t, err.Error(), "Malformed ExactBlockedNames entry, only one label: \"com\"")
 }

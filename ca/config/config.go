@@ -20,10 +20,7 @@ type CAConfig struct {
 
 	RSAProfile   string
 	ECDSAProfile string
-	TestMode     bool
 	SerialPrefix int
-	// TODO(jsha): Remove Key field once we've migrated to Issuers
-	Key *IssuerConfig
 	// Issuers contains configuration information for each issuer cert and key
 	// this CA knows about. The first in the list is used as the default.
 	Issuers []IssuerConfig
@@ -45,17 +42,14 @@ type CAConfig struct {
 	// not pull a SAN entry to be the CN if no CN was given in a CSR.
 	DoNotForceCN bool
 
-	// EnableMustStaple governs whether the Must Staple extension in CSRs
-	// triggers issuance of certificates with Must Staple.
-	EnableMustStaple bool
-
-	// EnablePrecertificateFlow governs whether precertificate-based issuance
-	// is enabled.
-	EnablePrecertificateFlow bool
-
 	// WeakKeyFile is the path to a JSON file containing truncated RSA modulus
 	// hashes of known easily enumerable keys.
 	WeakKeyFile string
+
+	// BlockedKeyFile is the path to a YAML file containing Base64 encoded
+	// SHA256 hashes of DER encoded PKIX public keys that should be considered
+	// administratively blocked.
+	BlockedKeyFile string
 
 	SAService *cmd.GRPCClientConfig
 

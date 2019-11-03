@@ -1,14 +1,15 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
+	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 )
 
@@ -24,13 +25,15 @@ type RequestEvent struct {
 	Latency   float64 `json:"-"`
 	RealIP    string  `json:"-"`
 
-	Slug           string                 `json:",omitempty"`
-	InternalErrors []string               `json:",omitempty"`
-	Error          string                 `json:",omitempty"`
-	Contacts       []string               `json:",omitempty"`
-	UserAgent      string                 `json:"ua,omitempty"`
-	Payload        string                 `json:",omitempty"`
-	Extra          map[string]interface{} `json:",omitempty"`
+	Slug           string   `json:",omitempty"`
+	InternalErrors []string `json:",omitempty"`
+	Error          string   `json:",omitempty"`
+	Contacts       []string `json:",omitempty"`
+	UserAgent      string   `json:"ua,omitempty"`
+	// Origin is sent by the browser from XHR-based clients.
+	Origin  string                 `json:",omitempty"`
+	Payload string                 `json:",omitempty"`
+	Extra   map[string]interface{} `json:",omitempty"`
 
 	// For endpoints that create objects, the ID of the newly created object.
 	Created string `json:",omitempty"`
@@ -96,13 +99,41 @@ func (th *TopHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RealIP:    realIP,
 		Method:    r.Method,
 		UserAgent: r.Header.Get("User-Agent"),
+		Origin:    r.Header.Get("Origin"),
 		Extra:     make(map[string]interface{}, 0),
+	}
+
+	if features.Enabled(features.StripDefaultSchemePort) {
+		// Some clients will send a HTTP Host header that includes the default port
+		// for the scheme that they are using. Previously when we were fronted by
+		// Akamai they would rewrite the header and strip out the unnecessary port,
+		// now that they are not in our request path we need to strip these ports out
+		// ourselves.
+		//
+		// The main reason we want to strip these ports out is so that when this header
+		// is sent to the /directory endpoint we don't reply with directory URLs that
+		// also contain these ports, which would then in turn end up being sent in the JWS
+		// signature 'url' header, which we don't support.
+		//
+		// We unconditionally strip :443 even when r.TLS is nil because the WFE/WFE2
+		// may be deployed HTTP-only behind another service that terminates HTTPS on
+		// its behalf.
+		if strings.HasSuffix(r.Host, ":443") {
+			r.Host = strings.TrimSuffix(r.Host, ":443")
+		} else if strings.HasSuffix(r.Host, ":80") {
+			r.Host = strings.TrimSuffix(r.Host, ":80")
+		}
 	}
 
 	begin := time.Now()
 	rwws := &responseWriterWithStatus{w, 0}
 	defer func() {
 		logEvent.Code = rwws.code
+		if logEvent.Code == 0 {
+			// If we haven't explicitly set a status code golang will set it
+			// to 200 itself when writing to the wire
+			logEvent.Code = http.StatusOK
+		}
 		logEvent.Latency = time.Since(begin).Seconds()
 		th.logEvent(logEvent)
 	}()

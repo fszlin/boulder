@@ -1,19 +1,4 @@
 // This package provides utilities that underlie the specific commands.
-// The idea is to make the specific command files very small, e.g.:
-//
-//    func main() {
-//      app := cmd.NewAppShell("command-name")
-//      app.Action = func(c cmd.Config) {
-//        // command logic
-//      }
-//      app.Run()
-//    }
-//
-// All commands share the same invocation pattern.  They take a single
-// parameter "-config", which is the name of a JSON file containing
-// the configuration for the app.  This JSON file is unmarshalled into
-// a Config object, which is provided to the app.
-
 package cmd
 
 import (
@@ -108,7 +93,11 @@ func (log grpcLogger) Error(args ...interface{}) {
 	log.Logger.AuditErr(fmt.Sprintln(args...))
 }
 func (log grpcLogger) Errorf(format string, args ...interface{}) {
-	log.Logger.AuditErrf(format, args...)
+	output := fmt.Sprintf(format, args...)
+	if output == `grpc: Server.processUnaryRPC failed to write status: connection error: desc = "transport is closing"` {
+		return
+	}
+	log.Logger.AuditErr(output)
 }
 func (log grpcLogger) Errorln(args ...interface{}) {
 	log.Logger.AuditErr(fmt.Sprintln(args...))
@@ -124,14 +113,13 @@ func (log grpcLogger) Warningln(args ...interface{}) {
 	log.Errorln(args...)
 }
 
+// Don't log any INFO-level gRPC stuff. In practice this is all noise, like
+// failed TXT lookups for service discovery (we only use A records).
 func (log grpcLogger) Info(args ...interface{}) {
-	log.Logger.Info(fmt.Sprintln(args...))
 }
 func (log grpcLogger) Infof(format string, args ...interface{}) {
-	log.Logger.Infof(format, args...)
 }
 func (log grpcLogger) Infoln(args ...interface{}) {
-	log.Logger.Info(fmt.Sprintln(args...))
 }
 
 type promLogger struct {
@@ -172,6 +160,12 @@ func NewLogger(logConf SyslogConfig) blog.Logger {
 	FailOnError(err, "Could not connect to Syslog")
 
 	_ = blog.Set(logger)
+	// We set the cfssl logging level to Debug as it
+	// won't actually call logging methods for any
+	// level less than what is set. We will ignore
+	// any logging we don't care about at the syslog
+	// level, so this doesn't cause extraneous logging.
+	cfsslLog.Level = cfsslLog.LevelDebug
 	cfsslLog.SetLogger(cfsslLogger{logger})
 	_ = mysql.SetLogger(mysqlLogger{logger})
 	grpclog.SetLoggerV2(grpcLogger{logger})

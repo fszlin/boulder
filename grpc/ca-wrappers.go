@@ -7,10 +7,10 @@
 package grpc
 
 import (
+	"context"
 	"errors"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
 	caPB "github.com/letsencrypt/boulder/ca/proto"
@@ -34,17 +34,6 @@ func NewCertificateAuthorityClient(inner caPB.CertificateAuthorityClient, innerO
 	return &CertificateAuthorityClientWrapper{inner, innerOCSP}
 }
 
-func (cac CertificateAuthorityClientWrapper) IssueCertificate(ctx context.Context, issueReq *caPB.IssueCertificateRequest) (core.Certificate, error) {
-	if cac.inner == nil {
-		return core.Certificate{}, errors.New("this CA client does not support issuing certificates")
-	}
-	res, err := cac.inner.IssueCertificate(ctx, issueReq)
-	if err != nil {
-		return core.Certificate{}, err
-	}
-	return pbToCert(res)
-}
-
 func (cac CertificateAuthorityClientWrapper) IssuePrecertificate(ctx context.Context, issueReq *caPB.IssueCertificateRequest) (*caPB.IssuePrecertificateResponse, error) {
 	if cac.inner == nil {
 		return nil, errors.New("this CA client does not support issuing precertificates")
@@ -53,7 +42,7 @@ func (cac CertificateAuthorityClientWrapper) IssuePrecertificate(ctx context.Con
 	if err != nil {
 		return nil, err
 	}
-	if resp.DER == nil {
+	if resp == nil || resp.DER == nil {
 		return nil, errIncompleteResponse
 	}
 	return resp, nil
@@ -67,7 +56,7 @@ func (cac CertificateAuthorityClientWrapper) IssueCertificateForPrecertificate(c
 	if err != nil {
 		return core.Certificate{}, err
 	}
-	return pbToCert(res)
+	return PBToCert(res)
 }
 
 func (cac CertificateAuthorityClientWrapper) GenerateOCSP(ctx context.Context, ocspReq core.OCSPSigningRequest) ([]byte, error) {
@@ -90,6 +79,9 @@ func (cac CertificateAuthorityClientWrapper) GenerateOCSP(ctx context.Context, o
 	if err != nil {
 		return nil, err
 	}
+	if res == nil || res.Response == nil {
+		return nil, errIncompleteResponse
+	}
 	return res.Response, nil
 }
 
@@ -102,26 +94,11 @@ func NewCertificateAuthorityServer(inner core.CertificateAuthority) *Certificate
 	return &CertificateAuthorityServerWrapper{inner}
 }
 
-func (cas *CertificateAuthorityServerWrapper) IssueCertificate(ctx context.Context, request *caPB.IssueCertificateRequest) (*corepb.Certificate, error) {
-	cert, err := cas.inner.IssueCertificate(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	return certToPB(cert), nil
-}
-
 func (cas *CertificateAuthorityServerWrapper) IssuePrecertificate(ctx context.Context, request *caPB.IssueCertificateRequest) (*caPB.IssuePrecertificateResponse, error) {
 	if request == nil || request.Csr == nil || request.OrderID == nil || request.RegistrationID == nil {
 		return nil, errIncompleteRequest
 	}
-	resp, err := cas.inner.IssuePrecertificate(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	if resp.DER == nil {
-		return nil, errIncompleteRequest
-	}
-	return resp, nil
+	return cas.inner.IssuePrecertificate(ctx, request)
 }
 
 func (cas *CertificateAuthorityServerWrapper) IssueCertificateForPrecertificate(ctx context.Context, req *caPB.IssueCertificateForPrecertificateRequest) (*corepb.Certificate, error) {
@@ -132,15 +109,18 @@ func (cas *CertificateAuthorityServerWrapper) IssueCertificateForPrecertificate(
 	if err != nil {
 		return nil, err
 	}
-	return certToPB(cert), nil
+	return CertToPB(cert), nil
 }
 
-func (cas *CertificateAuthorityServerWrapper) GenerateOCSP(ctx context.Context, request *caPB.GenerateOCSPRequest) (*caPB.OCSPResponse, error) {
+func (cas *CertificateAuthorityServerWrapper) GenerateOCSP(ctx context.Context, req *caPB.GenerateOCSPRequest) (*caPB.OCSPResponse, error) {
+	if req.CertDER == nil || req.Status == nil || req.Reason == nil || req.RevokedAt == nil {
+		return nil, errIncompleteRequest
+	}
 	res, err := cas.inner.GenerateOCSP(ctx, core.OCSPSigningRequest{
-		CertDER:   request.CertDER,
-		Status:    *request.Status,
-		Reason:    revocation.Reason(*request.Reason),
-		RevokedAt: time.Unix(0, *request.RevokedAt),
+		CertDER:   req.CertDER,
+		Status:    *req.Status,
+		Reason:    revocation.Reason(*req.Reason),
+		RevokedAt: time.Unix(0, *req.RevokedAt),
 	})
 	if err != nil {
 		return nil, err

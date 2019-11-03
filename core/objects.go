@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/square/go-jose.v2"
 
+	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/revocation"
 )
@@ -22,12 +23,6 @@ type AcmeStatus string
 
 // AcmeResource values identify different types of ACME resources
 type AcmeResource string
-
-// Buffer is a variable-length collection of bytes
-type Buffer []byte
-
-// IdentifierType defines the available identification mechanisms for domains
-type IdentifierType string
 
 // OCSPStatus defines the state of OCSP for a domain
 type OCSPStatus string
@@ -42,11 +37,6 @@ const (
 	StatusInvalid     = AcmeStatus("invalid")     // Validation failed
 	StatusRevoked     = AcmeStatus("revoked")     // Object no longer valid
 	StatusDeactivated = AcmeStatus("deactivated") // Object has been deactivated
-)
-
-// These types are the available identification mechanisms
-const (
-	IdentifierDNS = IdentifierType("dns")
 )
 
 // The types of ACME resources
@@ -89,16 +79,6 @@ func ValidChallenge(name string) bool {
 // DNSPrefix is attached to DNS names in DNS challenges
 const DNSPrefix = "_acme-challenge"
 
-// An AcmeIdentifier encodes an identifier that can
-// be validated by ACME.  The protocol allows for different
-// types of identifier to be supported (DNS names, IP
-// addresses, etc.), but currently we only support
-// domain names.
-type AcmeIdentifier struct {
-	Type  IdentifierType `json:"type"`  // The type of identifier being encoded
-	Value string         `json:"value"` // The identifier itself
-}
-
 // CertificateRequest is just a CSR
 //
 // This data is unmarshalled from JSON by way of RawCertificateRequest, which
@@ -140,7 +120,7 @@ func (cr CertificateRequest) MarshalJSON() ([]byte, error) {
 // to account keys.
 type Registration struct {
 	// Unique identifier
-	ID int64 `json:"id" db:"id"`
+	ID int64 `json:"id,omitempty" db:"id"`
 
 	// Account key to which the details are attached
 	Key *jose.JSONWebKey `json:"key"`
@@ -163,9 +143,6 @@ type Registration struct {
 // ValidationRecord represents a validation attempt against a specific URL/hostname
 // and the IP addresses that were resolved and used
 type ValidationRecord struct {
-	// DNS only
-	Authorities []string `json:"-"`
-
 	// SimpleHTTP only
 	URL string `json:"url,omitempty"`
 
@@ -211,13 +188,6 @@ func looksLikeKeyAuthorization(str string) error {
 // challenge, we just throw all the elements into one bucket,
 // together with the common metadata elements.
 type Challenge struct {
-	// ID was previously used to uniquely identify a challenge in the database and
-	// by users in the WFE. The ID is only populated when a challenge is added to
-	// the database. When features.NewAuthorizationSchema is enabled it is no
-	// longer populated at all and must not be relied upon in order to uniquely
-	// identify a challenge when transiting the RPC or storage layers.
-	ID int64 `json:"id,omitempty"`
-
 	// The type of challenge
 	Type string `json:"type"`
 
@@ -351,7 +321,7 @@ func (ch Challenge) StringID() string {
 	h := fnv.New128a()
 	h.Write([]byte(ch.Token))
 	h.Write([]byte(ch.Type))
-	return base64.URLEncoding.EncodeToString(h.Sum(nil)[0:4])
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil)[0:4])
 }
 
 // Authorization represents the authorization of an account key holder
@@ -364,7 +334,7 @@ type Authorization struct {
 	ID string `json:"id,omitempty" db:"id"`
 
 	// The identifier for which authorization is being given
-	Identifier AcmeIdentifier `json:"identifier,omitempty" db:"identifier"`
+	Identifier identifier.ACMEIdentifier `json:"identifier,omitempty" db:"identifier"`
 
 	// The registration ID associated with the authorization
 	RegistrationID int64 `json:"regId,omitempty" db:"registrationID"`
@@ -389,8 +359,7 @@ type Authorization struct {
 	// slice and the order of these challenges may not be predictable.
 	Challenges []Challenge `json:"challenges,omitempty" db:"-"`
 
-	// The server may suggest combinations of challenges if it
-	// requires more than one challenge to be completed.
+	// This field is deprecated. It's filled in by WFE for the ACMEv1 API.
 	Combinations [][]int `json:"combinations,omitempty" db:"combinations"`
 
 	// Wildcard is a Boulder-specific Authorization field that indicates the
@@ -399,22 +368,6 @@ type Authorization struct {
 	// Authorization with the identifier `example.com` and one DNS-01 challenge
 	// corresponds to a name `*.example.com` from an associated order.
 	Wildcard bool `json:"wildcard,omitempty" db:"-"`
-
-	// v2 is used to indicate if the backing storage for this authorization is
-	// the new v2 style. It is not exposed to users.
-	V2 bool `json:"-" db:"-"`
-}
-
-// FindChallenge will look for the given challenge inside this authorization. If
-// found, it will return the index of that challenge within the Authorization's
-// Challenges array. Otherwise it will return -1.
-func (authz *Authorization) FindChallenge(challengeID int64) int {
-	for i, c := range authz.Challenges {
-		if c.ID == challengeID {
-			return i
-		}
-	}
-	return -1
 }
 
 // FindChallengeByStringID will look for a challenge matching the given ID inside
@@ -493,16 +446,6 @@ type Certificate struct {
 	DER     []byte    `db:"der"`
 	Issued  time.Time `db:"issued"`
 	Expires time.Time `db:"expires"`
-}
-
-// IdentifierData holds information about what certificates are known for a
-// given identifier. This is used to present Proof of Possession challenges in
-// the case where a certificate already exists. The DB table holding
-// IdentifierData rows contains information about certs issued by Boulder and
-// also information about certs observed from third parties.
-type IdentifierData struct {
-	ReversedName string `db:"reversedName"` // The label-wise reverse of an identifier, e.g. com.example or com.example.*
-	CertSHA1     string `db:"certSHA1"`     // The hex encoding of the SHA-1 hash of a cert containing the identifier
 }
 
 // CertificateStatus structs are internal to the server. They represent the

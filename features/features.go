@@ -16,46 +16,95 @@ const (
 	ACME13KeyRollover
 	SimplifiedVAHTTP
 	TLSSNIRevalidation
+	AllowRenewalFirstRL
+	SetIssuedNamesRenewalBit
+	FasterRateLimit
+	ProbeCTLogs
+	RevokeAtRA
+	NewAuthorizationSchema
+	DisableAuthz2Orders
+	EarlyOrderRateLimit
+	FasterGetOrderForNames
 
 	//   Currently in-use features
-	AllowRenewalFirstRL
 	// Check CAA and respect validationmethods parameter.
 	CAAValidationMethods
 	// Check CAA and respect accounturi parameter.
 	CAAAccountURI
-	// ProbeCTLogs enables HTTP probes to CT logs from the publisher
-	ProbeCTLogs
 	// HEAD requests to the WFE2 new-nonce endpoint should return HTTP StatusOK
 	// instead of HTTP StatusNoContent.
 	HeadNonceStatusOK
-	// NewAuthorizationSchema enables usage of the new authorization storage schema
-	NewAuthorizationSchema
-	// RevokeAtRA enables revocation in the RA instead of ocsp-updater
-	RevokeAtRA
-	// SetIssuedNamesRenewalBit enables the SA setting the renewal bit for
-	// issuedNames entries during AddCertificate.
-	SetIssuedNamesRenewalBit
-	// EarlyOrderRateLimit enables the RA applying certificate per name/per FQDN
-	// set rate limits in NewOrder in addition to FinalizeOrder.
-	EarlyOrderRateLimit
+	// EnforceMultiVA causes the VA to block on remote VA PerformValidation
+	// requests in order to make a valid/invalid decision with the results.
+	EnforceMultiVA
+	// MultiVAFullResults will cause the main VA to wait for all of the remote VA
+	// results, not just the threshold required to make a decision.
+	MultiVAFullResults
+	// RemoveWFE2AccountID will remove the account ID from account objects returned
+	// from the new-account endpoint if enabled.
+	RemoveWFE2AccountID
+	// CheckRenewalFirst will check whether an issuance is a renewal before
+	// checking the "certificates per name" rate limit.
+	CheckRenewalFirst
+	// MandatoryPOSTAsGET forbids legacy unauthenticated GET requests for ACME
+	// resources.
+	MandatoryPOSTAsGET
+	// Allow creation of new registrations in ACMEv1.
+	AllowV1Registration
+	// Check the failed validation limit in parallel during NewOrder
+	ParallelCheckFailedValidation
+	// Upon authorization validation, delete the challenges that weren't used.
+	DeleteUnusedChallenges
+	// V1DisableNewValidations disables validations for new domain names in the V1
+	// API.
+	V1DisableNewValidations
+	// PrecertificateOCSP ensures that we write an OCSP response immediately upon
+	// generating a precertificate. This also changes the issuance / storage flow,
+	// adding two new calls from CA to SA: AddSerial and AddPrecertificate.
+	PrecertificateOCSP
+	// PrecertificateRevocation allows revocation of precertificates with the
+	// ACMEv2 interface.
+	PrecertificateRevocation
+	// StripDefaultSchemePort enables stripping of default scheme ports from HTTP
+	// request Host headers
+	StripDefaultSchemePort
+	// GetAuthorizationsPerf enables a more performant GetAuthorizations2 query
+	// at the SA.
+	GetAuthorizationsPerf
 )
 
 // List of features and their default value, protected by fMu
 var features = map[FeatureFlag]bool{
-	unused:                   false,
-	AllowRenewalFirstRL:      false,
-	TLSSNIRevalidation:       false,
-	CAAValidationMethods:     false,
-	CAAAccountURI:            false,
-	ACME13KeyRollover:        false,
-	ProbeCTLogs:              false,
-	SimplifiedVAHTTP:         false,
-	PerformValidationRPC:     false,
-	HeadNonceStatusOK:        false,
-	NewAuthorizationSchema:   false,
-	RevokeAtRA:               false,
-	SetIssuedNamesRenewalBit: false,
-	EarlyOrderRateLimit:      false,
+	unused:                        false,
+	AllowRenewalFirstRL:           false,
+	TLSSNIRevalidation:            false,
+	CAAValidationMethods:          false,
+	CAAAccountURI:                 false,
+	ACME13KeyRollover:             false,
+	ProbeCTLogs:                   false,
+	SimplifiedVAHTTP:              false,
+	PerformValidationRPC:          false,
+	HeadNonceStatusOK:             false,
+	NewAuthorizationSchema:        false,
+	RevokeAtRA:                    false,
+	SetIssuedNamesRenewalBit:      false,
+	EarlyOrderRateLimit:           false,
+	EnforceMultiVA:                false,
+	MultiVAFullResults:            false,
+	RemoveWFE2AccountID:           false,
+	FasterRateLimit:               false,
+	CheckRenewalFirst:             false,
+	MandatoryPOSTAsGET:            false,
+	DisableAuthz2Orders:           false,
+	FasterGetOrderForNames:        false,
+	AllowV1Registration:           true,
+	ParallelCheckFailedValidation: false,
+	DeleteUnusedChallenges:        false,
+	V1DisableNewValidations:       false,
+	PrecertificateOCSP:            false,
+	PrecertificateRevocation:      false,
+	StripDefaultSchemePort:        false,
+	GetAuthorizationsPerf:         false,
 }
 
 var fMu = new(sync.RWMutex)

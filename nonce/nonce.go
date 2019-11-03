@@ -15,22 +15,25 @@ package nonce
 
 import (
 	"container/heap"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"math/big"
 	"sync"
 	"time"
 
 	"github.com/letsencrypt/boulder/metrics"
+	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 )
 
-// MaxUsed defines the maximum number of Nonces we're willing to hold in
-// memory.
-const MaxUsed = 65536
-const nonceLen = 32
+const (
+	defaultMaxUsed = 65536
+	nonceLen       = 32
+)
 
 var errInvalidNonceLength = errors.New("invalid nonce length")
 
@@ -43,6 +46,7 @@ type NonceService struct {
 	usedHeap *int64Heap
 	gcm      cipher.AEAD
 	maxUsed  int
+	prefix   string
 	stats    metrics.Scope
 }
 
@@ -65,8 +69,24 @@ func (h *int64Heap) Pop() interface{} {
 }
 
 // NewNonceService constructs a NonceService with defaults
-func NewNonceService(scope metrics.Scope) (*NonceService, error) {
+func NewNonceService(scope metrics.Scope, maxUsed int, prefix string) (*NonceService, error) {
 	scope = scope.NewScope("NonceService")
+
+	// If a prefix is provided it must be four characters and valid
+	// base64. The prefix is required to be base64url as RFC8555
+	// section 6.5.1 requires that nonces use that encoding.
+	// As base64 operates on three byte binary segments we require
+	// the prefix to be three bytes (four characters) so that the
+	// bytes preceding the prefix wouldn't impact the encoding.
+	if prefix != "" {
+		if len(prefix) != 4 {
+			return nil, errors.New("nonce prefix must be 4 characters")
+		}
+		if _, err := base64.RawURLEncoding.DecodeString(prefix); err != nil {
+			return nil, errors.New("nonce prefix must be valid base64url")
+		}
+	}
+
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
@@ -81,13 +101,18 @@ func NewNonceService(scope metrics.Scope) (*NonceService, error) {
 		panic("Failure in NewGCM: " + err.Error())
 	}
 
+	if maxUsed <= 0 {
+		maxUsed = defaultMaxUsed
+	}
+
 	return &NonceService{
 		earliest: 0,
 		latest:   0,
-		used:     make(map[int64]bool, MaxUsed),
+		used:     make(map[int64]bool, maxUsed),
 		usedHeap: &int64Heap{},
 		gcm:      gcm,
-		maxUsed:  MaxUsed,
+		maxUsed:  maxUsed,
+		prefix:   prefix,
 		stats:    scope,
 	}, nil
 }
@@ -113,11 +138,24 @@ func (ns *NonceService) encrypt(counter int64) (string, error) {
 	ct := ns.gcm.Seal(nil, nonce, pt, nil)
 	copy(ret, nonce[4:])
 	copy(ret[8:], ct)
-	return base64.RawURLEncoding.EncodeToString(ret), nil
+
+	return ns.prefix + base64.RawURLEncoding.EncodeToString(ret), nil
 }
 
 func (ns *NonceService) decrypt(nonce string) (int64, error) {
-	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	body := nonce
+	if ns.prefix != "" {
+		var prefix string
+		var err error
+		prefix, body, err = splitNonce(nonce)
+		if err != nil {
+			return 0, err
+		}
+		if ns.prefix != prefix {
+			return 0, fmt.Errorf("nonce contains invalid prefix: expected %q, got %q", ns.prefix, prefix)
+		}
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		return 0, err
 	}
@@ -188,4 +226,29 @@ func (ns *NonceService) Valid(nonce string) bool {
 
 	ns.stats.Inc("Valid", 1)
 	return true
+}
+
+func splitNonce(nonce string) (string, string, error) {
+	if len(nonce) < 4 {
+		return "", "", errInvalidNonceLength
+	}
+	return nonce[:4], nonce[4:], nil
+}
+
+// RemoteRedeem checks the nonce prefix and routes the Redeem RPC
+// to the associated remote nonce service
+func RemoteRedeem(ctx context.Context, noncePrefixMap map[string]noncepb.NonceServiceClient, nonce string) (bool, error) {
+	prefix, _, err := splitNonce(nonce)
+	if err != nil {
+		return false, nil
+	}
+	nonceService, present := noncePrefixMap[prefix]
+	if !present {
+		return false, nil
+	}
+	resp, err := nonceService.Redeem(ctx, &noncepb.NonceMessage{Nonce: nonce})
+	if err != nil {
+		return false, err
+	}
+	return resp.Valid, nil
 }
