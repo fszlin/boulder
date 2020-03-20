@@ -18,6 +18,7 @@ import (
 
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/db"
 	berrors "github.com/letsencrypt/boulder/errors"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -27,8 +28,7 @@ import (
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_model/go"
-	"gopkg.in/go-gorp/gorp.v2"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	"gopkg.in/square/go-jose.v2"
 )
 
@@ -114,7 +114,7 @@ func TestSendNags(t *testing.T) {
 		subjectTemplate: staticTmpl,
 		rs:              rs,
 		clk:             fc,
-		stats:           initStats(metrics.NewNoopScope()),
+		stats:           initStats(metrics.NoopRegisterer),
 	}
 
 	cert := &x509.Certificate{
@@ -401,7 +401,7 @@ func addExpiringCerts(t *testing.T, ctx *testCtx) []core.Certificate {
 
 func countGroupsAtCapacity(group string, counter *prometheus.GaugeVec) int {
 	ch := make(chan prometheus.Metric, 10)
-	counter.With(prometheus.Labels{"nagGroup": group}).Collect(ch)
+	counter.With(prometheus.Labels{"nag_group": group}).Collect(ch)
 	m := <-ch
 	var iom io_prometheus_client.Metric
 	_ = m.Write(&iom)
@@ -435,6 +435,9 @@ func TestFindCertsAtCapacity(t *testing.T) {
 	err = testCtx.m.findExpiringCertificates()
 	test.AssertNotError(t, err, "Failed to find expiring certs")
 	test.AssertEquals(t, len(testCtx.mc.Messages), 0)
+
+	// The "48h0m0s" nag group should now be reporting that it isn't at capacity
+	test.AssertEquals(t, countGroupsAtCapacity("48h0m0s", testCtx.m.stats.nagsAtCapacity), 0)
 }
 
 func TestCertIsRenewed(t *testing.T) {
@@ -798,7 +801,7 @@ func TestDedupOnRegistration(t *testing.T) {
 }
 
 type testCtx struct {
-	dbMap   *gorp.DbMap
+	dbMap   *db.WrappedMap
 	ssa     core.StorageAdder
 	mc      *mocks.Mailer
 	fc      clock.FakeClock
@@ -814,7 +817,7 @@ func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 		t.Fatalf("Couldn't connect the database: %s", err)
 	}
 	fc := newFakeClock(t)
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc, log, metrics.NewNoopScope(), 1)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc, log, metrics.NoopRegisterer, 1)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}
@@ -837,7 +840,7 @@ func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 		nagTimes:        offsetNags,
 		limit:           100,
 		clk:             fc,
-		stats:           initStats(metrics.NewNoopScope()),
+		stats:           initStats(metrics.NoopRegisterer),
 	}
 	return &testCtx{
 		dbMap:   dbMap,

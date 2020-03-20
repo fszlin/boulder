@@ -3,6 +3,7 @@ package va
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	mrand "math/rand"
@@ -22,6 +23,7 @@ import (
 	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test"
+	"github.com/miekg/dns"
 
 	"testing"
 )
@@ -210,7 +212,7 @@ func TestExtractRequestTarget(t *testing.T) {
 			ExpectedError: fmt.Errorf("redirect HTTP request was nil"),
 		},
 		{
-			Name: "invalid protocal scheme",
+			Name: "invalid protocol scheme",
 			Req: &http.Request{
 				URL: mustURL(t, "gopher://letsencrypt.org"),
 			},
@@ -305,6 +307,64 @@ func TestExtractRequestTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHTTPValidationDNSError attempts validation for a domain name that always
+// generates a DNS error, and checks that a log line with the detailed error is
+// generated.
+func TestHTTPValidationDNSError(t *testing.T) {
+	va, mockLog := setup(nil, 0, "", nil)
+
+	_, _, prob := va.fetchHTTP(ctx, "always.error", "/.well-known/acme-challenge/whatever")
+	test.AssertError(t, prob, "Expected validation fetch to fail")
+	matchingLines := mockLog.GetAllMatching(`read udp: some net error`)
+	if len(matchingLines) != 1 {
+		t.Errorf("Didn't see expected DNS error logged. Instead, got:\n%s",
+			strings.Join(mockLog.GetAllMatching(`.*`), "\n"))
+	}
+}
+
+// TestHTTPValidationDNSIdMismatchError tests that performing an HTTP-01
+// challenge with a domain name that always returns a DNS ID mismatch error from
+// the mock resolver results in valid query/response data being logged in
+// a format we can decode successfully.
+func TestHTTPValidationDNSIdMismatchError(t *testing.T) {
+	va, mockLog := setup(nil, 0, "", nil)
+
+	_, _, prob := va.fetchHTTP(ctx, "id.mismatch", "/.well-known/acme-challenge/whatever")
+	test.AssertError(t, prob, "Expected validation fetch to fail")
+	matchingLines := mockLog.GetAllMatching(`logDNSError ID mismatch`)
+	if len(matchingLines) != 1 {
+		t.Errorf("Didn't see expected DNS error logged. Instead, got:\n%s",
+			strings.Join(mockLog.GetAllMatching(`.*`), "\n"))
+	}
+	expectedRegex := regexp.MustCompile(
+		`ERR: \[AUDIT\] logDNSError ID mismatch ` +
+			`chosenServer=\[mock.server\] ` +
+			`hostname=\[id\.mismatch\] ` +
+			`respHostname=\[id\.mismatch\.\] ` +
+			`queryType=\[A\] ` +
+			`err\=\[dns: id mismatch\] ` +
+			`msg=\[([A-Za-z0-9+=/\=]+)\] ` +
+			`resp=\[([A-Za-z0-9+=/\=]+)\]`,
+	)
+
+	matches := expectedRegex.FindAllStringSubmatch(matchingLines[0], -1)
+	test.AssertEquals(t, len(matches), 1)
+	submatches := matches[0]
+	test.AssertEquals(t, len(submatches), 3)
+
+	msgBytes, err := base64.StdEncoding.DecodeString(submatches[1])
+	test.AssertNotError(t, err, "bad base64 encoded query msg")
+	msg := new(dns.Msg)
+	err = msg.Unpack(msgBytes)
+	test.AssertNotError(t, err, "bad packed query msg")
+
+	respBytes, err := base64.StdEncoding.DecodeString(submatches[2])
+	test.AssertNotError(t, err, "bad base64 encoded resp msg")
+	resp := new(dns.Msg)
+	err = resp.Unpack(respBytes)
+	test.AssertNotError(t, err, "bad packed response msg")
 }
 
 func TestSetupHTTPValidation(t *testing.T) {
@@ -1167,7 +1227,7 @@ func TestHTTPDialTimeout(t *testing.T) {
 
 	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
 	// The only method I've found so far to trigger a connect timeout is to
-	// connect to an unrouteable IP address. This usuall generates a connection
+	// connect to an unrouteable IP address. This usually generates a connection
 	// timeout, but will rarely return "Network unreachable" instead. If we get
 	// that, just retry until we get something other than "Network unreachable".
 	var prob *probs.ProblemDetails

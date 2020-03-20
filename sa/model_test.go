@@ -102,7 +102,7 @@ func TestV2AuthzModel(t *testing.T) {
 	model, err := authzPBToModel(authzPB)
 	test.AssertNotError(t, err, "authzPBToModel failed")
 
-	authzPBOut, err := modelToAuthzPB(model)
+	authzPBOut, err := modelToAuthzPB(*model)
 	test.AssertNotError(t, err, "modelToAuthzPB failed")
 	test.AssertDeepEquals(t, authzPB.Challenges, authzPBOut.Challenges)
 
@@ -114,7 +114,7 @@ func TestV2AuthzModel(t *testing.T) {
 	model, err = authzPBToModel(authzPB)
 	test.AssertNotError(t, err, "authzPBToModel failed")
 
-	authzPBOut, err = modelToAuthzPB(model)
+	authzPBOut, err = modelToAuthzPB(*model)
 	test.AssertNotError(t, err, "modelToAuthzPB failed")
 	test.AssertDeepEquals(t, authzPB.Challenges, authzPBOut.Challenges)
 
@@ -178,24 +178,24 @@ func TestPopulateAttemptedFieldsBadJSON(t *testing.T) {
 
 	testCases := []struct {
 		Name  string
-		Model *authz2Model
+		Model *authzModel
 	}{
 		{
 			Name: "Bad validation error field",
-			Model: &authz2Model{
+			Model: &authzModel{
 				ValidationError: badJSON,
 			},
 		},
 		{
 			Name: "Bad validation record field",
-			Model: &authz2Model{
+			Model: &authzModel{
 				ValidationRecord: badJSON,
 			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			err := populateAttemptedFields(tc.Model, &corepb.Challenge{})
+			err := populateAttemptedFields(*tc.Model, &corepb.Challenge{})
 			test.AssertError(t, err, "expected error from populateAttemptedFields")
 			badJSONErr, ok := err.(errBadJSON)
 			test.AssertEquals(t, ok, true)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 This file contains basic infrastructure for running the integration test cases.
@@ -31,6 +31,13 @@ from helpers import *
 
 from acme import challenges
 
+# Set the environment variable RACE to anything other than 'true' to disable
+# race detection. This significantly speeds up integration testing cycles
+# locally.
+race_detection = True
+if os.environ.get('RACE', 'true') != 'true':
+    race_detection = False
+
 def run_client_tests():
     root = os.environ.get("CERTBOT_PATH")
     assert root is not None, (
@@ -48,8 +55,11 @@ def run_go_tests(filterPattern=None):
     cmdLine = [ "go", "test", ]
     if filterPattern is not None and filterPattern != "":
         cmdLine = cmdLine + ["--test.run", filterPattern]
-    cmdLine = cmdLine + ["-tags", "integration", "-count=1", "./test/integration"]
-    return subprocess.check_call(cmdLine, shell=False, stderr=subprocess.STDOUT)
+    cmdLine = cmdLine + ["-tags", "integration", "-count=1", "-race", "./test/integration"]
+    try:
+        subprocess.check_call(cmdLine, shell=False, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        raise(Exception("%s. Output:\n%s" % (e, e.output)))
 
 def run_expired_authz_purger():
     # Note: This test must be run after all other tests that depend on
@@ -60,13 +70,13 @@ def run_expired_authz_purger():
         tool = "expired-authz-purger2"
         out = get_future_output("./bin/expired-authz-purger2 --single-run --config cmd/expired-authz-purger2/config.json", target_time)
         if 'via FAKECLOCK' not in out:
-            raise Exception("%s was not built with `integration` build tag" % (tool))
+            raise(Exception("%s was not built with `integration` build tag" % (tool)))
         if num is None:
             return
         expected_output = 'deleted %d expired authorizations' % (num)
         if expected_output not in out:
-            raise Exception("%s did not print '%s'.  Output:\n%s" % (
-                  tool, expected_output, out))
+            raise(Exception("%s did not print '%s'.  Output:\n%s" % (
+                  tool, expected_output, out)))
 
     now = datetime.datetime.utcnow()
 
@@ -98,7 +108,7 @@ def run_janitor():
     e.setdefault("FAKECLOCK", fakeclock(target_time))
 
     # Note: Must use exec here so that killing this process kills the command.
-    cmdline = "exec ./bin/boulder-janitor --config test/config-next/janitor.json"
+    cmdline = "exec ./bin/boulder-janitor --config {0}/janitor.json".format(config_dir)
     p = subprocess.Popen(cmdline, shell=True, env=e)
 
     # Wait for the janitor to come up
@@ -112,7 +122,7 @@ def run_janitor():
     def get_stat_line(port, stat):
         url = "http://localhost:%d/metrics" % port
         response = requests.get(url)
-        for l in response.content.split("\n"):
+        for l in response.text.split("\n"):
             if l.strip().startswith(stat):
                 return l
         return None
@@ -120,7 +130,7 @@ def run_janitor():
     def stat_value(line):
         parts = line.split(" ")
         if len(parts) != 2:
-            raise Exception("stat line {0} was missing required parts".format(line))
+            raise(Exception("stat line {0} was missing required parts".format(line)))
         return parts[1]
 
     # Wait for the janitor to finish its work. The easiest way to tell this
@@ -129,11 +139,12 @@ def run_janitor():
     attempts = 0
     while True:
         if attempts > 5:
-            raise Exception("timed out waiting for janitor workbatch counts to stabilize")
+            raise(Exception("timed out waiting for janitor workbatch counts to stabilize"))
 
         certStatusWorkBatch = get_stat_line(8014, statline("workbatch", "certificateStatus"))
         certsWorkBatch = get_stat_line(8014, statline("workbatch", "certificates"))
         certsPerNameWorkBatch = get_stat_line(8014, statline("workbatch", "certificatesPerName"))
+        ordersWorkBatch = get_stat_line(8014, statline("workbatch", "orders"))
 
         # sleep for double the configured workSleep for each job
         time.sleep(1)
@@ -141,10 +152,12 @@ def run_janitor():
         newCertStatusWorkBatch = get_stat_line(8014, statline("workbatch", "certificateStatus"))
         newCertsWorkBatch = get_stat_line(8014, statline("workbatch", "certificates"))
         newCertsPerNameWorkBatch = get_stat_line(8014, statline("workbatch", "certificatesPerName"))
+        newOrdersWorkBatch = get_stat_line(8014, statline("workbatch", "orders"))
 
         if (certStatusWorkBatch == newCertStatusWorkBatch 
             and certsWorkBatch == newCertsWorkBatch 
-            and certsPerNameWorkBatch == newCertsPerNameWorkBatch):
+            and certsPerNameWorkBatch == newCertsPerNameWorkBatch
+            and ordersWorkBatch == newOrdersWorkBatch):
             break
 
         attempts = attempts + 1
@@ -154,26 +167,28 @@ def run_janitor():
         certStatusDeletes = get_stat_line(8014, statline("deletions", "certificateStatus"))
         certsDeletes = get_stat_line(8014, statline("deletions", "certificates"))
         certsPerNameDeletes = get_stat_line(8014, statline("deletions", "certificatesPerName"))
+        ordersDeletes = get_stat_line(8014, statline("deletions", "orders"))
 
-        if certStatusDeletes is None or certsDeletes is None or certsPerNameDeletes is None:
+        if certStatusDeletes is None or certsDeletes is None or certsPerNameDeletes is None or ordersDeletes is None:
             print("delete stats not present after check {0}. Sleeping".format(i))
             time.sleep(2)
             continue
 
-        for l in [certStatusDeletes, certsDeletes, certsPerNameDeletes]:
+        for l in [certStatusDeletes, certsDeletes, certsPerNameDeletes, ordersDeletes]:
             if stat_value(l) == "0":
-                raise Exception("Expected a non-zero number of deletes to be performed. Found {0}".format(l))
+                raise(Exception("Expected a non-zero number of deletes to be performed. Found {0}".format(l)))
 
     # Check that all error stats are empty
     errorStats = [
       statline("errors", "certificateStatus"),
       statline("errors", "certificates"),
       statline("errors", "certificatesPerName"),
+      statline("errors", "orders"),
     ]
     for eStat in errorStats:
         actual = get_stat_line(8014, eStat)
         if actual is not None:
-            raise Exception("Expected to find no error stat lines but found {0}\n".format(eStat))
+            raise(Exception("Expected to find no error stat lines but found {0}\n".format(eStat)))
 
     # Terminate the janitor
     p.terminate()
@@ -216,9 +231,9 @@ def test_stats():
     def expect_stat(port, stat):
         url = "http://localhost:%d/metrics" % port
         response = requests.get(url)
-        if not stat in response.content:
+        if not stat in response.text:
             print(response.content)
-            raise Exception("%s not present in %s" % (stat, url))
+            raise(Exception("%s not present in %s" % (stat, url)))
     expect_stat(8000, "\nresponse_time_count{")
     expect_stat(8000, "\ngo_goroutines ")
     expect_stat(8000, '\ngrpc_client_handling_seconds_count{grpc_method="NewRegistration",grpc_service="ra.RegistrationAuthority",grpc_type="unary"} ')
@@ -246,27 +261,27 @@ def main():
         test_case_filter="", skip_setup=False)
     args = parser.parse_args()
 
-    if not (args.run_certbot or args.run_chisel or args.run_loadtest or args.custom is not None):
-        raise Exception("must run at least one of the letsencrypt or chisel tests with --certbot, --chisel, or --custom")
+    if not (args.run_certbot or args.run_chisel or args.custom is not None):
+        raise(Exception("must run at least one of the letsencrypt or chisel tests with --certbot, --chisel, or --custom"))
 
     if not args.test_case_filter:
         now = datetime.datetime.utcnow()
 
         six_months_ago = now+datetime.timedelta(days=-30*6)
-        if not startservers.start(race_detection=True, fakeclock=fakeclock(six_months_ago)):
-            raise Exception("startservers failed (mocking six months ago)")
+        if not startservers.start(race_detection=race_detection, fakeclock=fakeclock(six_months_ago)):
+            raise(Exception("startservers failed (mocking six months ago)"))
         v1_integration.caa_client = caa_client = chisel.make_client()
         setup_six_months_ago()
         startservers.stop()
 
         twenty_days_ago = now+datetime.timedelta(days=-20)
-        if not startservers.start(race_detection=True, fakeclock=fakeclock(twenty_days_ago)):
-            raise Exception("startservers failed (mocking twenty days ago)")
+        if not startservers.start(race_detection=race_detection, fakeclock=fakeclock(twenty_days_ago)):
+            raise(Exception("startservers failed (mocking twenty days ago)"))
         setup_twenty_days_ago()
         startservers.stop()
 
-    if not startservers.start(race_detection=True, fakeclock=None):
-        raise Exception("startservers failed")
+    if not startservers.start(race_detection=race_detection, fakeclock=None):
+        raise(Exception("startservers failed"))
 
     if args.run_chisel:
         run_chisel(args.test_case_filter)
@@ -299,10 +314,48 @@ def main():
         run_loadtest()
 
     if not startservers.check():
-        raise Exception("startservers.check failed")
+        raise(Exception("startservers.check failed"))
+
+    # This test is flaky, so it's temporarily disabled.
+    # TODO(#4583): Re-enable this test.
+    #check_slow_queries()
 
     global exit_status
     exit_status = 0
+
+def check_slow_queries():
+    """Checks that we haven't run any slow queries during the integration test.
+
+    This depends on flags set on mysqld in docker-compose.yml.
+
+    We skip the boulder_sa_test database because we manually run a bunch of
+    non-indexed queries in unittests. We skip actions by the setup and root
+    users because they're known to be non-indexed. Similarly we skip the
+    cert_checker, mailer, and janitor's work because they are known to be
+    slow (though we should eventually improve these).
+    The SELECT ... IN () on the authz2 table shows up in the slow query log
+    a lot. Presumably when there are a lot of entries in the IN() argument
+    and the table is small, it's not efficient to use the index. But we
+    should dig into this more.
+    """
+    query = """
+        SELECT * FROM mysql.slow_log
+            WHERE db != 'boulder_sa_test'
+            AND user_host NOT LIKE "test_setup%"
+            AND user_host NOT LIKE "root%"
+            AND user_host NOT LIKE "cert_checker%"
+            AND user_host NOT LIKE "mailer%"
+            AND user_host NOT LIKE "janitor%"
+            AND sql_text NOT LIKE 'SELECT status, expires FROM authz2 WHERE id IN %'
+            AND sql_text NOT LIKE '%LEFT JOIN orderToAuthz2 %'
+        \G
+    """
+    output = subprocess.check_output(
+      ["mysql", "-h", "boulder-mysql", "-e", query],
+      stderr=subprocess.STDOUT).decode()
+    if len(output) > 0:
+        print(output)
+        raise Exception("Found slow queries in the slow query log")
 
 def run_chisel(test_case_filter):
     for key, value in inspect.getmembers(v1_integration):
@@ -350,7 +403,7 @@ def check_balance():
     for address in addresses:
         metrics = requests.get("http://%s/metrics" % address)
         if not "grpc_server_handled_total" in metrics.text:
-            raise Exception("no gRPC traffic processed by %s; load balancing problem?"
+            raise(Exception("no gRPC traffic processed by %s; load balancing problem?")
                 % address)
 
 def run_cert_checker():
@@ -360,7 +413,7 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as e:
-        raise Exception("%s. Output:\n%s" % (e, e.output))
+        raise(Exception("%s. Output:\n%s" % (e, e.output)))
 
 @atexit.register
 def stop():

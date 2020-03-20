@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
-	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,10 +18,10 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"gopkg.in/go-gorp/gorp.v2"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/db"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
@@ -44,7 +43,7 @@ type regStore interface {
 
 type mailer struct {
 	log             blog.Logger
-	dbMap           *gorp.DbMap
+	dbMap           *db.WrappedMap
 	rs              regStore
 	mailer          bmail.Mailer
 	emailTemplate   *template.Template
@@ -303,11 +302,11 @@ func (m *mailer) findExpiringCertificates() error {
 			var cert core.Certificate
 			cert, err := sa.SelectCertificate(m.dbMap, "WHERE serial = ?", serial)
 			if err != nil {
-				// We can get an ErrNoRows when processing a serial number corresponding
+				// We can get a NoRowsErr when processing a serial number corresponding
 				// to a precertificate with no final certificate. Since this certificate
 				// is not being used by a subscriber, we don't send expiration email about
 				// it.
-				if err == sql.ErrNoRows {
+				if db.IsNoRows(err) {
 					continue
 				}
 				m.log.AuditErrf("expiration-mailer: Error loading cert %q: %s", cert.Serial, err)
@@ -319,10 +318,6 @@ func (m *mailer) findExpiringCertificates() error {
 		m.log.Infof("Found %d certificates expiring between %s and %s", len(certs),
 			left.Format("2006-01-02 03:04"), right.Format("2006-01-02 03:04"))
 
-		if len(certs) == 0 {
-			continue // nothing to do
-		}
-
 		// If the `certs` result was exactly `m.limit` rows we need to increment
 		// a stat indicating that this nag group is at capacity based on the
 		// configured cert limit. If this condition continually occurs across mailer
@@ -330,10 +325,16 @@ func (m *mailer) findExpiringCertificates() error {
 		// mails. The effects of this were initially described in issue #2002[0].
 		//
 		// 0: https://github.com/letsencrypt/boulder/issues/2002
+		atCapacity := float64(0)
 		if len(certs) == m.limit {
 			m.log.Infof("nag group %s expiring certificates at configured capacity (cert limit %d)",
 				expiresIn.String(), m.limit)
-			m.stats.nagsAtCapacity.With(prometheus.Labels{"nagGroup": expiresIn.String()}).Set(1)
+			atCapacity = float64(1)
+		}
+		m.stats.nagsAtCapacity.With(prometheus.Labels{"nag_group": expiresIn.String()}).Set(atCapacity)
+
+		if len(certs) == 0 {
+			continue // nothing to do
 		}
 
 		processingStarted := m.clk.Now()
@@ -393,14 +394,14 @@ type config struct {
 	Syslog cmd.SyslogConfig
 }
 
-func initStats(scope metrics.Scope) mailerStats {
+func initStats(stats prometheus.Registerer) mailerStats {
 	nagsAtCapacity := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "nagsAtCapacity",
+			Name: "nags_at_capacity",
 			Help: "Count of nag groups at capcacity",
 		},
-		[]string{"nagGroup"})
-	scope.MustRegister(nagsAtCapacity)
+		[]string{"nag_group"})
+	stats.MustRegister(nagsAtCapacity)
 
 	errorCount := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -408,7 +409,7 @@ func initStats(scope metrics.Scope) mailerStats {
 			Help: "Number of errors",
 		},
 		[]string{"type"})
-	scope.MustRegister(errorCount)
+	stats.MustRegister(errorCount)
 
 	renewalCount := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -416,22 +417,22 @@ func initStats(scope metrics.Scope) mailerStats {
 			Help: "Number of messages skipped for being renewals",
 		},
 		nil)
-	scope.MustRegister(renewalCount)
+	stats.MustRegister(renewalCount)
 
 	sendLatency := prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "sendLatency",
+			Name:    "send_latency",
 			Help:    "Time the mailer takes sending messages",
 			Buckets: metrics.InternetFacingBuckets,
 		})
-	scope.MustRegister(sendLatency)
+	stats.MustRegister(sendLatency)
 
 	processingLatency := prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name: "processingLatency",
+			Name: "processing_latency",
 			Help: "Time the mailer takes processing certificates",
 		})
-	scope.MustRegister(processingLatency)
+	stats.MustRegister(processingLatency)
 
 	return mailerStats{
 		nagsAtCapacity:    nagsAtCapacity,
@@ -573,7 +574,7 @@ func main() {
 	// set to 0 on startup, rather than being missing from stats collection until
 	// the first mail run.
 	for _, expiresIn := range nags {
-		m.stats.nagsAtCapacity.With(prometheus.Labels{"nagGroup": expiresIn.String()}).Set(0)
+		m.stats.nagsAtCapacity.With(prometheus.Labels{"nag_group": expiresIn.String()}).Set(0)
 	}
 
 	if *daemon {

@@ -2,10 +2,10 @@ package sa
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"time"
 
+	"github.com/letsencrypt/boulder/db"
 	"github.com/weppos/publicsuffix-go/publicsuffix"
 )
 
@@ -32,7 +32,7 @@ func baseDomain(name string) string {
 // input timeToTheHour must be a time rounded to an hour.
 func (ssa *SQLStorageAuthority) addCertificatesPerName(
 	ctx context.Context,
-	db dbSelectExecer,
+	db db.SelectExecer,
 	names []string,
 	timeToTheHour time.Time,
 ) error {
@@ -63,14 +63,14 @@ func (ssa *SQLStorageAuthority) addCertificatesPerName(
 // certificates issued in the given time range for that domain's eTLD+1 (aka
 // base domain). It uses the certificatesPerName table to make this lookup fast.
 func (ssa *SQLStorageAuthority) countCertificates(
-	db dbSelector,
+	dbMap db.Selector,
 	domain string,
 	earliest,
 	latest time.Time,
 ) (int, error) {
 	base := baseDomain(domain)
 	var counts []int
-	_, err := db.Select(
+	_, err := dbMap.Select(
 		&counts,
 		`SELECT count FROM certificatesPerName
 		 WHERE eTLDPlusOne = :baseDomain AND
@@ -81,9 +81,10 @@ func (ssa *SQLStorageAuthority) countCertificates(
 			"earliest":   earliest,
 			"latest":     latest,
 		})
-	if err == sql.ErrNoRows {
-		return 0, nil
-	} else if err != nil {
+	if err != nil {
+		if db.IsNoRows(err) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	var total int

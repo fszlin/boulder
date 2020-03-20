@@ -27,7 +27,7 @@
       "timeout": "150s"
     },
     "features": {
-      "PrecertificateOCSP": true
+      "StoreIssuerInfo": true
     }
   },
 

@@ -4,12 +4,9 @@ Thanks for helping us build Boulder! This page contains requirements and guideli
 * All new functionality and fixed bugs must be accompanied by tests.
 * All patches must meet the deployability requirements listed below.
 * We prefer pull requests from external forks be created with the ["Allow edits from maintainers"](https://github.com/blog/2247-improving-collaboration-with-forks) checkbox selected.
-* Boulder currently implements something we internally refer to as "ACME v1". It is largely the same as the IETF ACME protocol's current most draft ([ACME draft-06](https://tools.ietf.org/html/draft-ietf-acme-acme-06)). The [acme-divergences](https://github.com/letsencrypt/boulder/blob/master/docs/acme-divergences.md) document outlines the places where Boulder differs from the IETF drafts. Our [plans for an "ACME v2" endpoint](https://letsencrypt.org/2017/06/14/acme-v2-api.html) describe how we will resolve the divergences when ACME leaves draft status. If a protocol spec change is required for Boulder functionality, you should propose it on the ACME mailing list (acme@ietf.org), possibly accompanied by a pull request on the [spec repo](https://github.com/ietf-wg-acme/acme/).
 
 # Review Requirements
-* All pull requests must receive at least one positive review. Contributors are
-  strongly encouraged to get two positive reviews before merging whenever
-  possible.
+* All pull requests must receive at least one approval through the GitHub UI.
 * We indicate review approval through GitHub's code review facility.
 * New commits pushed to a branch invalidate previous reviews. In other words, a reviewer must give positive reviews of a branch after its most recent pushed commit.
 * You cannot review your own code.
@@ -31,7 +28,7 @@ Thanks for helping us build Boulder! This page contains requirements and guideli
 
 # Squash merging
 
-Once a pull requests has two reviews and the tests are passing, we'll merge it. We always use [squash merges](https://github.com/blog/2141-squash-your-commits) via GitHub's web interface. That means that during the course of your review you should generally not squash or amend commits, or force push. Even if the changes in each commit are small, keeping them separate makes it easier for us to review incremental changes to a pull request. Rest assured that those tiny changes will get squashed into a nice meaningful-size commit when we merge.
+Once a pull request is approved and the tests are passing, the author or any other committer can merge it. We always use [squash merges](https://github.com/blog/2141-squash-your-commits) via GitHub's web interface. That means that during the course of your review you should generally not squash or amend commits, or force push. Even if the changes in each commit are small, keeping them separate makes it easier for us to review incremental changes to a pull request. Rest assured that those tiny changes will get squashed into a nice meaningful-size commit when we merge.
 
 If the Travis tests are failing on your branch, you should look at the logs to figure out why. Sometimes (though rarely) they fail spuriously, in which case you can post a comment requesting that a project owner kick the build.
 
@@ -125,7 +122,7 @@ migration. This is because the ORM package we use,
 [`gorp`](https://github.com/go-gorp/gorp), expects every field in a struct to
 map to a column in the table. If we add a new field to a model struct and
 Boulder attempts to write that struct to a table that doesn't yet have the
-corresponding column (case 1), gorp wil fail with
+corresponding column (case 1), gorp will fail with
 `Insert failed table posts has no column named Foo`.
 There are examples of such models in sa/model.go, along with code to
 turn a model into a `struct` used internally. 
@@ -269,6 +266,23 @@ When vendorizing dependencies, it's important to make sure tests pass on the ver
 
 To upgrade a dependency, [see the Go
 docs](https://github.com/golang/go/wiki/Modules#how-to-upgrade-and-downgrade-dependencies).
+Typically you want `go get <dependency>` rather than `go get -u
+<dependency>`, which can introduce a lot of unexpected updates. After running
+`go get`, make sure to run `go mod vendor` to update the vendor directory. If
+you forget, Travis tests will catch this.
+
+Note that updating dependencies can introduce new, transitive dependencies. In
+general we try to keep our dependencies as narrow as possible in order to
+minimize the number of people and organizations whose code we need to trust.
+As a rule of thumb: If an update introduces new packages or modules that are
+inside a repository where we already depend on other packages or modules, it's
+not a big deal. If it introduces a new dependency in a different repository,
+please try to figure out where that dependency came from and why (for instance:
+"package X, which we depend on, started supporting XML config files, so now we
+depend on an XML parser") and include that in the PR description. When there are
+a large number of new dependencies introduced, and we don't need the
+functionality they provide, we should consider asking the relevant upstream
+repository for a refactoring to reduce the number of transitive dependencies.
 
 # Go Version
 

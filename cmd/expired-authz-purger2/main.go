@@ -6,13 +6,11 @@ import (
 	"io/ioutil"
 	"time"
 
-	"gopkg.in/go-gorp/gorp.v2"
-
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/db"
 	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
-	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/sa"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -37,7 +35,7 @@ var deletedStat = prometheus.NewCounter(
 	},
 )
 
-func deleteExpired(clk clock.Clock, gracePeriod time.Duration, batchSize int, dbMap *gorp.DbMap) (int64, error) {
+func deleteExpired(clk clock.Clock, gracePeriod time.Duration, batchSize int, dbMap *db.WrappedMap) (int64, error) {
 	expires := clk.Now().Add(-gracePeriod)
 	res, err := dbMap.Exec(
 		"DELETE FROM authz2 WHERE expires <= :expires LIMIT :limit",
@@ -67,9 +65,9 @@ func main() {
 
 	var logger blog.Logger
 	if c.ExpiredAuthzPurger2.DebugAddr != "" {
-		var scope metrics.Scope
-		scope, logger = cmd.StatsAndLogging(c.ExpiredAuthzPurger2.Syslog, c.ExpiredAuthzPurger2.DebugAddr)
-		scope.MustRegister(deletedStat)
+		var stats prometheus.Registerer
+		stats, logger = cmd.StatsAndLogging(c.ExpiredAuthzPurger2.Syslog, c.ExpiredAuthzPurger2.DebugAddr)
+		stats.MustRegister(deletedStat)
 	} else {
 		logger = cmd.NewLogger(c.ExpiredAuthzPurger2.Syslog)
 	}

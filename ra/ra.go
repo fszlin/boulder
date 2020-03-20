@@ -3,6 +3,7 @@ package ra
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/mail"
@@ -25,7 +26,6 @@ import (
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
-	"github.com/letsencrypt/boulder/iana"
 	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -62,7 +62,6 @@ type RegistrationAuthorityImpl struct {
 	publisher core.Publisher
 	caa       caaChecker
 
-	stats     metrics.Scope
 	clk       clock.Clock
 	log       blog.Logger
 	keyPolicy goodkey.KeyPolicy
@@ -79,24 +78,22 @@ type RegistrationAuthorityImpl struct {
 	issuer *x509.Certificate
 	purger akamaipb.AkamaiPurgerClient
 
-	regByIPStats           metrics.Scope
-	regByIPRangeStats      metrics.Scope
-	pendAuthByRegIDStats   metrics.Scope
-	pendOrdersByRegIDStats metrics.Scope
-	newOrderByRegIDStats   metrics.Scope
-	certsForDomainStats    metrics.Scope
+	ctpolicy *ctpolicy.CTPolicy
 
-	ctpolicy        *ctpolicy.CTPolicy
-	ctpolicyResults *prometheus.HistogramVec
-
-	namesPerCert *prometheus.HistogramVec
+	ctpolicyResults         *prometheus.HistogramVec
+	rateLimitCounter        *prometheus.CounterVec
+	namesPerCert            *prometheus.HistogramVec
+	newRegCounter           prometheus.Counter
+	reusedValidAuthzCounter prometheus.Counter
+	recheckCAACounter       prometheus.Counter
+	newCertCounter          prometheus.Counter
 }
 
 // NewRegistrationAuthorityImpl constructs a new RA object.
 func NewRegistrationAuthorityImpl(
 	clk clock.Clock,
 	logger blog.Logger,
-	stats metrics.Scope,
+	stats prometheus.Registerer,
 	maxContactsPerReg int,
 	keyPolicy goodkey.KeyPolicy,
 	maxNames int,
@@ -134,8 +131,37 @@ func NewRegistrationAuthorityImpl(
 	)
 	stats.MustRegister(namesPerCert)
 
+	rateLimitCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ra_ratelimits",
+		Help: "A counter of RA ratelimit checks labelled by type and pass/exceed",
+	}, []string{"limit", "result"})
+	stats.MustRegister(rateLimitCounter)
+
+	newRegCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "new_registrations",
+		Help: "A counter of new registrations",
+	})
+	stats.MustRegister(newRegCounter)
+
+	reusedValidAuthzCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "reused_valid_authz",
+		Help: "A counter of reused valid authorizations",
+	})
+	stats.MustRegister(reusedValidAuthzCounter)
+
+	recheckCAACounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "recheck_caa",
+		Help: "A counter of CAA rechecks",
+	})
+	stats.MustRegister(recheckCAACounter)
+
+	newCertCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "new_certificates",
+		Help: "A counter of new certificates",
+	})
+	stats.MustRegister(newCertCounter)
+
 	ra := &RegistrationAuthorityImpl{
-		stats:                        stats,
 		clk:                          clk,
 		log:                          logger,
 		authorizationLifetime:        authorizationLifetime,
@@ -146,12 +172,6 @@ func NewRegistrationAuthorityImpl(
 		maxNames:                     maxNames,
 		forceCNFromSAN:               forceCNFromSAN,
 		reuseValidAuthz:              reuseValidAuthz,
-		regByIPStats:                 stats.NewScope("RateLimit", "RegistrationsByIP"),
-		regByIPRangeStats:            stats.NewScope("RateLimit", "RegistrationsByIPRange"),
-		pendAuthByRegIDStats:         stats.NewScope("RateLimit", "PendingAuthorizationsByRegID"),
-		pendOrdersByRegIDStats:       stats.NewScope("RateLimit", "PendingOrdersByRegID"),
-		newOrderByRegIDStats:         stats.NewScope("RateLimit", "NewOrdersByRegID"),
-		certsForDomainStats:          stats.NewScope("RateLimit", "CertificatesForDomain"),
 		publisher:                    pubc,
 		caa:                          caaClient,
 		orderLifetime:                orderLifetime,
@@ -160,6 +180,11 @@ func NewRegistrationAuthorityImpl(
 		purger:                       purger,
 		issuer:                       issuer,
 		namesPerCert:                 namesPerCert,
+		rateLimitCounter:             rateLimitCounter,
+		newRegCounter:                newRegCounter,
+		reusedValidAuthzCounter:      reusedValidAuthzCounter,
+		recheckCAACounter:            recheckCAACounter,
+		newCertCounter:               newCertCounter,
 	}
 	return ra
 }
@@ -263,11 +288,11 @@ func (ra *RegistrationAuthorityImpl) checkRegistrationLimits(ctx context.Context
 	exactRegLimit := ra.rlPolicies.RegistrationsPerIP()
 	err := ra.checkRegistrationIPLimit(ctx, exactRegLimit, ip, ra.SA.CountRegistrationsByIP)
 	if err != nil {
-		ra.regByIPStats.Inc("Exceeded", 1)
+		ra.rateLimitCounter.WithLabelValues("registrations_by_ip", "exceeded").Inc()
 		ra.log.Infof("Rate limit exceeded, RegistrationsByIP, IP: %s", ip)
 		return err
 	}
-	ra.regByIPStats.Inc("Pass", 1)
+	ra.rateLimitCounter.WithLabelValues("registrations_by_ip", "pass").Inc()
 
 	// We only apply the fuzzy reg limit to IPv6 addresses.
 	// Per https://golang.org/pkg/net/#IP.To4 "If ip is not an IPv4 address, To4
@@ -282,13 +307,13 @@ func (ra *RegistrationAuthorityImpl) checkRegistrationLimits(ctx context.Context
 	fuzzyRegLimit := ra.rlPolicies.RegistrationsPerIPRange()
 	err = ra.checkRegistrationIPLimit(ctx, fuzzyRegLimit, ip, ra.SA.CountRegistrationsByIPRange)
 	if err != nil {
-		ra.regByIPRangeStats.Inc("Exceeded", 1)
+		ra.rateLimitCounter.WithLabelValues("registrations_by_ip_range", "exceeded").Inc()
 		ra.log.Infof("Rate limit exceeded, RegistrationsByIPRange, IP: %s", ip)
 		// For the fuzzyRegLimit we use a new error message that specifically
 		// mentions that the limit being exceeded is applied to a *range* of IPs
 		return berrors.RateLimitError("too many registrations for this IP range")
 	}
-	ra.regByIPRangeStats.Inc("Pass", 1)
+	ra.rateLimitCounter.WithLabelValues("registrations_by_ip_range", "pass").Inc()
 
 	return nil
 }
@@ -322,7 +347,7 @@ func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, init c
 		return core.Registration{}, err
 	}
 
-	ra.stats.Inc("NewRegistrations", 1)
+	ra.newRegCounter.Inc()
 	return reg, nil
 }
 
@@ -333,6 +358,7 @@ func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, init c
 // * A list containing an empty contact
 // * A list containing a contact that does not parse as a URL
 // * A list containing a contact that has a URL scheme other than mailto
+// * A list containing a mailto contact that contains hfields
 // * A list containing a contact that has non-ascii characters
 // * A list containing a contact that doesn't pass `validateEmail`
 func (ra *RegistrationAuthorityImpl) validateContacts(ctx context.Context, contacts *[]string) error {
@@ -349,24 +375,42 @@ func (ra *RegistrationAuthorityImpl) validateContacts(ctx context.Context, conta
 
 	for _, contact := range *contacts {
 		if contact == "" {
-			return berrors.MalformedError("empty contact")
+			return berrors.InvalidEmailError("empty contact")
 		}
 		parsed, err := url.Parse(contact)
 		if err != nil {
-			return berrors.MalformedError("invalid contact")
+			return berrors.InvalidEmailError("invalid contact")
 		}
 		if parsed.Scheme != "mailto" {
-			return berrors.MalformedError("contact method %s is not supported", parsed.Scheme)
+			return berrors.InvalidEmailError("contact method %q is not supported", parsed.Scheme)
+		}
+		if parsed.RawQuery != "" {
+			return berrors.InvalidEmailError("contact email [%q] contains hfields", contact)
 		}
 		if !core.IsASCII(contact) {
-			return berrors.MalformedError(
-				"contact email [%s] contains non-ASCII characters",
+			return berrors.InvalidEmailError(
+				"contact email [%q] contains non-ASCII characters",
 				contact,
 			)
 		}
-		if err := validateEmail(parsed.Opaque); err != nil {
+		if err := ra.validateEmail(parsed.Opaque); err != nil {
 			return err
 		}
+	}
+
+	// NOTE(@cpu): For historical reasons (</3) we store ACME account contact
+	// information de-normalized in a fixed size `contact` field on the
+	// `registrations` table. At the time of writing this field is VARCHAR(191)
+	// That means the largest marshalled JSON value we can store is 191 bytes.
+	const maxContactBytes = 191
+	if jsonBytes, err := json.Marshal(*contacts); err != nil {
+		// This shouldn't happen with a simple []string but if it does we want the
+		// error to be logged internally but served as a 500 to the user so we
+		// return a bare error and not a berror here.
+		return fmt.Errorf("failed to marshal reg.Contact to JSON: %#v", *contacts)
+	} else if len(jsonBytes) >= maxContactBytes {
+		return berrors.InvalidEmailError(
+			"too many/too long contact(s). Please use shorter or fewer email addresses")
 	}
 
 	return nil
@@ -385,9 +429,9 @@ var forbiddenMailDomains = map[string]bool{
 }
 
 // validateEmail returns an error if the given address is not parseable as an
-// email address or if the domain portion of the email address is a member of
-// the forbiddenMailDomains map.
-func validateEmail(address string) error {
+// email address or if the domain portion of the email address is invalid or
+// a member of the forbiddenMailDomains map.
+func (ra *RegistrationAuthorityImpl) validateEmail(address string) error {
 	email, err := mail.ParseAddress(address)
 	if err != nil {
 		if len(address) > 254 {
@@ -397,13 +441,15 @@ func validateEmail(address string) error {
 	}
 	splitEmail := strings.SplitN(email.Address, "@", -1)
 	domain := strings.ToLower(splitEmail[len(splitEmail)-1])
+	if err := ra.PA.ValidDomain(domain); err != nil {
+		return berrors.InvalidEmailError(
+			"contact email %q has invalid domain : %s",
+			email.Address, err)
+	}
 	if forbiddenMailDomains[domain] {
 		return berrors.InvalidEmailError(
 			"invalid contact domain. Contact emails @%s are forbidden",
 			domain)
-	}
-	if _, err := iana.ExtractSuffix(domain); err != nil {
-		return berrors.InvalidEmailError("email domain name does not end in a IANA suffix")
 	}
 	return nil
 }
@@ -421,11 +467,11 @@ func (ra *RegistrationAuthorityImpl) checkPendingAuthorizationLimit(ctx context.
 		// here.
 		noKey := ""
 		if int(*countPB.Count) >= limit.GetThreshold(noKey, regID) {
-			ra.pendAuthByRegIDStats.Inc("Exceeded", 1)
+			ra.rateLimitCounter.WithLabelValues("pending_authorizations_by_registration_id", "exceeded").Inc()
 			ra.log.Infof("Rate limit exceeded, PendingAuthorizationsByRegID, regID: %d", regID)
 			return berrors.RateLimitError("too many currently pending authorizations")
 		}
-		ra.pendAuthByRegIDStats.Inc("Pass", 1)
+		ra.rateLimitCounter.WithLabelValues("pending_authorizations_by_registration_id", "pass").Inc()
 	}
 	return nil
 }
@@ -506,10 +552,10 @@ func (ra *RegistrationAuthorityImpl) checkNewOrdersPerAccountLimit(ctx context.C
 	// There is no meaningful override key to use for this rate limit
 	noKey := ""
 	if count >= limit.GetThreshold(noKey, acctID) {
-		ra.newOrderByRegIDStats.Inc("Exceeded", 1)
+		ra.rateLimitCounter.WithLabelValues("new_order_by_registration_id", "exceeded").Inc()
 		return berrors.RateLimitError("too many new orders recently")
 	}
-	ra.newOrderByRegIDStats.Inc("Pass", 1)
+	ra.rateLimitCounter.WithLabelValues("new_order_by_registration_id", "pass").Inc()
 	return nil
 }
 
@@ -560,7 +606,7 @@ func (ra *RegistrationAuthorityImpl) NewAuthorization(ctx context.Context, reque
 				// it to be OK for reuse
 				reuseCutOff := ra.clk.Now().Add(time.Hour * 24)
 				if existingAuthz.Expires.After(reuseCutOff) {
-					ra.stats.Inc("ReusedValidAuthz", 1)
+					ra.reusedValidAuthzCounter.Inc()
 					return *existingAuthz, nil
 				}
 			}
@@ -807,8 +853,7 @@ func (ra *RegistrationAuthorityImpl) checkAuthorizationsCAA(
 // performs the CAA checks required for each. If any of the rechecks fail an
 // error is returned.
 func (ra *RegistrationAuthorityImpl) recheckCAA(ctx context.Context, authzs []*core.Authorization) error {
-	ra.stats.Inc("recheck_caa", 1)
-	ra.stats.Inc("recheck_caa_authzs", int64(len(authzs)))
+	ra.recheckCAACounter.Add(float64(len(authzs)))
 
 	type authzCAAResult struct {
 		authz *core.Authorization
@@ -1084,6 +1129,17 @@ func (ra *RegistrationAuthorityImpl) issueCertificate(
 // issueCertificateInner handles the common aspects of certificate issuance used by
 // both the "classic" NewCertificate endpoint (for ACME v1) and the
 // FinalizeOrder endpoint (for ACME v2).
+//
+// This function is responsible for ensuring that we never try to issue a final
+// certificate twice for the same precertificate, because that has the potential
+// to create certificates with duplicate serials. For instance, this could
+// happen if final certificates were created with different sets of SCTs. This
+// function accomplishes that by bailing on issuance if there is any error in
+// IssueCertificateForPrecertificate; there are no retries, and serials are
+// generated in IssuePrecertificate, so serials with errors are dropped and
+// never have final certificates issued for them (because there is a possibility
+// that the certificate was actually issued but there was an error returning
+// it).
 func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	ctx context.Context,
 	req core.CertificateRequest,
@@ -1150,7 +1206,7 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 		var solvedByChallengeType string
 		// If the authz has no solved by challenge type there has been an internal
 		// consistency violation worth logging a warning about. In this case the
-		// solvedByChallengeType will be logged as the emtpy string.
+		// solvedByChallengeType will be logged as the empty string.
 		if solvedByChallengeType = authz.SolvedBy(); solvedByChallengeType == "" {
 			ra.log.Warningf("Authz %q has status %q but empty SolvedBy()", authz.ID, authz.Status)
 		}
@@ -1226,7 +1282,7 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	logEvent.NotBefore = parsedCertificate.NotBefore
 	logEvent.NotAfter = parsedCertificate.NotAfter
 
-	ra.stats.Inc("NewCertificates", 1)
+	ra.newCertCounter.Inc()
 	return cert, nil
 }
 
@@ -1313,7 +1369,7 @@ func (ra *RegistrationAuthorityImpl) checkCertificatesPerNameLimit(ctx context.C
 			return fmt.Errorf("checking renewal exemption for %q: %s", names, err)
 		}
 		if exists {
-			ra.certsForDomainStats.Inc("FQDNSetBypass", 1)
+			ra.rateLimitCounter.WithLabelValues("certificates_for_domain", "FQDN set bypass").Inc()
 			return nil
 		}
 	}
@@ -1339,13 +1395,13 @@ func (ra *RegistrationAuthorityImpl) checkCertificatesPerNameLimit(ctx context.C
 				return fmt.Errorf("checking renewal exemption for %q: %s", names, err)
 			}
 			if exists {
-				ra.certsForDomainStats.Inc("FQDNSetBypass", 1)
+				ra.rateLimitCounter.WithLabelValues("certificates_for_domain", "FQDN set bypass").Inc()
 				return nil
 			}
 		}
 
 		ra.log.Infof("Rate limit exceeded, CertificatesForDomain, regID: %d, domains: %s", regID, strings.Join(namesOutOfLimit, ", "))
-		ra.certsForDomainStats.Inc("Exceeded", 1)
+		ra.rateLimitCounter.WithLabelValues("certificates_for_domain", "exceeded").Inc()
 		if len(namesOutOfLimit) > 1 {
 			var subErrors []berrors.SubBoulderError
 			for _, name := range namesOutOfLimit {
@@ -1358,7 +1414,7 @@ func (ra *RegistrationAuthorityImpl) checkCertificatesPerNameLimit(ctx context.C
 		}
 		return berrors.RateLimitError("too many certificates already issued for: %s", namesOutOfLimit[0])
 	}
-	ra.certsForDomainStats.Inc("Pass", 1)
+	ra.rateLimitCounter.WithLabelValues("certificates_for_domain", "pass").Inc()
 
 	return nil
 }
@@ -1403,7 +1459,7 @@ func (ra *RegistrationAuthorityImpl) checkLimits(ctx context.Context, names []st
 func (ra *RegistrationAuthorityImpl) UpdateRegistration(ctx context.Context, base core.Registration, update core.Registration) (core.Registration, error) {
 	if changed := mergeUpdate(&base, update); !changed {
 		// If merging the update didn't actually change the base then our work is
-		// done, we can return before calling ra.SA.UpdateRegistration since theres
+		// done, we can return before calling ra.SA.UpdateRegistration since there's
 		// nothing for the SA to do
 		return base, nil
 	}
@@ -1421,7 +1477,6 @@ func (ra *RegistrationAuthorityImpl) UpdateRegistration(ctx context.Context, bas
 		return core.Registration{}, err
 	}
 
-	ra.stats.Inc("UpdatedRegistrations", 1)
 	return base, nil
 }
 
@@ -1500,7 +1555,7 @@ func (ra *RegistrationAuthorityImpl) recordValidation(ctx context.Context, authI
 	if challenge.Status == core.StatusInvalid {
 		expires = authExpires.UnixNano()
 	} else {
-		expires = authExpires.Add(ra.authorizationLifetime).UnixNano()
+		expires = ra.clk.Now().Add(ra.authorizationLifetime).UnixNano()
 	}
 	vr, err := bgrpc.ValidationResultToPB(challenge.ValidationRecord, challenge.Error)
 	if err != nil {
@@ -1556,7 +1611,6 @@ func (ra *RegistrationAuthorityImpl) PerformValidation(
 	// the overall authorization is already good! We increment a stat for this
 	// case and return early.
 	if ra.reuseValidAuthz && authz.Status == core.StatusValid {
-		ra.stats.Inc("ReusedValidAuthzChallenge", 1)
 		return req.Authz, nil
 	}
 
@@ -1588,8 +1642,6 @@ func (ra *RegistrationAuthorityImpl) PerformValidation(
 	if cErr := ch.CheckConsistencyForValidation(); cErr != nil {
 		return nil, berrors.MalformedError(cErr.Error())
 	}
-
-	ra.stats.Inc("NewPendingAuthorizations", 1)
 
 	// Dispatch to the VA for service
 	vaCtx := context.Background()
@@ -1631,7 +1683,6 @@ func (ra *RegistrationAuthorityImpl) PerformValidation(
 				err, authz.RegistrationID, authz.ID)
 		}
 	}(authz)
-	ra.stats.Inc("UpdatedPendingAuthorizations", 1)
 	return bgrpc.AuthzToPB(authz)
 }
 
@@ -1649,25 +1700,27 @@ func revokeEvent(state, serial, cn string, names []string, revocationCode revoca
 // revokeCertificate generates a revoked OCSP response for the given certificate, stores
 // the revocation information, and purges OCSP request URLs from Akamai.
 func (ra *RegistrationAuthorityImpl) revokeCertificate(ctx context.Context, cert x509.Certificate, code revocation.Reason) error {
-	now := time.Now()
-	signRequest := core.OCSPSigningRequest{
+	status := string(core.OCSPStatusRevoked)
+	reason := int32(code)
+	revokedAt := time.Now().UnixNano()
+	ocspResponse, err := ra.CA.GenerateOCSP(ctx, &caPB.GenerateOCSPRequest{
 		CertDER:   cert.Raw,
-		Status:    string(core.OCSPStatusRevoked),
-		Reason:    code,
-		RevokedAt: now,
-	}
-	ocspResponse, err := ra.CA.GenerateOCSP(ctx, signRequest)
+		Status:    &status,
+		Reason:    &reason,
+		RevokedAt: &revokedAt,
+	})
 	if err != nil {
 		return err
 	}
 	serial := core.SerialToString(cert.SerialNumber)
-	nowUnix := now.UnixNano()
-	reason := int64(code)
+	// for some reason we use int32 and int64 for the reason in different
+	// protobuf messages, so we have to re-cast it here.
+	reason64 := int64(reason)
 	err = ra.SA.RevokeCertificate(ctx, &sapb.RevokeCertificateRequest{
 		Serial:   &serial,
-		Reason:   &reason,
-		Date:     &nowUnix,
-		Response: ocspResponse,
+		Reason:   &reason64,
+		Date:     &revokedAt,
+		Response: ocspResponse.Response,
 	})
 	if err != nil {
 		return err
@@ -1709,7 +1762,6 @@ func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Contex
 	}
 
 	state = "Success"
-	ra.stats.Inc("RevokedCertificates", 1)
 	return nil
 }
 
@@ -1740,7 +1792,6 @@ func (ra *RegistrationAuthorityImpl) AdministrativelyRevokeCertificate(ctx conte
 	}
 
 	state = "Success"
-	ra.stats.Inc("RevokedCertificates", 1)
 	return nil
 }
 
@@ -1794,7 +1845,8 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 	}
 
 	if len(order.Names) > ra.maxNames {
-		return nil, fmt.Errorf("Order cannot contain more than %d DNS names", ra.maxNames)
+		return nil, berrors.MalformedError(
+			"Order cannot contain more than %d DNS names", ra.maxNames)
 	}
 
 	// Validate that our policy allows issuing for each of the names in the order
@@ -1996,9 +2048,7 @@ func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.New
 func (ra *RegistrationAuthorityImpl) createPendingAuthz(ctx context.Context, reg int64, identifier identifier.ACMEIdentifier) (*corepb.Authorization, error) {
 	expires := ra.clk.Now().Add(ra.pendingAuthorizationLifetime).Truncate(time.Second).UnixNano()
 	status := string(core.StatusPending)
-	v2 := true
 	authz := &corepb.Authorization{
-		V2:             &v2,
 		Identifier:     &identifier.Value,
 		RegistrationID: &reg,
 		Status:         &status,

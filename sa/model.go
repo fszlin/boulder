@@ -1,7 +1,6 @@
 package sa
 
 import (
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
+	"github.com/letsencrypt/boulder/db"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/probs"
@@ -50,42 +50,10 @@ func badJSONError(msg string, jsonData []byte, err error) error {
 	}
 }
 
-// By convention, any function that takes a dbOneSelector, dbSelector,
-// dbInserter, dbExecer, or dbSelectExecer as as an argument expects
-// that a context has already been applied to the relevant DbMap or
-// Transaction object.
-
-// A `dbOneSelector` is anything that provides a `SelectOne` function.
-type dbOneSelector interface {
-	SelectOne(interface{}, string, ...interface{}) error
-}
-
-// A `dbSelector` is anything that provides a `Select` function.
-type dbSelector interface {
-	Select(interface{}, string, ...interface{}) ([]interface{}, error)
-}
-
-// a `dbInserter` is anything that provides an `Insert` function
-type dbInserter interface {
-	Insert(list ...interface{}) error
-}
-
-// A `dbExecer` is anything that provides an `Exec` function
-type dbExecer interface {
-	Exec(string, ...interface{}) (sql.Result, error)
-}
-
-// dbSelectExecer offers a subset of gorp.SqlExecutor's methods: Select and
-// Exec.
-type dbSelectExecer interface {
-	dbSelector
-	dbExecer
-}
-
 const regFields = "id, jwk, jwk_sha256, contact, agreement, initialIP, createdAt, LockCol, status"
 
 // selectRegistration selects all fields of one registration model
-func selectRegistration(s dbOneSelector, q string, args ...interface{}) (*regModel, error) {
+func selectRegistration(s db.OneSelector, q string, args ...interface{}) (*regModel, error) {
 	var model regModel
 	err := s.SelectOne(
 		&model,
@@ -95,34 +63,10 @@ func selectRegistration(s dbOneSelector, q string, args ...interface{}) (*regMod
 	return &model, err
 }
 
-// selectPendingAuthz selects all fields of one pending authorization model
-func selectPendingAuthz(s dbOneSelector, q string, args ...interface{}) (*pendingauthzModel, error) {
-	var model pendingauthzModel
-	err := s.SelectOne(
-		&model,
-		"SELECT id, identifier, registrationID, status, expires, LockCol FROM pendingAuthorizations "+q,
-		args...,
-	)
-	return &model, err
-}
-
-const authzFields = "id, identifier, registrationID, status, expires"
-
-// selectAuthz selects all fields of one authorization model
-func selectAuthz(s dbOneSelector, q string, args ...interface{}) (*authzModel, error) {
-	var model authzModel
-	err := s.SelectOne(
-		&model,
-		"SELECT "+authzFields+" FROM authz "+q,
-		args...,
-	)
-	return &model, err
-}
-
 const certFields = "registrationID, serial, digest, der, issued, expires"
 
 // SelectCertificate selects all fields of one certificate object
-func SelectCertificate(s dbOneSelector, q string, args ...interface{}) (core.Certificate, error) {
+func SelectCertificate(s db.OneSelector, q string, args ...interface{}) (core.Certificate, error) {
 	var model core.Certificate
 	err := s.SelectOne(
 		&model,
@@ -136,7 +80,7 @@ const precertFields = "registrationID, serial, der, issued, expires"
 
 // SelectPrecertificate selects all fields of one precertificate object
 // identified by serial.
-func SelectPrecertificate(s dbOneSelector, serial string) (core.Certificate, error) {
+func SelectPrecertificate(s db.OneSelector, serial string) (core.Certificate, error) {
 	var model precertificateModel
 	err := s.SelectOne(
 		&model,
@@ -157,7 +101,7 @@ type CertWithID struct {
 }
 
 // SelectCertificates selects all fields of multiple certificate objects
-func SelectCertificates(s dbSelector, q string, args map[string]interface{}) ([]CertWithID, error) {
+func SelectCertificates(s db.Selector, q string, args map[string]interface{}) ([]CertWithID, error) {
 	var models []CertWithID
 	_, err := s.Select(
 		&models,
@@ -168,25 +112,18 @@ func SelectCertificates(s dbSelector, q string, args map[string]interface{}) ([]
 const certStatusFields = "serial, status, ocspLastUpdated, revokedDate, revokedReason, lastExpirationNagSent, ocspResponse, notAfter, isExpired"
 
 // SelectCertificateStatus selects all fields of one certificate status model
-func SelectCertificateStatus(s dbOneSelector, q string, args ...interface{}) (certStatusModel, error) {
+func SelectCertificateStatus(s db.OneSelector, q string, args ...interface{}) (certStatusModel, error) {
+	fields := certStatusFields
+	if features.Enabled(features.StoreIssuerInfo) {
+		fields += ", issuerID"
+	}
 	var model certStatusModel
 	err := s.SelectOne(
 		&model,
-		"SELECT "+certStatusFields+" FROM certificateStatus "+q,
+		"SELECT "+fields+" FROM certificateStatus "+q,
 		args...,
 	)
 	return model, err
-}
-
-// SelectCertificateStatuses selects all fields of multiple certificate status objects
-func SelectCertificateStatuses(s dbSelector, q string, args ...interface{}) ([]core.CertificateStatus, error) {
-	var models []core.CertificateStatus
-	_, err := s.Select(
-		&models,
-		"SELECT "+certStatusFields+" FROM certificateStatus "+q,
-		args...,
-	)
-	return models, err
 }
 
 var mediumBlobSize = int(math.Pow(2, 24))
@@ -223,6 +160,7 @@ type certStatusModel struct {
 	OCSPResponse          []byte            `db:"ocspResponse"`
 	NotAfter              time.Time         `db:"notAfter"`
 	IsExpired             bool              `db:"isExpired"`
+	IssuerID              *int64            `db:"issuerID"`
 }
 
 // challModel is the description of a core.Challenge in the database
@@ -413,11 +351,6 @@ type requestedNameModel struct {
 
 type orderToAuthzModel struct {
 	OrderID int64
-	AuthzID string
-}
-
-type orderToAuthz2Model struct {
-	OrderID int64
 	AuthzID int64
 }
 
@@ -511,9 +444,9 @@ func statusUint(status core.AcmeStatus) uint8 {
 	return statusToUint[string(status)]
 }
 
-const authz2Fields = "id, identifierType, identifierValue, registrationID, status, expires, challenges, attempted, token, validationError, validationRecord"
+const authzFields = "id, identifierType, identifierValue, registrationID, status, expires, challenges, attempted, token, validationError, validationRecord"
 
-type authz2Model struct {
+type authzModel struct {
 	ID               int64     `db:"id"`
 	IdentifierType   uint8     `db:"identifierType"`
 	IdentifierValue  string    `db:"identifierValue"`
@@ -544,10 +477,10 @@ func hasMultipleNonPendingChallenges(challenges []*corepb.Challenge) bool {
 }
 
 // authzPBToModel converts a protobuf authorization representation to the
-// authz2Model storage representation.
-func authzPBToModel(authz *corepb.Authorization) (*authz2Model, error) {
+// authzModel storage representation.
+func authzPBToModel(authz *corepb.Authorization) (*authzModel, error) {
 	expires := time.Unix(0, *authz.Expires).UTC()
-	am := &authz2Model{
+	am := &authzModel{
 		IdentifierValue: *authz.Identifier,
 		RegistrationID:  *authz.RegistrationID,
 		Status:          statusToUint[*authz.Status],
@@ -566,7 +499,7 @@ func authzPBToModel(authz *corepb.Authorization) (*authz2Model, error) {
 	if hasMultipleNonPendingChallenges(authz.Challenges) {
 		return nil, errors.New("multiple challenges are non-pending")
 	}
-	// In the v2 authorization style we don't store invididual challenges with their own
+	// In the v2 authorization style we don't store individual challenges with their own
 	// token, validation errors/records, etc. Instead we store a single token/error/record
 	// set, a bitmap of available challenge types, and a row indicating which challenge type
 	// was 'attempted'.
@@ -625,8 +558,8 @@ func authzPBToModel(authz *corepb.Authorization) (*authz2Model, error) {
 }
 
 // populateAttemptedFields takes a challenge and populates it with the validation fields status,
-// validation records, and error (the latter only if the validation failed) from a authz2Model.
-func populateAttemptedFields(am *authz2Model, challenge *corepb.Challenge) error {
+// validation records, and error (the latter only if the validation failed) from a authzModel.
+func populateAttemptedFields(am authzModel, challenge *corepb.Challenge) error {
 	if len(am.ValidationError) != 0 {
 		// If the error is non-empty the challenge must be invalid.
 		status := string(core.StatusInvalid)
@@ -666,13 +599,11 @@ func populateAttemptedFields(am *authz2Model, challenge *corepb.Challenge) error
 	return nil
 }
 
-func modelToAuthzPB(am *authz2Model) (*corepb.Authorization, error) {
+func modelToAuthzPB(am authzModel) (*corepb.Authorization, error) {
 	expires := am.Expires.UTC().UnixNano()
 	id := fmt.Sprintf("%d", am.ID)
 	status := uintToStatus[am.Status]
-	v2 := true
 	pb := &corepb.Authorization{
-		V2:             &v2,
 		Id:             &id,
 		Status:         &status,
 		Identifier:     &am.IdentifierValue,

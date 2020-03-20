@@ -3,18 +3,19 @@ package main
 import (
 	"context"
 	"crypto/x509"
-	"database/sql"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/user"
 	"sort"
 	"strconv"
-
-	"gopkg.in/go-gorp/gorp.v2"
+	"strings"
+	"sync"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/db"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
@@ -29,13 +30,15 @@ import (
 const usageString = `
 usage:
 admin-revoker serial-revoke --config <path> <serial> <reason-code>
+admin-revoker batched-serial-revoke --config <path> <serial-file-path> <reason-code> <parallelism>
 admin-revoker reg-revoke --config <path> <registration-id> <reason-code>
 admin-revoker list-reasons --config <path>
 
 command descriptions:
-  serial-revoke   Revoke a single certificate by the hex serial number
-  reg-revoke      Revoke all certificates associated with a registration ID
-  list-reasons    List all revocation reason codes
+  serial-revoke       Revoke a single certificate by the hex serial number
+  batched-serial-revoke Revokes all certificates contained in a file of hex serial numbers
+  reg-revoke          Revoke all certificates associated with a registration ID
+  list-reasons        List all revocation reason codes
 
 args:
   config    File path to the configuration file for this service
@@ -57,7 +60,7 @@ type config struct {
 	Syslog cmd.SyslogConfig
 }
 
-func setupContext(c config) (core.RegistrationAuthority, blog.Logger, *gorp.DbMap, core.StorageAuthority) {
+func setupContext(c config) (core.RegistrationAuthority, blog.Logger, *db.WrappedMap, core.StorageAuthority) {
 	logger := cmd.NewLogger(c.Syslog)
 
 	tlsConfig, err := c.Revoker.TLS.Load()
@@ -65,7 +68,7 @@ func setupContext(c config) (core.RegistrationAuthority, blog.Logger, *gorp.DbMa
 
 	clk := cmd.Clock()
 
-	clientMetrics := bgrpc.NewClientMetrics(metrics.NewNoopScope())
+	clientMetrics := bgrpc.NewClientMetrics(metrics.NoopRegisterer)
 	raConn, err := bgrpc.ClientSetup(c.Revoker.RAService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
 	rac := bgrpc.NewRegistrationAuthorityClient(rapb.NewRegistrationAuthorityClient(raConn))
@@ -82,16 +85,16 @@ func setupContext(c config) (core.RegistrationAuthority, blog.Logger, *gorp.DbMa
 	return rac, logger, dbMap, sac
 }
 
-func revokeBySerial(ctx context.Context, serial string, reasonCode revocation.Reason, rac core.RegistrationAuthority, logger blog.Logger, tx *gorp.Transaction) (err error) {
+func revokeBySerial(ctx context.Context, serial string, reasonCode revocation.Reason, rac core.RegistrationAuthority, logger blog.Logger, dbMap db.Executor) (err error) {
 	if reasonCode < 0 || reasonCode == 7 || reasonCode > 10 {
 		panic(fmt.Sprintf("Invalid reason code: %d", reasonCode))
 	}
 
-	certObj, err := sa.SelectCertificate(tx, "WHERE serial = ?", serial)
-	if err == sql.ErrNoRows {
-		return berrors.NotFoundError("certificate with serial %q not found", serial)
-	}
+	certObj, err := sa.SelectCertificate(dbMap, "WHERE serial = ?", serial)
 	if err != nil {
+		if db.IsNoRows(err) {
+			return berrors.NotFoundError("certificate with serial %q not found", serial)
+		}
 		return err
 	}
 	cert, err := x509.ParseCertificate(certObj.DER)
@@ -109,21 +112,56 @@ func revokeBySerial(ctx context.Context, serial string, reasonCode revocation.Re
 	return
 }
 
-func revokeByReg(ctx context.Context, regID int64, reasonCode revocation.Reason, rac core.RegistrationAuthority, logger blog.Logger, tx *gorp.Transaction) (err error) {
+func revokeByReg(ctx context.Context, regID int64, reasonCode revocation.Reason, rac core.RegistrationAuthority, logger blog.Logger, dbMap db.Executor) (err error) {
 	var certs []core.Certificate
-	_, err = tx.Select(&certs, "SELECT serial FROM certificates WHERE registrationID = :regID", map[string]interface{}{"regID": regID})
+	_, err = dbMap.Select(&certs, "SELECT serial FROM certificates WHERE registrationID = :regID", map[string]interface{}{"regID": regID})
 	if err != nil {
 		return
 	}
 
 	for _, cert := range certs {
-		err = revokeBySerial(ctx, cert.Serial, reasonCode, rac, logger, tx)
+		err = revokeBySerial(ctx, cert.Serial, reasonCode, rac, logger, dbMap)
 		if err != nil {
 			return
 		}
 	}
 
 	return
+}
+
+func revokeBatch(rac core.RegistrationAuthority, logger blog.Logger, dbMap *db.WrappedMap, serialPath string, reasonCode revocation.Reason, parallelism int) error {
+	serials, err := ioutil.ReadFile(serialPath)
+	if err != nil {
+		return err
+	}
+	wg := new(sync.WaitGroup)
+	work := make(chan string, parallelism)
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for serial := range work {
+				// handle newlines gracefully
+				if serial == "" {
+					continue
+				}
+				err := revokeBySerial(context.Background(), serial, reasonCode, rac, logger, dbMap)
+				if err != nil {
+					logger.Errf("failed to revoke %q: %s", serial, err)
+				}
+			}
+		}()
+	}
+	for _, serial := range strings.Split(string(serials), "\n") {
+		if serial == "" {
+			continue
+		}
+		work <- serial
+	}
+	close(work)
+	wg.Wait()
+
+	return nil
 }
 
 // This abstraction is needed so that we can use sort.Sort below
@@ -161,6 +199,20 @@ func main() {
 	ctx := context.Background()
 	args := flagSet.Args()
 	switch {
+	case command == "batched-serial-revoke" && len(args) == 3:
+		// 1: serial file path,  2: reasonCode, 3: parallelism
+		serialPath := args[0]
+		reasonCode, err := strconv.Atoi(args[1])
+		cmd.FailOnError(err, "Reason code argument must be an integer")
+		parallelism, err := strconv.Atoi(args[2])
+		cmd.FailOnError(err, "parallelism argument must be an integer")
+		if parallelism < 1 {
+			cmd.Fail("parallelism argument must be >= 1")
+		}
+
+		rac, logger, dbMap, _ := setupContext(c)
+		err = revokeBatch(rac, logger, dbMap, serialPath, revocation.Reason(reasonCode), parallelism)
+		cmd.FailOnError(err, "Batch revocation failed")
 	case command == "serial-revoke" && len(args) == 2:
 		// 1: serial,  2: reasonCode
 		serial := args[0]
@@ -169,18 +221,11 @@ func main() {
 
 		rac, logger, dbMap, _ := setupContext(c)
 
-		tx, err := dbMap.Begin()
-		if err != nil {
-			cmd.FailOnError(sa.Rollback(tx, err), "Couldn't begin transaction")
-		}
-
-		err = revokeBySerial(ctx, serial, revocation.Reason(reasonCode), rac, logger, tx)
-		if err != nil {
-			cmd.FailOnError(sa.Rollback(tx, err), "Couldn't revoke certificate")
-		}
-
-		err = tx.Commit()
-		cmd.FailOnError(err, "Couldn't cleanly close transaction")
+		_, err = db.WithTransaction(ctx, dbMap, func(txWithCtx db.Executor) (interface{}, error) {
+			err := revokeBySerial(ctx, serial, revocation.Reason(reasonCode), rac, logger, txWithCtx)
+			return nil, err
+		})
+		cmd.FailOnError(err, "Couldn't revoke certificate by serial")
 
 	case command == "reg-revoke" && len(args) == 2:
 		// 1: registration ID,  2: reasonCode
@@ -192,23 +237,16 @@ func main() {
 		rac, logger, dbMap, sac := setupContext(c)
 		defer logger.AuditPanic()
 
-		tx, err := dbMap.Begin()
-		if err != nil {
-			cmd.FailOnError(sa.Rollback(tx, err), "Couldn't begin transaction")
-		}
-
 		_, err = sac.GetRegistration(ctx, regID)
 		if err != nil {
 			cmd.FailOnError(err, "Couldn't fetch registration")
 		}
 
-		err = revokeByReg(ctx, regID, revocation.Reason(reasonCode), rac, logger, tx)
-		if err != nil {
-			cmd.FailOnError(sa.Rollback(tx, err), "Couldn't revoke certificate")
-		}
-
-		err = tx.Commit()
-		cmd.FailOnError(err, "Couldn't cleanly close transaction")
+		_, err = db.WithTransaction(ctx, dbMap, func(txWithCtx db.Executor) (interface{}, error) {
+			err := revokeByReg(ctx, regID, revocation.Reason(reasonCode), rac, logger, txWithCtx)
+			return nil, err
+		})
+		cmd.FailOnError(err, "Couldn't revoke certificate by registration")
 
 	case command == "list-reasons":
 		var codes revocationCodes

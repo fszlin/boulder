@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"gopkg.in/square/go-jose.v2"
+	jose "gopkg.in/square/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -295,6 +295,10 @@ func (pa *mockPA) WillingToIssueWildcards(idents []identifier.ACMEIdentifier) er
 	return nil
 }
 
+func (pa *mockPA) ValidDomaiN(_ string) error {
+	return nil
+}
+
 func makeBody(s string) io.ReadCloser {
 	return ioutil.NopCloser(strings.NewReader(s))
 }
@@ -349,7 +353,7 @@ func setupWFE(t *testing.T) (WebFrontEndImpl, clock.FakeClock) {
 	features.Reset()
 
 	fc := clock.NewFake()
-	stats := metrics.NewNoopScope()
+	stats := metrics.NoopRegisterer
 
 	chainPEM, err := ioutil.ReadFile("../test/test-ca2.pem")
 	test.AssertNotError(t, err, "Unable to read ../test/test-ca2.pem")
@@ -364,7 +368,7 @@ func setupWFE(t *testing.T) (WebFrontEndImpl, clock.FakeClock) {
 		issuerCert,
 	}
 
-	wfe, err := NewWebFrontEndImpl(stats, fc, testKeyPolicy, certChains, issuerCertificates, nil, nil, blog.NewMock())
+	wfe, err := NewWebFrontEndImpl(stats, fc, testKeyPolicy, certChains, issuerCertificates, nil, nil, blog.NewMock(), 10*time.Second, 30*24*time.Hour, 7*24*time.Hour)
 	test.AssertNotError(t, err, "Unable to create WFE")
 
 	wfe.SubscriberAgreementURL = agreementURL
@@ -709,12 +713,32 @@ func (fr fakeRand) Read(p []byte) (int, error) {
 
 func TestDirectory(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	core.RandReader = fakeRand{}
 	defer func() { core.RandReader = rand.Reader }()
 
-	// Directory with a key change endpoint and a meta entry
-	metaJSON := `{
+	dirURL, _ := url.Parse("/directory")
+
+	getReq := &http.Request{
+		Method: http.MethodGet,
+		URL:    dirURL,
+		Host:   "localhost:4300",
+	}
+
+	_, _, jwsBody := signRequestKeyID(t, 1, nil, "http://localhost/directory", "", wfe.nonceService)
+	postAsGetReq := makePostRequestWithPath("/directory", jwsBody)
+
+	testCases := []struct {
+		name         string
+		caaIdent     string
+		website      string
+		expectedJSON string
+		request      *http.Request
+	}{
+		{
+			name:    "standard GET, no CAA ident/website meta",
+			request: getReq,
+			expectedJSON: `{
   "keyChange": "http://localhost:4300/acme/key-change",
   "meta": {
     "termsOfService": "http://example.invalid/terms"
@@ -724,36 +748,14 @@ func TestDirectory(t *testing.T) {
   "newOrder": "http://localhost:4300/acme/new-order",
   "revokeCert": "http://localhost:4300/acme/revoke-cert",
   "AAAAAAAAAAA": "https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417"
-}`
-
-	// NOTE: the req.URL will be modified and must be constructed per
-	// testcase or things will break and you will be confused and sad.
-	url, _ := url.Parse("/directory")
-	req := &http.Request{
-		Method: "GET",
-		URL:    url,
-		Host:   "localhost:4300",
-	}
-	// Serve the /directory response for this request into a recorder
-	responseWriter := httptest.NewRecorder()
-	mux.ServeHTTP(responseWriter, req)
-	// We expect all directory requests to return a json object with a good HTTP status
-	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/json")
-	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
-	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), metaJSON)
-	// Check if there is a random directory key present and if so, that it is
-	// expected to be present
-	test.AssertEquals(t,
-		randomDirectoryKeyPresent(t, responseWriter.Body.Bytes()),
-		true)
-
-	// Configure a caaIdentity and website for the /directory meta
-	wfe.DirectoryCAAIdentity = "Radiant Lock"
-	wfe.DirectoryWebsite = "zombo.com"
-
-	// Expect directory with a key change endpoint and a meta entry that has both
-	// a website and a caaIdentity
-	metaJSON = `{
+}`,
+		},
+		{
+			name:     "standard GET, CAA ident/website meta",
+			caaIdent: "Radiant Lock",
+			website:  "zombo.com",
+			request:  getReq,
+			expectedJSON: `{
   "AAAAAAAAAAA": "https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417",
   "keyChange": "http://localhost:4300/acme/key-change",
   "meta": {
@@ -767,24 +769,56 @@ func TestDirectory(t *testing.T) {
   "newNonce": "http://localhost:4300/acme/new-nonce",
   "newOrder": "http://localhost:4300/acme/new-order",
   "revokeCert": "http://localhost:4300/acme/revoke-cert"
-}`
-	// Serve the /directory response for this request into a recorder
-	responseWriter = httptest.NewRecorder()
-	mux.ServeHTTP(responseWriter, req)
-	// We expect all directory requests to return a json object with a good HTTP status
-	test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/json")
-	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
-	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), metaJSON)
-	// Check if there is a random directory key present and if so, that it is
-	// expected to be present
-	test.AssertEquals(t,
-		randomDirectoryKeyPresent(t, responseWriter.Body.Bytes()),
-		true)
+}`,
+		},
+		{
+			name:     "POST-as-GET, CAA ident/website meta",
+			caaIdent: "Radiant Lock",
+			website:  "zombo.com",
+			request:  postAsGetReq,
+			expectedJSON: `{
+  "AAAAAAAAAAA": "https://community.letsencrypt.org/t/adding-random-entries-to-the-directory/33417",
+  "keyChange": "http://localhost/acme/key-change",
+  "meta": {
+    "caaIdentities": [
+      "Radiant Lock"
+    ],
+    "termsOfService": "http://example.invalid/terms",
+    "website": "zombo.com"
+  },
+  "newAccount": "http://localhost/acme/new-acct",
+  "newNonce": "http://localhost/acme/new-nonce",
+  "newOrder": "http://localhost/acme/new-order",
+  "revokeCert": "http://localhost/acme/revoke-cert"
+}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Configure a caaIdentity and website for the /directory meta based on the tc
+			wfe.DirectoryCAAIdentity = tc.caaIdent // "Radiant Lock"
+			wfe.DirectoryWebsite = tc.website      //"zombo.com"
+			responseWriter := httptest.NewRecorder()
+			// Serve the /directory response for this request into a recorder
+			mux.ServeHTTP(responseWriter, tc.request)
+			// We expect all directory requests to return a json object with a good HTTP status
+			test.AssertEquals(t, responseWriter.Header().Get("Content-Type"), "application/json")
+			// We expect all requests to return status OK
+			test.AssertEquals(t, responseWriter.Code, http.StatusOK)
+			// The response should match expected
+			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tc.expectedJSON)
+			// Check that the random directory key is present
+			test.AssertEquals(t,
+				randomDirectoryKeyPresent(t, responseWriter.Body.Bytes()),
+				true)
+		})
+	}
 }
 
 func TestRelativeDirectory(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	core.RandReader = fakeRand{}
 	defer func() { core.RandReader = rand.Reader }()
 
@@ -843,37 +877,64 @@ func TestRelativeDirectory(t *testing.T) {
 }
 
 // TestNonceEndpoint tests requests to the WFE2's new-nonce endpoint
-func TestNonceEndpointGET(t *testing.T) {
+func TestNonceEndpoint(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
+
+	getReq := &http.Request{
+		Method: http.MethodGet,
+		URL:    mustParseURL(newNoncePath),
+	}
+	headReq := &http.Request{
+		Method: http.MethodHead,
+		URL:    mustParseURL(newNoncePath),
+	}
+
+	// Make two PAG requests. We can't use the same req twice because the nonce in
+	// the signature will be stale the 2nd time.
+	_, _, jwsBodyA := signRequestKeyID(t, 1, nil, fmt.Sprintf("http://localhost%s", newNoncePath), "", wfe.nonceService)
+	_, _, jwsBodyB := signRequestKeyID(t, 1, nil, fmt.Sprintf("http://localhost%s", newNoncePath), "", wfe.nonceService)
+	postAsGetReqA := makePostRequestWithPath(newNoncePath, jwsBodyA)
+	postAsGetReqB := makePostRequestWithPath(newNoncePath, jwsBodyB)
 
 	testCases := []struct {
-		Name              string
-		Method            string
-		ExpectedStatus    int
-		HeadNonceStatusOK bool
+		name              string
+		request           *http.Request
+		expectedStatus    int
+		headNonceStatusOK bool
 	}{
 		{
-			Name:           "GET new-nonce request",
-			Method:         "GET",
-			ExpectedStatus: http.StatusNoContent,
+			name:           "GET new-nonce request",
+			request:        getReq,
+			expectedStatus: http.StatusNoContent,
 		},
 		{
-			Name:           "HEAD new-nonce request (legacy)",
-			Method:         "HEAD",
-			ExpectedStatus: http.StatusNoContent,
+			name:           "HEAD new-nonce request (legacy status code)",
+			request:        headReq,
+			expectedStatus: http.StatusNoContent,
 		},
 		{
-			Name:              "HEAD new-nonce request (feature flag)",
-			Method:            "HEAD",
-			ExpectedStatus:    http.StatusOK,
-			HeadNonceStatusOK: true,
+			name:              "HEAD new-nonce request (ok status code)",
+			request:           headReq,
+			expectedStatus:    http.StatusOK,
+			headNonceStatusOK: true,
+		},
+		{
+			name:           "POST-as-GET new-nonce request (legacy status code)",
+			request:        postAsGetReqA,
+			expectedStatus: http.StatusNoContent,
+		},
+		{
+			name:              "POST-as-GET new-nonce request (ok status code)",
+			request:           postAsGetReqB,
+			expectedStatus:    http.StatusOK,
+			headNonceStatusOK: true,
 		},
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			if tc.HeadNonceStatusOK {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.headNonceStatusOK {
 				if err := features.Set(map[string]bool{"HeadNonceStatusOK": true}); err != nil {
 					t.Fatalf("Failed to enable HeadNonceStatusOK feature: %v", err)
 				}
@@ -881,12 +942,9 @@ func TestNonceEndpointGET(t *testing.T) {
 			}
 
 			responseWriter := httptest.NewRecorder()
-			mux.ServeHTTP(responseWriter, &http.Request{
-				Method: tc.Method,
-				URL:    mustParseURL(newNoncePath),
-			})
+			mux.ServeHTTP(responseWriter, tc.request)
 			// The response should have the expected HTTP status code
-			test.AssertEquals(t, responseWriter.Code, tc.ExpectedStatus)
+			test.AssertEquals(t, responseWriter.Code, tc.expectedStatus)
 			// And the response should contain a valid nonce in the Replay-Nonce header
 			nonce := responseWriter.Header().Get("Replay-Nonce")
 			test.AssertEquals(t, wfe.nonceService.Valid(nonce), true)
@@ -896,7 +954,7 @@ func TestNonceEndpointGET(t *testing.T) {
 
 func TestHTTPMethods(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	// NOTE: Boulder's muxer treats HEAD as implicitly allowed if GET is specified
 	// so we include both here in `getOnly`
@@ -915,9 +973,9 @@ func TestHTTPMethods(t *testing.T) {
 			Allowed: getOnly,
 		},
 		{
-			Name:    "Directory path should be GET only",
+			Name:    "Directory path should be GET or POST only",
 			Path:    directoryPath,
-			Allowed: getOnly,
+			Allowed: getOrPost,
 		},
 		{
 			Name:    "NewAcct path should be POST only",
@@ -979,9 +1037,9 @@ func TestHTTPMethods(t *testing.T) {
 			Allowed: getOrPost,
 		},
 		{
-			Name:    "Nonce path should be GET only",
+			Name:    "Nonce path should be GET or POST only",
 			Path:    newNoncePath,
-			Allowed: getOnly,
+			Allowed: getOrPost,
 		},
 	}
 
@@ -1047,7 +1105,7 @@ func TestGetChallenge(t *testing.T) {
 		req.URL.Path = "1/-ZfxEw"
 		test.AssertNotError(t, err, "Could not make NewRequest")
 
-		wfe.ChallengeV2(ctx, newRequestEvent(), resp, req)
+		wfe.Challenge(ctx, newRequestEvent(), resp, req)
 		test.AssertEquals(t,
 			resp.Code,
 			http.StatusOK)
@@ -1138,8 +1196,8 @@ func TestChallenge(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
 			responseWriter := httptest.NewRecorder()
-			wfe.ChallengeV2(ctx, newRequestEvent(), responseWriter, tc.Request)
-			// Check the reponse code, headers and body match expected
+			wfe.Challenge(ctx, newRequestEvent(), responseWriter, tc.Request)
+			// Check the response code, headers and body match expected
 			headers := responseWriter.Header()
 			body := responseWriter.Body.String()
 			test.AssertEquals(t, responseWriter.Code, tc.ExpectedStatus)
@@ -1172,7 +1230,7 @@ func TestUpdateChallengeFinalizedAuthz(t *testing.T) {
 	signedURL := "http://localhost/1/-ZfxEw"
 	_, _, jwsBody := signRequestKeyID(t, 1, nil, signedURL, `{}`, wfe.nonceService)
 	request := makePostRequestWithPath("1/-ZfxEw", jwsBody)
-	wfe.ChallengeV2(ctx, newRequestEvent(), responseWriter, request)
+	wfe.Challenge(ctx, newRequestEvent(), responseWriter, request)
 
 	body := responseWriter.Body.String()
 	test.AssertUnmarshaledEquals(t, body, `{
@@ -1196,7 +1254,7 @@ func TestUpdateChallengeRAError(t *testing.T) {
 	responseWriter := httptest.NewRecorder()
 	request := makePostRequestWithPath("2/-ZfxEw", jwsBody)
 
-	wfe.ChallengeV2(ctx, newRequestEvent(), responseWriter, request)
+	wfe.Challenge(ctx, newRequestEvent(), responseWriter, request)
 
 	// The result should be an internal server error problem.
 	body := responseWriter.Body.String()
@@ -1336,7 +1394,7 @@ func TestEmptyAccount(t *testing.T) {
 
 func TestNewAccount(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	key := loadKey(t, []byte(test2KeyPrivatePEM))
 	_, ok := key.(*rsa.PrivateKey)
 	test.Assert(t, ok, "Couldn't load test2 key")
@@ -1501,7 +1559,7 @@ func TestGetAuthorization(t *testing.T) {
 	// Expired authorizations should be inaccessible
 	authzURL := "3"
 	responseWriter := httptest.NewRecorder()
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, &http.Request{
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, &http.Request{
 		Method: "GET",
 		URL:    mustParseURL(authzURL),
 	})
@@ -1511,7 +1569,7 @@ func TestGetAuthorization(t *testing.T) {
 	responseWriter.Body.Reset()
 
 	// Ensure that a valid authorization can't be reached with an invalid URL
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, &http.Request{
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, &http.Request{
 		URL:    mustParseURL("1d"),
 		Method: "GET",
 	})
@@ -1523,7 +1581,7 @@ func TestGetAuthorization(t *testing.T) {
 
 	responseWriter = httptest.NewRecorder()
 	// Ensure that a POST-as-GET to an authorization works
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, postAsGet)
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, postAsGet)
 	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
 	body := responseWriter.Body.String()
 	test.AssertUnmarshaledEquals(t, body, `
@@ -1560,7 +1618,7 @@ func TestAuthorization500(t *testing.T) {
 	wfe, _ := setupWFE(t)
 
 	responseWriter := httptest.NewRecorder()
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, &http.Request{
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, &http.Request{
 		Method: "GET",
 		URL:    mustParseURL("4"),
 	})
@@ -1583,7 +1641,7 @@ func TestAuthorizationChallengeNamespace(t *testing.T) {
 	// For "oldNS" the SA mock returns an authorization with a failed challenge
 	// that has an error with the type already prefixed by the v1 error NS
 	responseWriter := httptest.NewRecorder()
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, &http.Request{
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, &http.Request{
 		Method: "GET",
 		URL:    mustParseURL("55"),
 	})
@@ -1598,7 +1656,7 @@ func TestAuthorizationChallengeNamespace(t *testing.T) {
 	// For "failed" the SA mock returns an authorization with a failed challenge
 	// that has an error with the type not prefixed by an error namespace.
 	responseWriter = httptest.NewRecorder()
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, &http.Request{
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, &http.Request{
 		Method: "GET",
 		URL:    mustParseURL("56"),
 	})
@@ -1622,7 +1680,7 @@ func contains(s []string, e string) bool {
 
 func TestAccount(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	responseWriter := httptest.NewRecorder()
 
 	// Test GET proper entry returns 405
@@ -1730,7 +1788,7 @@ func TestIssuer(t *testing.T) {
 
 func TestGetCertificate(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	makeGet := func(path string) *http.Request {
 		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"}
@@ -1752,6 +1810,8 @@ func TestGetCertificate(t *testing.T) {
 	test.AssertNotError(t, err, "Error reading ../test/test-ca2.pem")
 
 	noCache := "public, max-age=0, no-cache"
+	newSerial := "/acme/cert/0000000000000000000000000000000000b3"
+	newGetSerial := "/get/cert/0000000000000000000000000000000000b3"
 	goodSerial := "/acme/cert/0000000000000000000000000000000000b2"
 	notFound := `{"type":"` + probs.V2ErrorNS + `malformed","detail":"Certificate not found","status":404}`
 
@@ -1762,6 +1822,7 @@ func TestGetCertificate(t *testing.T) {
 		ExpectedHeaders map[string]string
 		ExpectedBody    string
 		ExpectedCert    []byte
+		AnyCert         bool
 	}{
 		{
 			Name:           "Valid serial",
@@ -1819,6 +1880,34 @@ func TestGetCertificate(t *testing.T) {
 			ExpectedStatus: http.StatusNotFound,
 			ExpectedBody:   notFound,
 		},
+		{
+			Name:           "New cert",
+			Request:        makeGet(newGetSerial),
+			ExpectedStatus: http.StatusForbidden,
+			ExpectedBody: `{
+				"type": "` + probs.V2ErrorNS + `unauthorized",
+				"detail": "Certificate is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago",
+				"status": 403
+			}`,
+		},
+		{
+			Name:           "New cert, old endpoint",
+			Request:        makeGet(newSerial),
+			ExpectedStatus: http.StatusOK,
+			ExpectedHeaders: map[string]string{
+				"Content-Type": pkixContent,
+			},
+			AnyCert: true,
+		},
+		{
+			Name:           "New cert, POST-as-GET",
+			Request:        makePost(1, nil, newSerial, ""),
+			ExpectedStatus: http.StatusOK,
+			ExpectedHeaders: map[string]string{
+				"Content-Type": pkixContent,
+			},
+			AnyCert: true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1840,6 +1929,10 @@ func TestGetCertificate(t *testing.T) {
 			// If the test cases expects additional headers, check those too
 			for h, v := range tc.ExpectedHeaders {
 				test.AssertEquals(t, headers.Get(h), v)
+			}
+
+			if tc.AnyCert { // Certificate is randomly generated, don't match it
+				return
 			}
 
 			if len(tc.ExpectedCert) > 0 {
@@ -1882,7 +1975,7 @@ func TestGetCertificateHEADHasCorrectBodyLength(t *testing.T) {
 	mockLog := wfe.log.(*blog.Mock)
 	mockLog.Clear()
 
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	s := httptest.NewServer(mux)
 	defer s.Close()
 	req, _ := http.NewRequest("HEAD", s.URL+"/acme/cert/0000000000000000000000000000000000b2", nil)
@@ -1909,7 +2002,7 @@ func newRequestEvent() *web.RequestEvent {
 
 func TestHeaderBoulderRequester(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	responseWriter := httptest.NewRecorder()
 
 	key := loadKey(t, []byte(test1KeyPrivatePEM))
@@ -1943,7 +2036,7 @@ func TestDeactivateAuthorization(t *testing.T) {
 	_, _, body := signRequestKeyID(t, 1, nil, "http://localhost/1", payload, wfe.nonceService)
 	request := makePostRequestWithPath("1", body)
 
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, request)
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, request)
 	test.AssertUnmarshaledEquals(t,
 		responseWriter.Body.String(),
 		`{"type": "`+probs.V2ErrorNS+`malformed","detail": "Invalid status value","status": 400}`)
@@ -1953,7 +2046,7 @@ func TestDeactivateAuthorization(t *testing.T) {
 	_, _, body = signRequestKeyID(t, 1, nil, "http://localhost/1", payload, wfe.nonceService)
 	request = makePostRequestWithPath("1", body)
 
-	wfe.AuthorizationV2(ctx, newRequestEvent(), responseWriter, request)
+	wfe.Authorization(ctx, newRequestEvent(), responseWriter, request)
 	test.AssertUnmarshaledEquals(t,
 		responseWriter.Body.String(),
 		`{
@@ -2421,6 +2514,7 @@ func TestGetOrder(t *testing.T) {
 		Name     string
 		Request  *http.Request
 		Response string
+		Endpoint string
 	}{
 		{
 			Name:     "Good request",
@@ -2472,12 +2566,32 @@ func TestGetOrder(t *testing.T) {
 			Request:  makePost(1, "1/1", ""),
 			Response: `{"status": "valid","expires": "1970-01-01T00:00:00.9466848Z","identifiers":[{"type":"dns", "value":"example.com"}], "authorizations":["http://localhost/acme/authz-v3/1"],"finalize":"http://localhost/acme/finalize/1/1","certificate":"http://localhost/acme/cert/serial"}`,
 		},
+		{
+			Name:     "GET new order",
+			Request:  makeGet("1/9"),
+			Response: `{"type":"` + probs.V2ErrorNS + `unauthorized","detail":"Order is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago","status":403}`,
+			Endpoint: "/get/order/",
+		},
+		{
+			Name:     "GET new order from old endpoint",
+			Request:  makeGet("1/9"),
+			Response: `{"status": "valid","expires": "1970-01-01T00:00:00.9466848Z","identifiers":[{"type":"dns", "value":"example.com"}], "authorizations":["http://localhost/acme/authz-v3/1"],"finalize":"http://localhost/acme/finalize/1/9","certificate":"http://localhost/acme/cert/serial"}`,
+		},
+		{
+			Name:     "POST-as-GET new order",
+			Request:  makePost(1, "1/9", ""),
+			Response: `{"status": "valid","expires": "1970-01-01T00:00:00.9466848Z","identifiers":[{"type":"dns", "value":"example.com"}], "authorizations":["http://localhost/acme/authz-v3/1"],"finalize":"http://localhost/acme/finalize/1/9","certificate":"http://localhost/acme/cert/serial"}`,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
 			responseWriter := httptest.NewRecorder()
-			wfe.GetOrder(ctx, newRequestEvent(), responseWriter, tc.Request)
+			if tc.Endpoint != "" {
+				wfe.GetOrder(ctx, &web.RequestEvent{Extra: make(map[string]interface{}), Endpoint: tc.Endpoint}, responseWriter, tc.Request)
+			} else {
+				wfe.GetOrder(ctx, newRequestEvent(), responseWriter, tc.Request)
+			}
 			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tc.Response)
 		})
 	}
@@ -2905,7 +3019,7 @@ func TestPrepAuthzForDisplay(t *testing.T) {
 	test.AssertEquals(t, authz.Wildcard, true)
 	// The authz should not have any combinations
 	// NOTE(@cpu): We don't use test.AssertNotNil here because its use of
-	// interface{} types makes a comparsion of [][]int{nil} and nil fail.
+	// interface{} types makes a comparison of [][]int{nil} and nil fail.
 	if authz.Combinations != nil {
 		t.Errorf("Authz had a non-nil combinations")
 	}
@@ -3013,13 +3127,13 @@ func TestMandatoryPOSTAsGET(t *testing.T) {
 			// GET requests to a mocked authorization path should return an error
 			name:    "GET Authz",
 			path:    "1",
-			handler: wfe.AuthorizationV2,
+			handler: wfe.Authorization,
 		},
 		{
 			// GET requests to a mocked challenge path should return an error
 			name:    "GET Chall",
 			path:    "1/-ZfxEw",
-			handler: wfe.ChallengeV2,
+			handler: wfe.Challenge,
 		},
 		{
 			// GET requests to a mocked certificate serial path should return an error
@@ -3039,7 +3153,7 @@ func TestMandatoryPOSTAsGET(t *testing.T) {
 	}
 }
 
-func TestGetChallengeV2UpRel(t *testing.T) {
+func TestGetChallengeUpRel(t *testing.T) {
 	if !strings.HasSuffix(os.Getenv("BOULDER_CONFIG_DIR"), "config-next") {
 		return
 	}
@@ -3053,7 +3167,7 @@ func TestGetChallengeV2UpRel(t *testing.T) {
 	test.AssertNotError(t, err, "Could not make NewRequest")
 	req.URL.Path = "1/-ZfxEw"
 
-	wfe.ChallengeV2(ctx, newRequestEvent(), resp, req)
+	wfe.Challenge(ctx, newRequestEvent(), resp, req)
 	test.AssertEquals(t,
 		resp.Code,
 		http.StatusOK)
@@ -3083,4 +3197,98 @@ func TestPrepAccountForDisplay(t *testing.T) {
 
 	// The ID field should now be zeroed
 	test.AssertEquals(t, acct.ID, int64(0))
+}
+
+func TestGETAPIAuthz(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	makeGet := func(path, endpoint string) (*http.Request, *web.RequestEvent) {
+		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"},
+			&web.RequestEvent{Endpoint: endpoint}
+	}
+
+	testCases := []struct {
+		name              string
+		path              string
+		expectTooFreshErr bool
+	}{
+		{
+			name:              "fresh authz",
+			path:              "1",
+			expectTooFreshErr: true,
+		},
+		{
+			name:              "old authz",
+			path:              "2",
+			expectTooFreshErr: false,
+		},
+	}
+
+	tooFreshErr := `{"type":"` + probs.V2ErrorNS + `unauthorized","detail":"Authorization is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago","status":403}`
+	for _, tc := range testCases {
+		responseWriter := httptest.NewRecorder()
+		req, logEvent := makeGet(tc.path, getAuthzv2Path)
+		wfe.Authorization(context.Background(), logEvent, responseWriter, req)
+
+		if responseWriter.Code == http.StatusOK && tc.expectTooFreshErr {
+			t.Errorf("expected too fresh error, got http.StatusOK")
+		} else {
+			test.AssertEquals(t, responseWriter.Code, http.StatusForbidden)
+			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tooFreshErr)
+		}
+	}
+}
+
+func TestGETAPIChallenge(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	makeGet := func(path, endpoint string) (*http.Request, *web.RequestEvent) {
+		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"},
+			&web.RequestEvent{Endpoint: endpoint}
+	}
+
+	testCases := []struct {
+		name              string
+		path              string
+		expectTooFreshErr bool
+	}{
+		{
+			name:              "fresh authz challenge",
+			path:              "1/-ZfxEw",
+			expectTooFreshErr: true,
+		},
+		{
+			name:              "old authz challenge",
+			path:              "2/-ZfxEw",
+			expectTooFreshErr: false,
+		},
+	}
+
+	tooFreshErr := `{"type":"` + probs.V2ErrorNS + `unauthorized","detail":"Authorization is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago","status":403}`
+	for _, tc := range testCases {
+		responseWriter := httptest.NewRecorder()
+		req, logEvent := makeGet(tc.path, getAuthzv2Path)
+		wfe.Challenge(context.Background(), logEvent, responseWriter, req)
+
+		if responseWriter.Code == http.StatusOK && tc.expectTooFreshErr {
+			t.Errorf("expected too fresh error, got http.StatusOK")
+		} else {
+			test.AssertEquals(t, responseWriter.Code, http.StatusForbidden)
+			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tooFreshErr)
+		}
+	}
+}
+
+func TestGetAPIAndMandatoryPOSTAsGET(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	makeGet := func(path, endpoint string) (*http.Request, *web.RequestEvent) {
+		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"},
+			&web.RequestEvent{Endpoint: endpoint, Extra: map[string]interface{}{}}
+	}
+	_ = features.Set(map[string]bool{"MandatoryPOSTAsGET": true})
+	defer features.Reset()
+
+	oldSerial := "0000000000000000000000000000000000b2"
+	req, event := makeGet(oldSerial, getCertPath)
+	resp := httptest.NewRecorder()
+	wfe.Certificate(context.Background(), event, resp, req)
+	test.AssertEquals(t, resp.Code, 200)
 }

@@ -25,7 +25,6 @@ import (
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/identifier"
 	blog "github.com/letsencrypt/boulder/log"
-	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/metrics/measured_http"
 	"github.com/letsencrypt/boulder/nonce"
 	noncepb "github.com/letsencrypt/boulder/nonce/proto"
@@ -61,6 +60,12 @@ const (
 	newOrderPath      = "/acme/new-order"
 	orderPath         = "/acme/order/"
 	finalizeOrderPath = "/acme/finalize/"
+
+	getAPIPrefix       = "/get/"
+	getOrderPath       = getAPIPrefix + "order/"
+	getAuthzv2Path     = getAPIPrefix + "authz-v3/"
+	getChallengev2Path = getAPIPrefix + "chall-v3/"
+	getCertPath        = getAPIPrefix + "cert/"
 )
 
 // WebFrontEndImpl provides all the logic for Boulder's web-facing interface,
@@ -73,7 +78,6 @@ type WebFrontEndImpl struct {
 	log   blog.Logger
 	clk   clock.Clock
 	stats wfe2Stats
-	scope metrics.Scope
 
 	// Issuer certificate (DER) for /acme/issuer-cert
 	IssuerCert []byte
@@ -102,7 +106,7 @@ type WebFrontEndImpl struct {
 
 	// Allowed prefix for legacy accounts used by verify.go's `lookupJWK`.
 	// See `cmd/boulder-wfe2/main.go`'s comment on the configuration field
-	// `LegacyKeyIDPrefix` for more informaton.
+	// `LegacyKeyIDPrefix` for more information.
 	LegacyKeyIDPrefix string
 
 	// Register of anti-replay nonces
@@ -118,11 +122,24 @@ type WebFrontEndImpl struct {
 
 	// Maximum duration of a request
 	RequestTimeout time.Duration
+
+	// StaleTimeout determines the required staleness for resources allowed to be
+	// accessed via Boulder-specific GET-able APIs. Resources newer than
+	// staleTimeout must be accessed via POST-as-GET and the RFC 8555 ACME API. We
+	// do this to incentivize client developers to use the standard API.
+	staleTimeout time.Duration
+
+	// How long before authorizations and pending authorizations expire. The
+	// Boulder specific GET-able API uses these values to find the creation date
+	// of authorizations to determine if they are stale enough. The values should
+	// match the ones used by the RA.
+	authorizationLifetime        time.Duration
+	pendingAuthorizationLifetime time.Duration
 }
 
 // NewWebFrontEndImpl constructs a web service for Boulder
 func NewWebFrontEndImpl(
-	scope metrics.Scope,
+	stats prometheus.Registerer,
 	clk clock.Clock,
 	keyPolicy goodkey.KeyPolicy,
 	certificateChains map[string][]byte,
@@ -130,21 +147,26 @@ func NewWebFrontEndImpl(
 	remoteNonceService noncepb.NonceServiceClient,
 	noncePrefixMap map[string]noncepb.NonceServiceClient,
 	logger blog.Logger,
+	staleTimeout time.Duration,
+	authorizationLifetime time.Duration,
+	pendingAuthorizationLifetime time.Duration,
 ) (WebFrontEndImpl, error) {
 	wfe := WebFrontEndImpl{
-		log:                logger,
-		clk:                clk,
-		keyPolicy:          keyPolicy,
-		certificateChains:  certificateChains,
-		issuerCertificates: issuerCertificates,
-		stats:              initStats(scope),
-		scope:              scope,
-		remoteNonceService: remoteNonceService,
-		noncePrefixMap:     noncePrefixMap,
+		log:                          logger,
+		clk:                          clk,
+		keyPolicy:                    keyPolicy,
+		certificateChains:            certificateChains,
+		issuerCertificates:           issuerCertificates,
+		stats:                        initStats(stats),
+		remoteNonceService:           remoteNonceService,
+		noncePrefixMap:               noncePrefixMap,
+		staleTimeout:                 staleTimeout,
+		authorizationLifetime:        authorizationLifetime,
+		pendingAuthorizationLifetime: pendingAuthorizationLifetime,
 	}
 
 	if wfe.remoteNonceService == nil {
-		nonceService, err := nonce.NewNonceService(scope, 0, "")
+		nonceService, err := nonce.NewNonceService(stats, 0, "")
 		if err != nil {
 			return WebFrontEndImpl{}, err
 		}
@@ -196,7 +218,6 @@ func (wfe *WebFrontEndImpl) HandleFunc(mux *http.ServeMux, pattern string, h web
 				if wfe.remoteNonceService != nil {
 					nonceMsg, err := wfe.remoteNonceService.Nonce(ctx, &corepb.Empty{})
 					if err != nil {
-						fmt.Println("fucking broken", err)
 						wfe.sendError(response, logEvent, probs.ServerInternal("unable to get nonce"), err)
 						return
 					}
@@ -335,15 +356,11 @@ func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory m
 
 // Handler returns an http.Handler that uses various functions for
 // various ACME-specified paths.
-func (wfe *WebFrontEndImpl) Handler() http.Handler {
+func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
 	m := http.NewServeMux()
 	// Boulder specific endpoints
 	wfe.HandleFunc(m, issuerPath, wfe.Issuer, "GET")
 	wfe.HandleFunc(m, buildIDPath, wfe.BuildID, "GET")
-
-	// GETable ACME endpoints
-	wfe.HandleFunc(m, directoryPath, wfe.Directory, "GET")
-	wfe.HandleFunc(m, newNoncePath, wfe.Nonce, "GET")
 
 	// POSTable ACME endpoints
 	wfe.HandleFunc(m, newAcctPath, wfe.NewAccount, "POST")
@@ -353,19 +370,27 @@ func (wfe *WebFrontEndImpl) Handler() http.Handler {
 	wfe.HandleFunc(m, newOrderPath, wfe.NewOrder, "POST")
 	wfe.HandleFunc(m, finalizeOrderPath, wfe.FinalizeOrder, "POST")
 
+	// GETable and POST-as-GETable ACME endpoints
+	wfe.HandleFunc(m, directoryPath, wfe.Directory, "GET", "POST")
+	wfe.HandleFunc(m, newNoncePath, wfe.Nonce, "GET", "POST")
 	// POST-as-GETable ACME endpoints
-	// TODO(@cpu): After November 1st, 2019 support for "GET" to the following
+	// TODO(@cpu): After November 1st, 2020 support for "GET" to the following
 	// endpoints will be removed, leaving only POST-as-GET support.
 	wfe.HandleFunc(m, orderPath, wfe.GetOrder, "GET", "POST")
-	wfe.HandleFunc(m, authzv2Path, wfe.AuthorizationV2, "GET", "POST")
-	wfe.HandleFunc(m, challengev2Path, wfe.ChallengeV2, "GET", "POST")
+	wfe.HandleFunc(m, authzv2Path, wfe.Authorization, "GET", "POST")
+	wfe.HandleFunc(m, challengev2Path, wfe.Challenge, "GET", "POST")
 	wfe.HandleFunc(m, certPath, wfe.Certificate, "GET", "POST")
+	// Boulder-specific GET-able resource endpoints
+	wfe.HandleFunc(m, getOrderPath, wfe.GetOrder, "GET")
+	wfe.HandleFunc(m, getAuthzv2Path, wfe.Authorization, "GET")
+	wfe.HandleFunc(m, getChallengev2Path, wfe.Challenge, "GET")
+	wfe.HandleFunc(m, getCertPath, wfe.Certificate, "GET")
 
 	// We don't use our special HandleFunc for "/" because it matches everything,
 	// meaning we can wind up returning 405 when we mean to return 404. See
 	// https://github.com/letsencrypt/boulder/issues/717
 	m.Handle("/", web.NewTopHandler(wfe.log, web.WFEHandlerFunc(wfe.Index)))
-	return measured_http.New(m, wfe.clk, wfe.scope)
+	return measured_http.New(m, wfe.clk, stats)
 }
 
 // Method implementations
@@ -426,6 +451,15 @@ func (wfe *WebFrontEndImpl) Directory(
 		"keyChange":  rolloverPath,
 	}
 
+	if request.Method == http.MethodPost {
+		acct, prob := wfe.validPOSTAsGETForAccount(request, ctx, logEvent)
+		if prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
+		logEvent.Requester = acct.ID
+	}
+
 	// Add a random key to the directory in order to make sure that clients don't hardcode an
 	// expected set of keys. This ensures that we can properly extend the directory when we
 	// need to add a new endpoint or meta element.
@@ -473,12 +507,21 @@ func (wfe *WebFrontEndImpl) Nonce(
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
 	request *http.Request) {
+	if request.Method == http.MethodPost {
+		acct, prob := wfe.validPOSTAsGETForAccount(request, ctx, logEvent)
+		if prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
+		logEvent.Requester = acct.ID
+	}
+
 	statusCode := http.StatusNoContent
 	// The ACME specification says GET requets should receive http.StatusNoContent
-	// and HEAD requests should receive http.StatusOK. We gate this with the
-	// HeadNonceStatusOK feature flag because it may break clients that are
-	// programmed to expect StatusOK.
-	if features.Enabled(features.HeadNonceStatusOK) && request.Method == "HEAD" {
+	// and HEAD/POST-as-GET requests should receive http.StatusOK. We gate this
+	// with the HeadNonceStatusOK feature flag because it may break clients that
+	// are programmed to expect StatusOK.
+	if features.Enabled(features.HeadNonceStatusOK) && request.Method != "GET" {
 		statusCode = http.StatusOK
 	}
 	response.WriteHeader(statusCode)
@@ -966,10 +1009,10 @@ func (wfe *WebFrontEndImpl) logCsr(request *http.Request, cr core.CertificateReq
 	wfe.log.AuditObject("Certificate request", csrLog)
 }
 
-// ChallengeV2 handles POST requests to challenge URLs belonging to
+// Challenge handles POST requests to challenge URLs belonging to
 // authzv2-style authorizations.  Such requests are clients'
 // responses to the server's challenges.
-func (wfe *WebFrontEndImpl) ChallengeV2(
+func (wfe *WebFrontEndImpl) Challenge(
 	ctx context.Context,
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
@@ -1008,7 +1051,7 @@ func (wfe *WebFrontEndImpl) ChallengeV2(
 		return
 	}
 
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost {
+	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
 		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
 		return
 	}
@@ -1016,6 +1059,13 @@ func (wfe *WebFrontEndImpl) ChallengeV2(
 	if authz.Expires == nil || authz.Expires.Before(wfe.clk.Now()) {
 		wfe.sendError(response, logEvent, probs.NotFound("Expired authorization"), nil)
 		return
+	}
+
+	if requiredStale(request, logEvent) {
+		if prob := wfe.staleEnoughToGETAuthz(authz); prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
 	}
 
 	if authz.Identifier.Type == identifier.DNS {
@@ -1159,7 +1209,7 @@ func (wfe *WebFrontEndImpl) postChallenge(
 		return
 	}
 
-	// If the JWS body is empty then this POST is a POST-as-GET to retreive
+	// If the JWS body is empty then this POST is a POST-as-GET to retrieve
 	// challenge details, not a POST to initiate a challenge
 	if string(body) == "" {
 		challenge := authz.Challenges[challengeIndex]
@@ -1169,11 +1219,9 @@ func (wfe *WebFrontEndImpl) postChallenge(
 
 	// We can expect some clients to try and update a challenge for an authorization
 	// that is already valid. In this case we don't need to process the challenge
-	// update. It wouldn't be helpful, the overall authorization is already good! We
-	// increment a stat for this case and return early.
+	// update. It wouldn't be helpful, the overall authorization is already good!
 	var returnAuthz core.Authorization
 	if authz.Status == core.StatusValid {
-		wfe.scope.Inc("ReusedValidAuthzChallengeWFE", 1)
 		returnAuthz = authz
 	} else {
 
@@ -1378,30 +1426,13 @@ func (wfe *WebFrontEndImpl) deactivateAuthorization(
 	return true
 }
 
-// authzLookupFunc is used by handleAuthorization to look up either an authzv1
-// or an authzv2, as appropriate.
-type authzLookupFunc func() (*core.Authorization, error)
+func (wfe *WebFrontEndImpl) Authorization(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request) {
 
-func (wfe *WebFrontEndImpl) AuthorizationV2(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	wfe.handleAuthorization(ctx, logEvent, response, request, func() (*core.Authorization, error) {
-		authzID, err := strconv.ParseInt(request.URL.Path, 10, 64)
-		if err != nil {
-			return nil, berrors.MalformedError("Invalid authorization ID")
-		}
-		authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authzID})
-		if err != nil {
-			return nil, err
-		}
-		authz, err := bgrpc.PBToAuthz(authzPB)
-		if err != nil {
-			return nil, err
-		}
-		return &authz, nil
-	})
-}
-
-func (wfe *WebFrontEndImpl) handleAuthorization(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request, lookupFunc authzLookupFunc) {
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost {
+	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
 		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
 		return
 	}
@@ -1423,7 +1454,13 @@ func (wfe *WebFrontEndImpl) handleAuthorization(ctx context.Context, logEvent *w
 		requestBody = body
 	}
 
-	authz, err := lookupFunc()
+	authzID, err := strconv.ParseInt(request.URL.Path, 10, 64)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid authorization ID"), nil)
+		return
+	}
+
+	authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authzID})
 	if berrors.Is(err, berrors.NotFound) {
 		wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
 		return
@@ -1434,6 +1471,13 @@ func (wfe *WebFrontEndImpl) handleAuthorization(ctx context.Context, logEvent *w
 		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
 		return
 	}
+
+	authz, err := bgrpc.PBToAuthz(authzPB)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+		return
+	}
+
 	if authz.Identifier.Type == identifier.DNS {
 		logEvent.DNSName = authz.Identifier.Value
 	}
@@ -1443,6 +1487,13 @@ func (wfe *WebFrontEndImpl) handleAuthorization(ctx context.Context, logEvent *w
 	if authz.Expires == nil || authz.Expires.Before(wfe.clk.Now()) {
 		wfe.sendError(response, logEvent, probs.NotFound("Expired authorization"), nil)
 		return
+	}
+
+	if requiredStale(request, logEvent) {
+		if prob := wfe.staleEnoughToGETAuthz(authz); prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
 	}
 
 	// If this was a POST that has an associated requestAccount and that account
@@ -1460,12 +1511,12 @@ func (wfe *WebFrontEndImpl) handleAuthorization(ctx context.Context, logEvent *w
 		// If the deactivation fails return early as errors and return codes
 		// have already been set. Otherwise continue so that the user gets
 		// sent the deactivated authorization.
-		if !wfe.deactivateAuthorization(ctx, authz, logEvent, response, requestBody) {
+		if !wfe.deactivateAuthorization(ctx, &authz, logEvent, response, requestBody) {
 			return
 		}
 	}
 
-	wfe.prepAuthorizationForDisplay(request, authz)
+	wfe.prepAuthorizationForDisplay(request, &authz)
 
 	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, authz)
 	if err != nil {
@@ -1480,7 +1531,7 @@ var allHex = regexp.MustCompile("^[0-9a-f]+$")
 // Certificate is used by clients to request a copy of their current certificate, or to
 // request a reissuance of the certificate.
 func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost {
+	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
 		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
 		return
 	}
@@ -1521,6 +1572,13 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 			wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), ierr)
 		}
 		return
+	}
+
+	if requiredStale(request, logEvent) {
+		if prob := wfe.staleEnoughToGETCert(cert); prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
 	}
 
 	// If there was a requesterAccount (e.g. because it was a POST-as-GET request)
@@ -1904,7 +1962,7 @@ func (wfe *WebFrontEndImpl) NewOrder(
 
 // GetOrder is used to retrieve a existing order object
 func (wfe *WebFrontEndImpl) GetOrder(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost {
+	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
 		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
 		return
 	}
@@ -1947,6 +2005,13 @@ func (wfe *WebFrontEndImpl) GetOrder(ctx context.Context, logEvent *web.RequestE
 		}
 		wfe.sendError(response, logEvent, probs.ServerInternal("Failed to retrieve order for ID %d", orderID), err)
 		return
+	}
+
+	if requiredStale(request, logEvent) {
+		if prob := wfe.staleEnoughToGETOrder(order); prob != nil {
+			wfe.sendError(response, logEvent, prob, nil)
+			return
+		}
 	}
 
 	if *order.RegistrationID != acctID {

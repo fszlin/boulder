@@ -25,7 +25,7 @@
     },
     "features": {
       "DeleteUnusedChallenges": true,
-      "FasterGetOrderForNames": true
+      "StoreIssuerInfo": true
     }
   },
 

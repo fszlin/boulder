@@ -77,8 +77,6 @@ func createPendingAuthorization(t *testing.T, sa core.StorageAuthority, domain s
 	}
 	authzPB, err := bgrpc.AuthzToPB(authz)
 	test.AssertNotError(t, err, "AuthzToPB failed")
-	v2 := true
-	authzPB.V2 = &v2
 	ids, err := sa.NewAuthorizations2(context.Background(), &sapb.AddPendingAuthorizationsRequest{
 		Authz: []*corepb.Authorization{authzPB},
 	})
@@ -303,7 +301,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 	if err != nil {
 		t.Fatalf("Failed to create dbMap: %s", err)
 	}
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc, log, metrics.NewNoopScope(), 1)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc, log, metrics.NoopRegisterer, 1)
 	if err != nil {
 		t.Fatalf("Failed to create SA: %s", err)
 	}
@@ -320,7 +318,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 	err = pa.SetHostnamePolicyFile("../test/hostname-policy.yaml")
 	test.AssertNotError(t, err, "Couldn't set hostname policy")
 
-	stats := metrics.NewNoopScope()
+	stats := metrics.NoopRegisterer
 
 	ca := &mocks.MockCA{
 		PEM: eeCertPEM,
@@ -338,7 +336,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 		Status:    core.StatusValid,
 	})
 
-	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, log, metrics.NewNoopScope())
+	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, log, metrics.NoopRegisterer)
 
 	ra := NewRegistrationAuthorityImpl(fc,
 		log,
@@ -379,7 +377,7 @@ func TestValidateContacts(t *testing.T) {
 	otherValidEmail := "mailto:other-admin@email.com"
 	malformedEmail := "mailto:admin.com"
 	nonASCII := "mailto:señor@email.com"
-	unparseable := "mailto:a@email.com, b@email.com"
+	unparsable := "mailto:a@email.com, b@email.com"
 	forbidden := "mailto:a@example.org"
 
 	err := ra.validateContacts(context.Background(), &[]string{})
@@ -403,8 +401,8 @@ func TestValidateContacts(t *testing.T) {
 	err = ra.validateContacts(context.Background(), &[]string{nonASCII})
 	test.AssertError(t, err, "Non ASCII email")
 
-	err = ra.validateContacts(context.Background(), &[]string{unparseable})
-	test.AssertError(t, err, "Unparseable email")
+	err = ra.validateContacts(context.Background(), &[]string{unparsable})
+	test.AssertError(t, err, "Unparsable email")
 
 	err = ra.validateContacts(context.Background(), &[]string{forbidden})
 	test.AssertError(t, err, "Forbidden email")
@@ -420,6 +418,22 @@ func TestValidateContacts(t *testing.T) {
 
 	err = ra.validateContacts(context.Background(), &[]string{"mailto:admin@[1.2.3.4]"})
 	test.AssertError(t, err, "Forbidden email")
+
+	err = ra.validateContacts(context.Background(), &[]string{"mailto:admin@a.com?no-reminder-emails"})
+	test.AssertError(t, err, "No hfields in email")
+
+	// The registrations.contact field is VARCHAR(191). 175 'a' characters plus
+	// the prefix "mailto:" and the suffix "@a.com" makes exactly 191 bytes of
+	// encoded JSON. The correct size to hit our maximum DB field length.
+	var longStringBuf strings.Builder
+	longStringBuf.WriteString("mailto:")
+	for i := 0; i < 175; i++ {
+		longStringBuf.WriteRune('a')
+	}
+	longStringBuf.WriteString("@a.com")
+
+	err = ra.validateContacts(context.Background(), &[]string{longStringBuf.String()})
+	test.AssertError(t, err, "Too long contacts")
 }
 
 func TestNewRegistration(t *testing.T) {
@@ -966,6 +980,11 @@ func TestPerformValidationSuccess(t *testing.T) {
 	test.Assert(t, len(vaAuthz.Challenges) > 0, "Authz passed to VA has no challenges")
 	challIdx = challTypeIndex(t, dbAuthz.Challenges, core.ChallengeTypeDNS01)
 	test.Assert(t, dbAuthz.Challenges[challIdx].Status == core.StatusValid, "challenge was not marked as valid")
+
+	// The DB authz's expiry should be equal to the current time plus the
+	// configured authorization lifetime
+	expectedExpires := ra.clk.Now().Add(ra.authorizationLifetime)
+	test.AssertEquals(t, *dbAuthz.Expires, expectedExpires)
 }
 
 func TestCertificateKeyNotEqualAccountKey(t *testing.T) {
@@ -2254,8 +2273,7 @@ func TestNewOrderReuseInvalidAuthz(t *testing.T) {
 	test.AssertNotError(t, err, "FinalizeAuthorization2 failed")
 
 	// The order associated with the authz should now be invalid
-	useV2 := true
-	updatedOrder, err := ra.SA.GetOrder(ctx, &sapb.OrderRequest{Id: order.Id, UseV2Authorizations: &useV2})
+	updatedOrder, err := ra.SA.GetOrder(ctx, &sapb.OrderRequest{Id: order.Id})
 	test.AssertNotError(t, err, "Error getting order to check status")
 	test.AssertEquals(t, *updatedOrder.Status, "invalid")
 
@@ -2487,7 +2505,7 @@ func TestNewOrderWildcard(t *testing.T) {
 
 	// Check each of the authz IDs in the order
 	for _, authzID := range order.V2Authorizations {
-		// We should be able to retreive the authz from the db without error
+		// We should be able to retrieve the authz from the db without error
 		authzPB, err := ra.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authzID})
 		test.AssertNotError(t, err, "sa.GetAuthorization2 failed")
 		authz, err := bgrpc.PBToAuthz(authzPB)
@@ -2534,7 +2552,7 @@ func TestNewOrderWildcard(t *testing.T) {
 	test.AssertEquals(t, numAuthorizations(order), 2)
 
 	for _, authzID := range order.V2Authorizations {
-		// We should be able to retreive the authz from the db without error
+		// We should be able to retrieve the authz from the db without error
 		authzPB, err := ra.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: &authzID})
 		test.AssertNotError(t, err, "sa.GetAuthorization2 failed")
 		authz, err := bgrpc.PBToAuthz(authzPB)
@@ -2985,10 +3003,9 @@ func TestFinalizeOrder(t *testing.T) {
 				// Otherwise we expect an issuance and no error
 				test.AssertNotError(t, result, fmt.Sprintf("FinalizeOrder result was %#v, expected nil", result))
 				// Check that the order now has a serial for the issued certificate
-				useV2 := true
 				updatedOrder, err := sa.GetOrder(
 					context.Background(),
-					&sapb.OrderRequest{Id: tc.OrderReq.Order.Id, UseV2Authorizations: &useV2})
+					&sapb.OrderRequest{Id: tc.OrderReq.Order.Id})
 				test.AssertNotError(t, err, "Error getting order to check serial")
 				test.AssertNotEquals(t, *updatedOrder.CertificateSerial, "")
 				test.AssertEquals(t, *updatedOrder.Status, "valid")
@@ -3435,13 +3452,13 @@ func (mp *timeoutPub) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Req
 func TestCTPolicyMeasurements(t *testing.T) {
 	_, ssa, _, fc, cleanup := initAuthorities(t)
 	defer cleanup()
-	stats := metrics.NewNoopScope()
+	stats := metrics.NoopRegisterer
 
 	ca := &mocks.MockCA{
 		PEM: eeCertPEM,
 	}
 
-	ctp := ctpolicy.New(&timeoutPub{}, []ctconfig.CTGroup{{}}, nil, log, metrics.NewNoopScope())
+	ctp := ctpolicy.New(&timeoutPub{}, []ctconfig.CTGroup{{}}, nil, log, metrics.NoopRegisterer)
 	ra := NewRegistrationAuthorityImpl(fc,
 		log,
 		stats,
@@ -3560,7 +3577,7 @@ func (ca *mockCAFailIssueCert) IssueCertificate(
 }
 
 // TestIssueCertificateInnerErrs tests that errors from the CA caught during
-// `ra.issueCertificateInner` are propogated correctly, with the part of the
+// `ra.issueCertificateInner` are propagated correctly, with the part of the
 // issuance process that failed prefixed on the error message.
 func TestIssueCertificateInnerErrs(t *testing.T) {
 	_, sa, ra, _, cleanUp := initAuthorities(t)
@@ -3712,7 +3729,9 @@ func TestIssueCertificateInnerErrs(t *testing.T) {
 }
 
 func TestValidateEmailError(t *testing.T) {
-	err := validateEmail("(๑•́ ω •̀๑)")
+	_, _, ra, _, cleanUp := initAuthorities(t)
+	defer cleanUp()
+	err := ra.validateEmail("(๑•́ ω •̀๑)")
 	test.AssertEquals(t, err.Error(), "\"(๑•́ ω •̀๑)\" is not a valid e-mail address")
 }
 
@@ -3785,6 +3804,7 @@ func TestNewOrderMaxNames(t *testing.T) {
 	})
 	test.AssertError(t, err, "NewOrder didn't fail with too many names in request")
 	test.AssertEquals(t, err.Error(), "Order cannot contain more than 2 DNS names")
+	test.AssertEquals(t, berrors.Is(err, berrors.Malformed), true)
 }
 
 var CAkeyPEM = `

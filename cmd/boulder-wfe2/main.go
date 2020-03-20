@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
@@ -18,11 +19,11 @@ import (
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
-	"github.com/letsencrypt/boulder/metrics"
 	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/wfe2"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type config struct {
@@ -79,9 +80,24 @@ type config struct {
 		LegacyKeyIDPrefix string
 
 		// BlockedKeyFile is the path to a YAML file containing Base64 encoded
-		// SHA256 hashes of DER encoded PKIX public keys that should be considered
+		// SHA256 hashes of SubjectPublicKeyInfo's that should be considered
 		// administratively blocked.
 		BlockedKeyFile string
+
+		// StaleTimeout determines how old should data be to be accessed via Boulder-specific GET-able APIs
+		StaleTimeout cmd.ConfigDuration
+
+		// AuthorizationLifetimeDays defines how long authorizations will be
+		// considered valid for. The WFE uses this to find the creation date of
+		// authorizations by subtracing this value from the expiry. It should match
+		// the value configured in the RA.
+		AuthorizationLifetimeDays int
+
+		// PendingAuthorizationLifetimeDays defines how long authorizations may be in
+		// the pending state before expiry. The WFE uses this to find the creation
+		// date of pending authorizations by subtracting this value from the expiry.
+		// It should match the value configured in the RA.
+		PendingAuthorizationLifetimeDays int
 	}
 
 	Syslog cmd.SyslogConfig
@@ -202,7 +218,7 @@ func loadCertificateChains(chainConfig map[string][]string) (map[string][]byte, 
 	return results, issuerCerts, nil
 }
 
-func setupWFE(c config, logger blog.Logger, stats metrics.Scope, clk clock.Clock) (core.RegistrationAuthority, core.StorageAuthority, noncepb.NonceServiceClient, map[string]noncepb.NonceServiceClient) {
+func setupWFE(c config, logger blog.Logger, stats prometheus.Registerer, clk clock.Clock) (core.RegistrationAuthority, core.StorageAuthority, noncepb.NonceServiceClient, map[string]noncepb.NonceServiceClient) {
 	tlsConfig, err := c.WFE.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 	clientMetrics := bgrpc.NewClientMetrics(stats)
@@ -248,7 +264,7 @@ func main() {
 	err = features.Set(c.WFE.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
-	scope, logger := cmd.StatsAndLogging(c.Syslog, c.WFE.DebugAddr)
+	stats, logger := cmd.StatsAndLogging(c.Syslog, c.WFE.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
 
@@ -257,8 +273,23 @@ func main() {
 	// don't load any weak keys, but do load blocked keys
 	kp, err := goodkey.NewKeyPolicy("", c.WFE.BlockedKeyFile)
 	cmd.FailOnError(err, "Unable to create key policy")
-	rac, sac, rns, npm := setupWFE(c, logger, scope, clk)
-	wfe, err := wfe2.NewWebFrontEndImpl(scope, clk, kp, certChains, issuerCerts, rns, npm, logger)
+	rac, sac, rns, npm := setupWFE(c, logger, stats, clk)
+
+	if c.WFE.StaleTimeout.Duration == 0 {
+		c.WFE.StaleTimeout.Duration = time.Minute * 10
+	}
+
+	authorizationLifetime := 30 * (24 * time.Hour)
+	if c.WFE.AuthorizationLifetimeDays != 0 {
+		authorizationLifetime = time.Duration(c.WFE.AuthorizationLifetimeDays) * (24 * time.Hour)
+	}
+
+	pendingAuthorizationLifetime := 7 * (24 * time.Hour)
+	if c.WFE.PendingAuthorizationLifetimeDays != 0 {
+		pendingAuthorizationLifetime = time.Duration(c.WFE.PendingAuthorizationLifetimeDays) * (24 * time.Hour)
+	}
+
+	wfe, err := wfe2.NewWebFrontEndImpl(stats, clk, kp, certChains, issuerCerts, rns, npm, logger, c.WFE.StaleTimeout.Duration, authorizationLifetime, pendingAuthorizationLifetime)
 	cmd.FailOnError(err, "Unable to create WFE")
 	wfe.RA = rac
 	wfe.SA = sac
@@ -275,7 +306,7 @@ func main() {
 	logger.Infof("WFE using key policy: %#v", kp)
 
 	logger.Infof("Server running, listening on %s...\n", c.WFE.ListenAddress)
-	handler := wfe.Handler()
+	handler := wfe.Handler(stats)
 	srv := &http.Server{
 		Addr:    c.WFE.ListenAddress,
 		Handler: handler,

@@ -156,13 +156,8 @@ const (
 	// octets: https://tools.ietf.org/html/rfc1035#page-10. Since two of those octets
 	// are taken up by the leading length byte and the trailing root period the actual
 	// max length becomes 253.
-	// TODO(#3237): Right now our schema for the authz table only allows 255 characters
-	// for identifiers, including JSON wrapping, which takes up 25 characters. For
-	// now, we only allow identifiers up to 230 characters in length. When we are
-	// able to do a migration to update this table, we can allow DNS names up to
-	// 253 characters in length.
 	maxLabelLength         = 63
-	maxDNSIdentifierLength = 230
+	maxDNSIdentifierLength = 253
 )
 
 var dnsLabelRegexp = regexp.MustCompile("^[a-z0-9][a-z0-9-]{0,62}$")
@@ -177,7 +172,7 @@ func isDNSCharacter(ch byte) bool {
 }
 
 // In these error messages:
-//   230 is the value of maxDNSIdentifierLength
+//   253 is the value of maxDNSIdentifierLength
 //   63 is the value of maxLabelLength
 //   10 is the value of maxLabels
 // If these values change, the related error messages should be updated.
@@ -188,7 +183,7 @@ var (
 	errICANNTLD             = berrors.MalformedError("Domain name is an ICANN TLD")
 	errPolicyForbidden      = berrors.RejectedIdentifierError("The ACME server refuses to issue a certificate for this domain name, because it is forbidden by policy")
 	errInvalidDNSCharacter  = berrors.MalformedError("Domain name contains an invalid character")
-	errNameTooLong          = berrors.MalformedError("Domain name is longer than 230 bytes, which is the maximum length supported by this server")
+	errNameTooLong          = berrors.MalformedError("Domain name is longer than 253 bytes")
 	errIPAddress            = berrors.MalformedError("The ACME server can not issue a certificate for an IP address")
 	errTooManyLabels        = berrors.MalformedError("Domain name has more than 10 labels (parts)")
 	errEmptyName            = berrors.MalformedError("Domain name is empty")
@@ -204,32 +199,21 @@ var (
 	errWildcardNotSupported = berrors.MalformedError("Wildcard domain names are not supported")
 )
 
-// WillingToIssue determines whether the CA is willing to issue for the provided
-// identifier. It expects domains in id to be lowercase to prevent mismatched
-// cases breaking queries.
+// ValidDomain checks that a domain isn't:
 //
-// We place several criteria on identifiers we are willing to issue for:
+// * empty
+// * prefixed with the wildcard label `*.`
+// * made of invalid DNS characters
+// * longer than the maxDNSIdentifierLength
+// * an IPv4 or IPv6 address
+// * suffixed with just "."
+// * made of too many DNS labels
+// * made of any invalid DNS labels
+// * suffixed with something other than an IANA registered TLD
+// * exactly equal to an IANA registered TLD
 //
-//  * MUST self-identify as DNS identifiers
-//  * MUST contain only bytes in the DNS hostname character set
-//  * MUST NOT have more than maxLabels labels
-//  * MUST follow the DNS hostname syntax rules in RFC 1035 and RFC 2181
-//    In particular:
-//    * MUST NOT contain underscores
-//  * MUST NOT match the syntax of an IP address
-//  * MUST end in a public suffix
-//  * MUST have at least one label in addition to the public suffix
-//  * MUST NOT be a label-wise suffix match for a name on the block list,
-//    where comparison is case-independent (normalized to lower case)
-//
-// If WillingToIssue returns an error, it will be of type MalformedRequestError
-// or RejectedIdentifierError
-func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
-	if id.Type != identifier.DNS {
-		return errInvalidIdentifier
-	}
-	domain := id.Value
-
+// It does _not_ check that the domain isn't on any PA blocked lists.
+func (pa *AuthorityImpl) ValidDomain(domain string) error {
 	if domain == "" {
 		return errEmptyName
 	}
@@ -305,6 +289,39 @@ func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
 		return errICANNTLD
 	}
 
+	return nil
+}
+
+// WillingToIssue determines whether the CA is willing to issue for the provided
+// identifier. It expects domains in id to be lowercase to prevent mismatched
+// cases breaking queries.
+//
+// We place several criteria on identifiers we are willing to issue for:
+//
+//  * MUST self-identify as DNS identifiers
+//  * MUST contain only bytes in the DNS hostname character set
+//  * MUST NOT have more than maxLabels labels
+//  * MUST follow the DNS hostname syntax rules in RFC 1035 and RFC 2181
+//    In particular:
+//    * MUST NOT contain underscores
+//  * MUST NOT match the syntax of an IP address
+//  * MUST end in a public suffix
+//  * MUST have at least one label in addition to the public suffix
+//  * MUST NOT be a label-wise suffix match for a name on the block list,
+//    where comparison is case-independent (normalized to lower case)
+//
+// If WillingToIssue returns an error, it will be of type MalformedRequestError
+// or RejectedIdentifierError
+func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
+	if id.Type != identifier.DNS {
+		return errInvalidIdentifier
+	}
+	domain := id.Value
+
+	if err := pa.ValidDomain(domain); err != nil {
+		return err
+	}
+
 	// Require no match against hostname block lists
 	if err := pa.checkHostLists(domain); err != nil {
 		return err
@@ -321,7 +338,7 @@ func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
 // returned. In addition to the regular WillingToIssue checks this function
 // also checks each wildcard identifier to enforce that:
 //
-// * The identifer is a DNS type identifier
+// * The identifier is a DNS type identifier
 // * There is at most one `*` wildcard character
 // * That the wildcard character is the leftmost label
 // * That the wildcard label is not immediately adjacent to a top level ICANN
@@ -391,7 +408,7 @@ func (pa *AuthorityImpl) willingToIssueWildcard(ident identifier.ACMEIdentifier)
 
 	// If there is exactly one wildcard in the domain we need to do some special
 	// processing to ensure that it is a well formed wildcard request and to
-	// translate the identifer to its base domain for use with WillingToIssue
+	// translate the identifier to its base domain for use with WillingToIssue
 	if strings.Count(rawDomain, "*") == 1 {
 		// If the rawDomain has a wildcard character, but it isn't the first most
 		// label of the domain name then the wildcard domain is malformed

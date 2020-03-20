@@ -2,7 +2,7 @@
   "ra": {
     "rateLimitPoliciesFilename": "test/rate-limit-policies.yml",
     "maxConcurrentRPCServerRequests": 100000,
-    "maxContactsPerRegistration": 100,
+    "maxContactsPerRegistration": 3,
     "debugAddr": ":8002",
     "hostnamePolicyFile": "test/hostname-policy.yaml",
     "maxNames": 100,
@@ -45,8 +45,6 @@
       ]
     },
     "features": {
-      "NewAuthorizationSchema": true,
-      "EarlyOrderRateLimit": true
     },
     "CTLogGroups2": [
       {

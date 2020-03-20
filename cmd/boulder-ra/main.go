@@ -65,7 +65,7 @@ type config struct {
 		WeakKeyFile string
 
 		// BlockedKeyFile is the path to a YAML file containing Base64 encoded
-		// SHA256 hashes of DER encoded PKIX public keys that should be considered
+		// SHA256 hashes of SubjectPublicKeyInfo's that should be considered
 		// administratively blocked.
 		BlockedKeyFile string
 
@@ -149,7 +149,7 @@ func main() {
 
 	caConn, err := bgrpc.ClientSetup(c.RA.CAService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Unable to create CA client")
-	cac := bgrpc.NewCertificateAuthorityClient(caPB.NewCertificateAuthorityClient(caConn), nil)
+	cac := bgrpc.NewCertificateAuthorityClient(caPB.NewCertificateAuthorityClient(caConn))
 
 	var ctp *ctpolicy.CTPolicy
 	conn, err := bgrpc.ClientSetup(c.RA.PublisherService, tlsConfig, clientMetrics, clk)

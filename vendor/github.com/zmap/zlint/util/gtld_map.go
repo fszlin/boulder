@@ -1096,7 +1096,7 @@ var tldMap = map[string]GTLDPeriod{
 	"cartier": {
 		GTLD:           "cartier",
 		DelegationDate: "2014-12-11",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-14",
 	},
 	"casa": {
 		GTLD:           "casa",
@@ -1266,7 +1266,7 @@ var tldMap = map[string]GTLDPeriod{
 	"chrysler": {
 		GTLD:           "chrysler",
 		DelegationDate: "2016-07-28",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"church": {
 		GTLD:           "church",
@@ -1836,7 +1836,7 @@ var tldMap = map[string]GTLDPeriod{
 	"dodge": {
 		GTLD:           "dodge",
 		DelegationDate: "2016-08-04",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"dog": {
 		GTLD:           "dog",
@@ -2081,7 +2081,7 @@ var tldMap = map[string]GTLDPeriod{
 	"everbank": {
 		GTLD:           "everbank",
 		DelegationDate: "2014-11-26",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-14",
 	},
 	"exchange": {
 		GTLD:           "exchange",
@@ -3571,7 +3571,7 @@ var tldMap = map[string]GTLDPeriod{
 	"ladbrokes": {
 		GTLD:           "ladbrokes",
 		DelegationDate: "2016-07-29",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"lamborghini": {
 		GTLD:           "lamborghini",
@@ -3596,7 +3596,7 @@ var tldMap = map[string]GTLDPeriod{
 	"lancome": {
 		GTLD:           "lancome",
 		DelegationDate: "2016-07-15",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-28",
 	},
 	"land": {
 		GTLD:           "land",
@@ -4231,7 +4231,7 @@ var tldMap = map[string]GTLDPeriod{
 	"mopar": {
 		GTLD:           "mopar",
 		DelegationDate: "2016-08-02",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"mormon": {
 		GTLD:           "mormon",
@@ -4896,7 +4896,7 @@ var tldMap = map[string]GTLDPeriod{
 	"piaget": {
 		GTLD:           "piaget",
 		DelegationDate: "2015-03-16",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-14",
 	},
 	"pics": {
 		GTLD:           "pics",
@@ -5916,7 +5916,7 @@ var tldMap = map[string]GTLDPeriod{
 	"srt": {
 		GTLD:           "srt",
 		DelegationDate: "2016-07-28",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"ss": {
 		GTLD:           "ss",
@@ -6496,7 +6496,7 @@ var tldMap = map[string]GTLDPeriod{
 	"uconnect": {
 		GTLD:           "uconnect",
 		DelegationDate: "2016-07-28",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"ug": {
 		GTLD:           "ug",
@@ -6766,7 +6766,7 @@ var tldMap = map[string]GTLDPeriod{
 	"warman": {
 		GTLD:           "warman",
 		DelegationDate: "2016-05-03",
-		RemovalDate:    "",
+		RemovalDate:    "2019-11-19",
 	},
 	"watch": {
 		GTLD:           "watch",

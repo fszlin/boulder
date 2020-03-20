@@ -8,14 +8,15 @@ import (
 	"gopkg.in/go-gorp/gorp.v2"
 
 	"github.com/letsencrypt/boulder/core"
+	boulderDB "github.com/letsencrypt/boulder/db"
 	blog "github.com/letsencrypt/boulder/log"
 )
 
-// NewDbMap creates the root gorp mapping object. Create one of these for each
-// database schema you wish to map. Each DbMap contains a list of mapped
+// NewDbMap creates a wrapped root gorp mapping object. Create one of these for
+// each database schema you wish to map. Each DbMap contains a list of mapped
 // tables. It automatically maps the tables for the primary parts of Boulder
 // around the Storage Authority.
-func NewDbMap(dbConnect string, maxOpenConns int) (*gorp.DbMap, error) {
+func NewDbMap(dbConnect string, maxOpenConns int) (*boulderDB.WrappedMap, error) {
 	var err error
 	var config *mysql.Config
 
@@ -40,7 +41,7 @@ var setMaxOpenConns = func(db *sql.DB, maxOpenConns int) {
 
 // NewDbMapFromConfig functions similarly to NewDbMap, but it takes the
 // decomposed form of the connection string, a *mysql.Config.
-func NewDbMapFromConfig(config *mysql.Config, maxOpenConns int) (*gorp.DbMap, error) {
+func NewDbMapFromConfig(config *mysql.Config, maxOpenConns int) (*boulderDB.WrappedMap, error) {
 	adjustMySQLConfig(config)
 
 	db, err := sqlOpen("mysql", config.FormatDSN())
@@ -57,7 +58,7 @@ func NewDbMapFromConfig(config *mysql.Config, maxOpenConns int) (*gorp.DbMap, er
 
 	initTables(dbmap)
 
-	return dbmap, err
+	return &boulderDB.WrappedMap{DbMap: dbmap}, nil
 }
 
 // adjustMySQLConfig sets certain flags that we want on every connection.
@@ -95,7 +96,7 @@ func adjustMySQLConfig(conf *mysql.Config) *mysql.Config {
 }
 
 // SetSQLDebug enables GORP SQL-level Debugging
-func SetSQLDebug(dbMap *gorp.DbMap, log blog.Logger) {
+func SetSQLDebug(dbMap *boulderDB.WrappedMap, log blog.Logger) {
 	dbMap.TraceOn("SQL: ", &SQLLogger{log})
 }
 
@@ -122,8 +123,6 @@ func initTables(dbMap *gorp.DbMap) {
 	regTable.SetVersionCol("LockCol")
 	regTable.ColMap("Key").SetNotNull(true)
 	regTable.ColMap("KeySHA256").SetNotNull(true).SetUnique(true)
-	pendingAuthzTable := dbMap.AddTableWithName(pendingauthzModel{}, "pendingAuthorizations").SetKeys(false, "ID")
-	pendingAuthzTable.SetVersionCol("LockCol")
 	dbMap.AddTableWithName(authzModel{}, "authz").SetKeys(false, "ID")
 	dbMap.AddTableWithName(challModel{}, "challenges").SetKeys(true, "ID")
 	dbMap.AddTableWithName(issuedNameModel{}, "issuedNames").SetKeys(true, "ID")
@@ -136,8 +135,8 @@ func initTables(dbMap *gorp.DbMap) {
 	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz").SetKeys(false, "OrderID", "AuthzID")
 	dbMap.AddTableWithName(requestedNameModel{}, "requestedNames").SetKeys(false, "OrderID")
 	dbMap.AddTableWithName(orderFQDNSet{}, "orderFqdnSets").SetKeys(true, "ID")
-	dbMap.AddTableWithName(authz2Model{}, "authz2").SetKeys(true, "ID")
-	dbMap.AddTableWithName(orderToAuthz2Model{}, "orderToAuthz2").SetKeys(false, "OrderID", "AuthzID")
+	dbMap.AddTableWithName(authzModel{}, "authz2").SetKeys(true, "ID")
+	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz2").SetKeys(false, "OrderID", "AuthzID")
 	dbMap.AddTableWithName(recordedSerialModel{}, "serials").SetKeys(true, "ID")
 	dbMap.AddTableWithName(precertificateModel{}, "precertificates").SetKeys(true, "ID")
 }

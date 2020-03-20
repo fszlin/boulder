@@ -286,13 +286,17 @@ func (pa *mockPA) ChallengeTypeEnabled(t string) bool {
 	return true
 }
 
+func (pa *mockPA) ValidDomain(_ string) error {
+	return nil
+}
+
 func makeBody(s string) io.ReadCloser {
 	return ioutil.NopCloser(strings.NewReader(s))
 }
 
 // loadPrivateKey loads a private key from PEM/DER-encoded data.
 // Duplicates functionality from jose v1's util.LoadPrivateKey function. It was
-// moved to the jose-util cmd's main packge in v2.
+// moved to the jose-util cmd's main package in v2.
 func loadPrivateKey(t *testing.T, keyBytes []byte) interface{} {
 	// pem.Decode does not return an error as its 2nd arg, but instead the "rest"
 	// that was leftover from parsing the PEM block. We only care if the decoded
@@ -378,7 +382,7 @@ func setupWFE(t *testing.T) (WebFrontEndImpl, clock.FakeClock) {
 	features.Reset()
 
 	fc := clock.NewFake()
-	stats := metrics.NewNoopScope()
+	stats := metrics.NoopRegisterer
 
 	wfe, err := NewWebFrontEndImpl(stats, fc, testKeyPolicy, nil, nil, blog.NewMock())
 	test.AssertNotError(t, err, "Unable to create WFE")
@@ -702,7 +706,7 @@ func TestIndex(t *testing.T) {
 
 func TestDirectory(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	responseWriter := httptest.NewRecorder()
 
@@ -846,7 +850,7 @@ func (cr noopCAA) IsCAAValid(
 
 func TestRelativeDirectory(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	dirTests := []struct {
 		host        string
@@ -892,7 +896,7 @@ func TestRelativeDirectory(t *testing.T) {
 //  - RA returns with a failure
 func TestIssueCertificate(t *testing.T) {
 	wfe, fc := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	mockLog := wfe.log.(*blog.Mock)
 
 	// The mock CA we use always returns the same test certificate, with a Not
@@ -908,9 +912,9 @@ func TestIssueCertificate(t *testing.T) {
 
 	// TODO: Use a mock RA so we can test various conditions of authorized, not
 	// authorized, etc.
-	stats := metrics.NewNoopScope()
+	stats := metrics.NoopRegisterer
 
-	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, wfe.log, metrics.NewNoopScope())
+	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, wfe.log, metrics.NoopRegisterer)
 	ra := ra.NewRegistrationAuthorityImpl(
 		fc,
 		wfe.log,
@@ -1390,7 +1394,7 @@ func TestNewRegistration409sWithAllowV1RegistrationDisabled(t *testing.T) {
 
 func TestNewRegistration(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	key := loadPrivateKey(t, []byte(test2KeyPrivatePEM))
 	rsaKey, ok := key.(*rsa.PrivateKey)
 	test.Assert(t, ok, "Couldn't load RSA key")
@@ -1797,7 +1801,7 @@ func TestAuthorization500(t *testing.T) {
 
 func TestAuthorization(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	responseWriter := httptest.NewRecorder()
 
@@ -1988,7 +1992,7 @@ func contains(s []string, e string) bool {
 
 func TestRegistration(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	responseWriter := httptest.NewRecorder()
 
 	// Test invalid method
@@ -2115,7 +2119,7 @@ func TestIssuer(t *testing.T) {
 
 func TestGetCertificate(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	certPemBytes, _ := ioutil.ReadFile("test/178.crt")
 	certBlock, _ := pem.Decode(certPemBytes)
@@ -2357,7 +2361,7 @@ func TestGetCertificateHEADHasCorrectBodyLength(t *testing.T) {
 	mockLog := wfe.log.(*blog.Mock)
 	mockLog.Clear()
 
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	s := httptest.NewServer(mux)
 	defer s.Close()
 	req, _ := http.NewRequest("HEAD", s.URL+"/acme/cert/0000000000000000000000000000000000b2", nil)
@@ -2393,7 +2397,7 @@ func TestVerifyPOSTInvalidJWK(t *testing.T) {
 
 func TestHeaderBoulderRequester(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	mux := wfe.Handler()
+	mux := wfe.Handler(metrics.NoopRegisterer)
 	responseWriter := httptest.NewRecorder()
 
 	// create a signed request

@@ -79,6 +79,13 @@ if [[ "$RUN" =~ "lints" ]] ; then
   run_and_expect_silence errcheck \
     -ignore fmt:Fprintf,fmt:Fprintln,fmt:Fprint,io:Write,os:Remove,net/http:Write \
     $(go list -f '{{ .ImportPath }}' ./... | grep -v test)
+
+  # Check for common spelling errors using codespell.
+  # Update .codespell.ignore.txt if you find false positives (NOTE: ignored
+  # words should be all lowercase).
+  run_and_expect_silence codespell \
+    --ignore-words=.codespell.ignore.txt \
+    --skip=.git,.gocache,go.sum,go.mod,vendor,bin,*.pyc,*.pem,*.der,*.resp,*.req,*.csr,.codespell.ignore.txt
 fi
 
 #
@@ -103,9 +110,9 @@ if [[ "$RUN" =~ "integration" ]] ; then
     args+=("--filter" "${INT_FILTER}")
   fi
 
-  source ${CERTBOT_PATH:-/certbot}/${VENV_NAME:-venv}/bin/activate
+  source ${CERTBOT_PATH:-/certbot}/${VENV_NAME:-venv3}/bin/activate
   DIRECTORY=http://boulder:4000/directory \
-    python2 test/integration-test.py --chisel --gotest "${args[@]}"
+    python3 test/integration-test.py --chisel --gotest "${args[@]}"
 fi
 
 # Test that just ./start.py works, which is a proxy for testing that
