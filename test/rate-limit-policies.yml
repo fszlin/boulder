@@ -32,13 +32,13 @@ pendingAuthorizationsPerAccount:
   threshold: 150
 invalidAuthorizationsPerAccount:
   window: 5m
-  threshold: 3
+  threshold: 300
 newOrdersPerAccount:
   window: 3h
   threshold: 1500
 certificatesPerFQDNSet:
   window: 24h
-  threshold: 5
+  threshold: 500
   overrides:
     le.wtf: 10000
     le1.wtf: 10000
