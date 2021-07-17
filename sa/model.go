@@ -64,13 +64,14 @@ func selectRegistration(s db.OneSelector, q string, args ...interface{}) (*regMo
 
 const certFields = "registrationID, serial, digest, der, issued, expires"
 
-// SelectCertificate selects all fields of one certificate object
-// identified by serial.
+// SelectCertificate selects all fields of one certificate object identified by
+// a serial. If more than one row contains the same serial only the first is
+// returned.
 func SelectCertificate(s db.OneSelector, serial string) (core.Certificate, error) {
 	var model core.Certificate
 	err := s.SelectOne(
 		&model,
-		"SELECT "+certFields+" FROM certificates WHERE serial = ?",
+		"SELECT "+certFields+" FROM certificates WHERE serial = ? LIMIT 1",
 		serial,
 	)
 	return model, err
@@ -202,6 +203,11 @@ func registrationToModel(r *core.Registration) (*regModel, error) {
 	if r.Contact == nil {
 		r.Contact = &[]string{}
 	}
+	var createdAt time.Time
+	if r.CreatedAt != nil {
+		createdAt = *r.CreatedAt
+	}
+
 	rm := regModel{
 		ID:        r.ID,
 		Key:       key,
@@ -209,7 +215,7 @@ func registrationToModel(r *core.Registration) (*regModel, error) {
 		Contact:   *r.Contact,
 		Agreement: r.Agreement,
 		InitialIP: []byte(r.InitialIP.To16()),
-		CreatedAt: r.CreatedAt,
+		CreatedAt: createdAt,
 		Status:    string(r.Status),
 	}
 
@@ -241,7 +247,7 @@ func modelToRegistration(reg *regModel) (core.Registration, error) {
 		Contact:   contact,
 		Agreement: reg.Agreement,
 		InitialIP: net.IP(reg.InitialIP),
-		CreatedAt: reg.CreatedAt,
+		CreatedAt: &reg.CreatedAt,
 		Status:    core.AcmeStatus(reg.Status),
 	}
 

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/db"
@@ -24,23 +27,58 @@ type idExporter struct {
 	grace time.Duration
 }
 
-type id struct {
+// resultEntry is a JSON marshalable exporter result entry.
+type resultEntry struct {
+	// ID is exported to support marshaling to JSON.
 	ID int64 `json:"id"`
+
+	// Hostname is exported to support marshaling to JSON. Not all queries
+	// will fill this field, so it's JSON field tag marks at as
+	// omittable.
+	Hostname string `json:"hostname,omitempty"`
 }
 
-// Find all registration IDs with unexpired certificates.
-func (c idExporter) findIDs() ([]id, error) {
-	var idsList []id
+// reverseHostname converts (reversed) names sourced from the
+// registrations table to standard hostnames.
+func (r *resultEntry) reverseHostname() {
+	r.Hostname = sa.ReverseName(r.Hostname)
+}
+
+// idExporterResults is passed as a selectable 'holder' for the results
+// of id-exporter database queries
+type idExporterResults []*resultEntry
+
+// marshalToJSON returns JSON as bytes for all elements of the inner `id`
+// slice.
+func (i *idExporterResults) marshalToJSON() ([]byte, error) {
+	data, err := json.Marshal(i)
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, '\n')
+	return data, nil
+}
+
+// writeToFile writes the contents of the inner `ids` slice, as JSON, to
+// a file
+func (i *idExporterResults) writeToFile(outfile string) error {
+	data, err := i.marshalToJSON()
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(outfile, data, 0644)
+}
+
+// findIDs gathers all registration IDs with unexpired certificates.
+func (c idExporter) findIDs() (idExporterResults, error) {
+	var holder idExporterResults
 	_, err := c.dbMap.Select(
-		&idsList,
-		`SELECT id
-		FROM registrations
-		WHERE contact != 'null' AND
-			id IN (
-				SELECT registrationID
-				FROM certificates
-				WHERE expires >= :expireCutoff
-			);`,
+		&holder,
+		`SELECT DISTINCT r.id
+		FROM registrations AS r
+			INNER JOIN certificates AS c on c.registrationID = r.id
+		WHERE r.contact NOT IN ('[]', 'null')
+			AND c.expires >= :expireCutoff;`,
 		map[string]interface{}{
 			"expireCutoff": c.clk.Now().Add(-c.grace),
 		})
@@ -48,27 +86,54 @@ func (c idExporter) findIDs() ([]id, error) {
 		c.log.AuditErrf("Error finding IDs: %s", err)
 		return nil, err
 	}
-
-	return idsList, nil
+	return holder, nil
 }
 
-func (c idExporter) findIDsForDomains(domains []string) ([]id, error) {
-	var idsList []id
-	for _, domain := range domains {
+// findIDsWithExampleHostnames gathers all registration IDs with
+// unexpired certificates and a corresponding example hostname.
+func (c idExporter) findIDsWithExampleHostnames() (idExporterResults, error) {
+	var holder idExporterResults
+	_, err := c.dbMap.Select(
+		&holder,
+		`SELECT SQL_BIG_RESULT
+			cert.registrationID AS id,
+			name.reversedName AS hostname
+		FROM certificates AS cert
+			INNER JOIN issuedNames AS name ON name.serial = cert.serial
+		WHERE cert.expires >= :expireCutoff
+		GROUP BY cert.registrationID;`,
+		map[string]interface{}{
+			"expireCutoff": c.clk.Now().Add(-c.grace),
+		})
+	if err != nil {
+		c.log.AuditErrf("Error finding IDs and example hostnames: %s", err)
+		return nil, err
+	}
+
+	for _, result := range holder {
+		result.reverseHostname()
+	}
+	return holder, nil
+}
+
+// findIDsForHostnames gathers all registration IDs with unexpired
+// certificates for each `hostnames` entry.
+func (c idExporter) findIDsForHostnames(hostnames []string) (idExporterResults, error) {
+	var holder idExporterResults
+	for _, hostname := range hostnames {
 		// Pass the same list in each time, gorp will happily just append to the slice
 		// instead of overwriting it each time
 		// https://github.com/go-gorp/gorp/blob/2ae7d174a4cf270240c4561092402affba25da5e/select.go#L348-L355
 		_, err := c.dbMap.Select(
-			&idsList,
-			`SELECT registrationID AS id FROM certificates
-                         WHERE expires >= :expireCutoff AND
-                         serial IN (
-                           SELECT serial FROM issuedNames
-                            WHERE reversedName = :reversedName
-                         )`,
+			&holder,
+			`SELECT DISTINCT c.registrationID AS id
+			FROM certificates AS c
+				INNER JOIN issuedNames AS n ON c.serial = n.serial
+			WHERE c.expires >= :expireCutoff
+				AND n.reversedName = :reversedName;`,
 			map[string]interface{}{
 				"expireCutoff": c.clk.Now().Add(-c.grace),
-				"reversedName": sa.ReverseName(domain),
+				"reversedName": sa.ReverseName(hostname),
 			},
 		)
 		if err != nil {
@@ -79,24 +144,7 @@ func (c idExporter) findIDsForDomains(domains []string) ([]id, error) {
 		}
 	}
 
-	return idsList, nil
-}
-
-// The `writeIDs` function produces a file containing JSON serialized
-// contact objects
-func writeIDs(idsList []id, outfile string) error {
-	data, err := json.Marshal(idsList)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-
-	if outfile != "" {
-		return ioutil.WriteFile(outfile, data, 0644)
-	}
-
-	fmt.Printf("%s", data)
-	return nil
+	return holder, nil
 }
 
 const usageIntro = `
@@ -117,11 +165,18 @@ mailing is underway, ensuring we use the correct address if a user has updated
 their contact information between the time of export and the time of
 notification.
 
-The ID exporter's output will be JSON of the form:
+By default, the ID exporter's output will be JSON of the form:
   [
-   { "id": 1 },
-   ...
-   { "id": n }
+    { "id": 1 },
+    ...
+    { "id": n }
+  ]
+
+Operations that return a hostname will be JSON of the form:
+  [
+    { "id": 1, "hostname": "example-1.com" },
+    ...
+    { "id": n, "hostname": "example-n.com" }
   ]
 
 Examples:
@@ -139,17 +194,43 @@ Required arguments:
 - config
 - outfile`
 
-func main() {
-	outFile := flag.String("outfile", "", "File to write contacts to (defaults to stdout).")
-	grace := flag.Duration("grace", 2*24*time.Hour, "Include contacts with certificates that expired in < grace ago")
-	domainsFile := flag.String("domains", "", "If provided only output contacts for certificates that contain at least one of the domains in the provided file. Provided file should contain one domain per line")
-	type config struct {
-		ContactExporter struct {
-			DB cmd.DBConfig
-			cmd.PasswordConfig
-			Features map[string]bool
-		}
+// unmarshalHostnames unmarshals a hostnames file and ensures that the file
+// contained at least one entry.
+func unmarshalHostnames(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
 	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
+
+	var hostnames []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, " ") {
+			return nil, fmt.Errorf(
+				"line: %q contains more than one entry, entries must be separated by newlines", line)
+		}
+		hostnames = append(hostnames, line)
+	}
+
+	if len(hostnames) == 0 {
+		return nil, errors.New("provided file contains 0 hostnames")
+	}
+	return hostnames, nil
+}
+
+func main() {
+	outFile := flag.String("outfile", "", "File to output results JSON to.")
+	grace := flag.Duration("grace", 2*24*time.Hour, "Include results with certificates that expired in < grace ago.")
+	hostnamesFile := flag.String(
+		"hostnames", "", "Only include results with unexpired certificates that contain hostnames\nlisted (newline separated) in this file.")
+	withExampleHostnames := flag.Bool(
+		"with-example-hostnames", false, "Include an example hostname for each registration ID with an unexpired certificate.")
+	useDefaultIsolationLevel := flag.Bool(
+		"use-default-isolation-level", false, "Do not override database transaction isolation level to READ UNCOMMITTED")
 	configFile := flag.String("config", "", "File containing a JSON config.")
 
 	flag.Usage = func() {
@@ -158,6 +239,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 
+	// Parse flags and check required.
 	flag.Parse()
 	if *outFile == "" || *configFile == "" {
 		flag.Usage()
@@ -166,19 +248,50 @@ func main() {
 
 	log := cmd.NewLogger(cmd.SyslogConfig{StdoutLevel: 7})
 
+	// Load configuration file.
 	configData, err := ioutil.ReadFile(*configFile)
 	cmd.FailOnError(err, fmt.Sprintf("Reading %q", *configFile))
+
+	type config struct {
+		ContactExporter struct {
+			DB cmd.DBConfig
+			cmd.PasswordConfig
+			Features map[string]bool
+		}
+	}
+
+	// Unmarshal JSON config file.
 	var cfg config
 	err = json.Unmarshal(configData, &cfg)
 	cmd.FailOnError(err, "Unmarshaling config")
+
 	err = features.Set(cfg.ContactExporter.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
+	// Setup database client.
 	dbURL, err := cfg.ContactExporter.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbSettings := sa.DbSettings{
-		MaxOpenConns: 10,
+
+	if !*useDefaultIsolationLevel {
+		conf, err := mysql.ParseDSN(dbURL)
+		cmd.FailOnError(err, "Couldn't parse DB URL as DSN")
+
+		// Transaction isolation level READ UNCOMMITTED trades consistency for
+		// performance.
+		if len(conf.Params) == 0 {
+			conf.Params = make(map[string]string)
+		}
+		conf.Params["tx_isolation"] = "'READ-UNCOMMITTED'"
+		dbURL = conf.FormatDSN()
 	}
+
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    cfg.ContactExporter.DB.MaxOpenConns,
+		MaxIdleConns:    cfg.ContactExporter.DB.MaxIdleConns,
+		ConnMaxLifetime: cfg.ContactExporter.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: cfg.ContactExporter.DB.ConnMaxIdleTime.Duration,
+	}
+
 	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 
@@ -189,17 +302,23 @@ func main() {
 		grace: *grace,
 	}
 
-	var ids []id
-	if *domainsFile != "" {
-		df, err := ioutil.ReadFile(*domainsFile)
-		cmd.FailOnError(err, fmt.Sprintf("Could not read domains file %q", *domainsFile))
-		ids, err = exporter.findIDsForDomains(strings.Split(string(df), "\n"))
-		cmd.FailOnError(err, "Could not find IDs")
+	var results idExporterResults
+	if *hostnamesFile != "" {
+		hostnames, err := unmarshalHostnames(*hostnamesFile)
+		cmd.FailOnError(err, "Problem unmarshalling hostnames")
+
+		results, err = exporter.findIDsForHostnames(hostnames)
+		cmd.FailOnError(err, "Could not find IDs for hostnames")
+
+	} else if *withExampleHostnames {
+		results, err = exporter.findIDsWithExampleHostnames()
+		cmd.FailOnError(err, "Could not find IDs with hostnames")
+
 	} else {
-		ids, err = exporter.findIDs()
+		results, err = exporter.findIDs()
 		cmd.FailOnError(err, "Could not find IDs")
 	}
 
-	err = writeIDs(ids, *outFile)
-	cmd.FailOnError(err, fmt.Sprintf("Could not write IDs to outfile %q", *outFile))
+	err = results.writeToFile(*outFile)
+	cmd.FailOnError(err, fmt.Sprintf("Could not write result to outfile %q", *outFile))
 }

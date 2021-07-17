@@ -38,6 +38,11 @@
     "stdoutlevel": 6,
     "sysloglevel": 4
   },
+  "beeline": {
+      "mute": true,
+      "dataset": "Test"
+  },
+
   "common": {
     "dnsTimeout": "1s",
     "dnsAllowLoopbackAddresses": true

@@ -7,6 +7,8 @@ import (
 	"sync"
 
 	"github.com/beeker1121/goque"
+	"github.com/honeycombio/beeline-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
@@ -17,7 +19,7 @@ import (
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/issuance"
-	"github.com/letsencrypt/boulder/lint"
+	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/policy"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 )
@@ -84,21 +86,17 @@ type config struct {
 		// Recommended to be around 500ms.
 		OCSPLogPeriod cmd.ConfigDuration
 
-		// List of Registration IDs for which ECDSA issuance is allowed. If an
-		// account is in this allowlist *and* requests issuance for an ECDSA key
-		// *and* an ECDSA issuer is configured in the CA, then the certificate
-		// will be issued from that ECDSA issuer. If this list is empty, then
-		// ECDSA issuance is allowed for all accounts.
-		// This is temporary, and will be used for testing and slow roll-out of
-		// ECDSA issuance, but will then be removed.
-		ECDSAAllowedAccounts []int64
+		// Path of a YAML file containing the list of int64 RegIDs
+		// allowed to request ECDSA issuance
+		ECDSAAllowListFilename string
 
 		Features map[string]bool
 	}
 
 	PA cmd.PAConfig
 
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 func loadBoulderIssuers(profileConfig issuance.ProfileConfig, issuerConfigs []issuance.IssuerConfig, ignoredLints []string) ([]*issuance.Issuer, error) {
@@ -114,7 +112,7 @@ func loadBoulderIssuers(profileConfig issuance.ProfileConfig, issuerConfigs []is
 			return nil, err
 		}
 
-		linter, err := lint.NewLinter(signer, ignoredLints)
+		linter, err := linter.New(cert.Certificate, signer, ignoredLints)
 		if err != nil {
 			return nil, err
 		}
@@ -161,9 +159,30 @@ func main() {
 		cmd.Fail("Error in CA config: MaxNames must not be 0")
 	}
 
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.CA.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
+
+	// These two metrics are created and registered here so they can be shared
+	// between NewCertificateAuthorityImpl and NewOCSPImpl.
+	signatureCount := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "signatures",
+			Help: "Number of signatures",
+		},
+		[]string{"purpose", "issuer"})
+	scope.MustRegister(signatureCount)
+
+	signErrorCount := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "signature_errors",
+		Help: "A counter of signature errors labelled by error type",
+	}, []string{"type"})
+	scope.MustRegister(signErrorCount)
 
 	cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
 
@@ -200,32 +219,75 @@ func main() {
 		defer func() { _ = orphanQueue.Close() }()
 	}
 
-	cai, err := ca.NewCertificateAuthorityImpl(
+	var ecdsaAllowList *ca.ECDSAAllowList
+	if c.CA.ECDSAAllowListFilename != "" {
+		// Create a gauge vector to track allow list reloads.
+		allowListGauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "ecdsa_allow_list_status",
+			Help: "Number of ECDSA allow list entries and status of most recent update attempt",
+		}, []string{"result"})
+		scope.MustRegister(allowListGauge)
+
+		// Create a reloadable allow list object.
+		var entries int
+		ecdsaAllowList, entries, err = ca.NewECDSAAllowListFromFile(c.CA.ECDSAAllowListFilename, logger, allowListGauge)
+		cmd.FailOnError(err, "Unable to load ECDSA allow list from YAML file")
+		logger.Infof("Created a reloadable allow list, it was initialized with %d entries", entries)
+
+	}
+
+	serverMetrics := bgrpc.NewServerMetrics(scope)
+	var wg sync.WaitGroup
+
+	ocspi, err := ca.NewOCSPImpl(
 		sa,
-		pa,
 		boulderIssuers,
-		c.CA.ECDSAAllowedAccounts,
-		c.CA.Expiry.Duration,
-		c.CA.Backdate.Duration,
-		c.CA.SerialPrefix,
-		c.CA.MaxNames,
 		c.CA.LifespanOCSP.Duration,
-		kp,
-		orphanQueue,
 		c.CA.OCSPLogMaxLength,
 		c.CA.OCSPLogPeriod.Duration,
 		logger,
 		scope,
+		signatureCount,
+		signErrorCount,
+		clk,
+	)
+	cmd.FailOnError(err, "Failed to create OCSP impl")
+	go ocspi.LogOCSPLoop()
+
+	ocspSrv, ocspListener, err := bgrpc.NewServer(c.CA.GRPCOCSPGenerator, tlsConfig, serverMetrics, clk)
+	cmd.FailOnError(err, "Unable to setup CA gRPC server")
+	capb.RegisterOCSPGeneratorServer(ocspSrv, ocspi)
+	ocspHealth := health.NewServer()
+	healthpb.RegisterHealthServer(ocspSrv, ocspHealth)
+	wg.Add(1)
+	go func() {
+		cmd.FailOnError(cmd.FilterShutdownErrors(ocspSrv.Serve(ocspListener)),
+			"OCSPGenerator gRPC service failed")
+		wg.Done()
+	}()
+
+	cai, err := ca.NewCertificateAuthorityImpl(
+		sa,
+		pa,
+		ocspi,
+		boulderIssuers,
+		ecdsaAllowList,
+		c.CA.Expiry.Duration,
+		c.CA.Backdate.Duration,
+		c.CA.SerialPrefix,
+		c.CA.MaxNames,
+		kp,
+		orphanQueue,
+		logger,
+		scope,
+		signatureCount,
+		signErrorCount,
 		clk)
 	cmd.FailOnError(err, "Failed to create CA impl")
 
 	if orphanQueue != nil {
 		go cai.OrphanIntegrationLoop()
 	}
-	go cai.LogOCSPLoop()
-
-	serverMetrics := bgrpc.NewServerMetrics(scope)
-	var wg sync.WaitGroup
 
 	caSrv, caListener, err := bgrpc.NewServer(c.CA.GRPCCA, tlsConfig, serverMetrics, clk)
 	cmd.FailOnError(err, "Unable to setup CA gRPC server")
@@ -238,25 +300,14 @@ func main() {
 		wg.Done()
 	}()
 
-	ocspSrv, ocspListener, err := bgrpc.NewServer(c.CA.GRPCOCSPGenerator, tlsConfig, serverMetrics, clk)
-	cmd.FailOnError(err, "Unable to setup CA gRPC server")
-	capb.RegisterOCSPGeneratorServer(ocspSrv, cai)
-	ocspHealth := health.NewServer()
-	healthpb.RegisterHealthServer(ocspSrv, ocspHealth)
-	wg.Add(1)
-	go func() {
-		cmd.FailOnError(cmd.FilterShutdownErrors(ocspSrv.Serve(ocspListener)),
-			"OCSPGenerator gRPC service failed")
-		wg.Done()
-	}()
-
 	go cmd.CatchSignals(logger, func() {
 		caHealth.Shutdown()
 		ocspHealth.Shutdown()
+		ecdsaAllowList.Stop()
 		caSrv.GracefulStop()
 		ocspSrv.GracefulStop()
 		wg.Wait()
-		cai.Stop()
+		ocspi.Stop()
 	})
 
 	select {}

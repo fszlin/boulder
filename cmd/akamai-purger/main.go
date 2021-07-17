@@ -9,16 +9,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/letsencrypt/boulder/akamai"
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	"github.com/letsencrypt/boulder/cmd"
-	corepb "github.com/letsencrypt/boulder/core/proto"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type config struct {
@@ -36,7 +37,8 @@ type config struct {
 		PurgeRetries      int
 		PurgeRetryBackoff cmd.ConfigDuration
 	}
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 type akamaiPurger struct {
@@ -78,14 +80,14 @@ func (ap *akamaiPurger) purge() error {
 // >= the number of URLs to purge so that it can catch up.
 var maxQueueSize = 1000000
 
-func (ap *akamaiPurger) Purge(ctx context.Context, req *akamaipb.PurgeRequest) (*corepb.Empty, error) {
+func (ap *akamaiPurger) Purge(ctx context.Context, req *akamaipb.PurgeRequest) (*emptypb.Empty, error) {
 	ap.mu.Lock()
 	defer ap.mu.Unlock()
 	if len(ap.toPurge) >= maxQueueSize {
 		return nil, errors.New("Akamai purge queue too large")
 	}
 	ap.toPurge = append(ap.toPurge, req.Urls...)
-	return &corepb.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func main() {
@@ -108,6 +110,11 @@ func main() {
 	if *debugAddr != "" {
 		c.AkamaiPurger.DebugAddr = *debugAddr
 	}
+
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
 
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.AkamaiPurger.DebugAddr)
 	defer logger.AuditPanic()

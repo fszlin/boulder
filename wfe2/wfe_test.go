@@ -26,6 +26,7 @@ import (
 
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/protobuf/types/known/emptypb"
 	jose "gopkg.in/square/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
@@ -208,8 +209,9 @@ type MockRegistrationAuthority struct {
 	lastRevocationReason revocation.Reason
 }
 
-func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, acct core.Registration) (core.Registration, error) {
-	acct.ID = 1
+func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, acct *corepb.Registration) (*corepb.Registration, error) {
+	acct.Id = 1
+	acct.CreatedAt = time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 	return acct, nil
 }
 
@@ -223,21 +225,20 @@ func (ra *MockRegistrationAuthority) NewCertificate(ctx context.Context, req cor
 	return core.Certificate{}, nil
 }
 
-func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, acct core.Registration, updated core.Registration) (core.Registration, error) {
-	keysMatch, _ := core.PublicKeysEqual(acct.Key.Key, updated.Key.Key)
-	if !keysMatch {
-		acct.Key = updated.Key
+func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, req *rapb.UpdateRegistrationRequest) (*corepb.Registration, error) {
+	if !bytes.Equal(req.Base.Key, req.Update.Key) {
+		req.Base.Key = req.Update.Key
 	}
-	return acct, nil
+	return req.Base, nil
 }
 
 func (ra *MockRegistrationAuthority) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
 	return nil, nil
 }
 
-func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, reason revocation.Reason, reg int64) error {
-	ra.lastRevocationReason = reason
-	return nil
+func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, req *rapb.RevokeCertificateWithRegRequest) (*emptypb.Empty, error) {
+	ra.lastRevocationReason = revocation.Reason(req.Code)
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) AdministrativelyRevokeCertificate(ctx context.Context, cert x509.Certificate, reason revocation.Reason, user string) error {
@@ -252,15 +253,16 @@ func (ra *MockRegistrationAuthority) DeactivateAuthorization(ctx context.Context
 	return nil
 }
 
-func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ core.Registration) error {
-	return nil
+func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ *corepb.Registration) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) NewOrder(ctx context.Context, req *rapb.NewOrderRequest) (*corepb.Order, error) {
 	return &corepb.Order{
 		Id:               1,
 		RegistrationID:   req.RegistrationID,
-		Expires:          0,
+		Created:          time.Date(2021, 1, 1, 1, 1, 1, 0, time.UTC).UnixNano(),
+		Expires:          time.Date(2021, 2, 1, 1, 1, 1, 0, time.UTC).UnixNano(),
 		Names:            req.Names,
 		Status:           string(core.StatusPending),
 		V2Authorizations: []int64{1},
@@ -1308,7 +1310,6 @@ func TestNewECDSAAccount(t *testing.T) {
 			"y": "S8rR-0dWa8nAcw1fbunF_ajS3PQZ-QwLps-2adgLgPk"
 		},
 		"initialIp": "",
-		"createdAt": "0001-01-01T00:00:00Z",
 		"status": ""
 		}`)
 	test.AssertEquals(t, responseWriter.Header().Get("Location"), "http://localhost/acme/acct/3")
@@ -1490,7 +1491,6 @@ func TestNewAccount(t *testing.T) {
 			"mailto:person@mail.com"
 		],
 		"initialIp": "",
-		"createdAt": "0001-01-01T00:00:00Z",
 		"status": "valid"
 	}`)
 }
@@ -1539,7 +1539,7 @@ func TestNewAccountNoID(t *testing.T) {
 			"mailto:person@mail.com"
 		],
 		"initialIp": "1.1.1.1",
-		"createdAt": "0001-01-01T00:00:00Z",
+		"createdAt": "2021-01-01T00:00:00Z",
 		"status": ""
 	}`)
 }
@@ -2324,7 +2324,6 @@ func TestDeactivateAccount(t *testing.T) {
 		    "mailto:person@mail.com"
 		  ],
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2345,7 +2344,6 @@ func TestDeactivateAccount(t *testing.T) {
 		    "mailto:person@mail.com"
 		  ],
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2397,6 +2395,31 @@ func TestNewOrder(t *testing.T) {
 		]
 	}`
 
+	// Body with a SAN that is longer than 64 bytes. This one is 65 bytes.
+	tooLongCNBody := `
+	{
+		"Identifiers": [
+			{
+				"type": "dns",
+				"value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"
+			}
+		]
+	}`
+
+	oneLongOneShortCNBody := `
+	{
+		"Identifiers": [
+			{
+				"type": "dns",
+				"value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"
+			},
+			{
+				"type": "dns",
+				"value": "not-example.com"
+			}
+		]
+	}`
+
 	testCases := []struct {
 		Name            string
 		Request         *http.Request
@@ -2445,12 +2468,34 @@ func TestNewOrder(t *testing.T) {
 			ExpectedBody: `{"type":"` + probs.V2ErrorNS + `malformed","detail":"NotBefore and NotAfter are not supported","status":400}`,
 		},
 		{
+			Name:         "POST, no potential CNs 64 bytes or smaller",
+			Request:      signAndPost(t, targetPath, signedURL, tooLongCNBody, 1, wfe.nonceService),
+			ExpectedBody: `{"type":"` + probs.V2ErrorNS + `rejectedIdentifier","detail":"NewOrder request did not include a SAN short enough to fit in CN","status":400}`,
+		},
+		{
+			Name:    "POST, good payload, one potential CNs less than 64 bytes and one longer",
+			Request: signAndPost(t, targetPath, signedURL, oneLongOneShortCNBody, 1, wfe.nonceService),
+			ExpectedBody: `
+			{
+				"status": "pending",
+				"expires": "2021-02-01T01:01:01Z",
+				"identifiers": [
+					{ "type": "dns", "value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"},
+					{ "type": "dns", "value": "not-example.com"}
+				],
+				"authorizations": [
+					"http://localhost/acme/authz-v3/1"
+				],
+				"finalize": "http://localhost/acme/finalize/1/1"
+			}`,
+		},
+		{
 			Name:    "POST, good payload",
 			Request: signAndPost(t, targetPath, signedURL, validOrderBody, 1, wfe.nonceService),
 			ExpectedBody: `
 					{
 						"status": "pending",
-						"expires": "1970-01-01T00:00:00Z",
+						"expires": "2021-02-01T01:01:01Z",
 						"identifiers": [
 							{ "type": "dns", "value": "not-example.com"},
 							{ "type": "dns", "value": "www.not-example.com"}
@@ -2697,7 +2742,6 @@ func TestKeyRollover(t *testing.T) {
 		       "mailto:person@mail.com"
 		     ],
 		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
 		     "status": "valid"
 		   }`,
 			NewKey: newKeyPriv,
@@ -3464,6 +3508,29 @@ func TestGETAPIChallenge(t *testing.T) {
 			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tooFreshErr)
 		}
 	}
+}
+
+// TestGet404 tests that a 404 is served and that the expected endpoint of
+// "/" is logged when an unknown path is requested. This will test the
+// codepath to the wfe.Index() handler which handles "/" and all non-api
+// endpoint requests to make sure the endpoint is set properly in the logs.
+func TestIndexGet404(t *testing.T) {
+	// Setup
+	wfe, _ := setupWFE(t)
+	path := "/nopathhere/nope/nofilehere"
+	req := &http.Request{URL: &url.URL{Path: path}, Method: "GET"}
+	logEvent := &web.RequestEvent{}
+	responseWriter := httptest.NewRecorder()
+
+	// Send a request to wfe.Index()
+	wfe.Index(context.Background(), logEvent, responseWriter, req)
+
+	// Test that a 404 is received as expected
+	test.AssertEquals(t, responseWriter.Code, http.StatusNotFound)
+	// Test that we logged the "/" endpoint
+	test.AssertEquals(t, logEvent.Endpoint, "/")
+	// Test that the rest of the path is logged as the slug
+	test.AssertEquals(t, logEvent.Slug, path[1:])
 }
 
 func TestGetAPIAndMandatoryPOSTAsGET(t *testing.T) {

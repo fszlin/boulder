@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -17,10 +16,10 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/db"
-	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	bmail "github.com/letsencrypt/boulder/mail"
 	"github.com/letsencrypt/boulder/metrics"
@@ -35,31 +34,33 @@ type mailer struct {
 	mailer        bmail.Mailer
 	subject       string
 	emailTemplate *template.Template
-	destinations  []recipient
+	recipients    []recipient
 	targetRange   interval
 	sleepInterval time.Duration
 }
 
-// interval defines a range of email addresses to send to, alphabetically.
-// The "start" field is inclusive and the "end" field is exclusive.
-// To include everything, set "end" to "\xFF".
+// interval defines a range of email addresses to send to in alphabetical order.
+// The `start` field is inclusive and the `end` field is exclusive. To include
+// everything, set `end` to \xFF.
 type interval struct {
 	start string
 	end   string
 }
 
-type contactJSON struct {
-	ID      int
+// contactQueryResult is a receiver for queries to the `registrations` table.
+type contactQueryResult struct {
+	// ID is exported to receive the value of `id`.
+	ID int64
+
+	// Contact is exported to receive the value of `contact`.
 	Contact []byte
 }
 
 func (i *interval) ok() error {
 	if i.start > i.end {
-		return fmt.Errorf(
-			"interval start value (%s) is greater than end value (%s)",
+		return fmt.Errorf("interval start value (%s) is greater than end value (%s)",
 			i.start, i.end)
 	}
-
 	return nil
 }
 
@@ -67,37 +68,35 @@ func (i *interval) includes(s string) bool {
 	return s >= i.start && s < i.end
 }
 
+// ok ensures that both the `targetRange` and `sleepInterval` are valid.
 func (m *mailer) ok() error {
-	// Make sure the checkpoint range is OK
-	if checkpointErr := m.targetRange.ok(); checkpointErr != nil {
-		return checkpointErr
+	if err := m.targetRange.ok(); err != nil {
+		return err
 	}
 
-	// Do not allow a negative sleep interval
 	if m.sleepInterval < 0 {
 		return fmt.Errorf(
 			"sleep interval (%d) is < 0", m.sleepInterval)
 	}
-
 	return nil
 }
 
-func (m *mailer) printStatus(to string, cur, total int, start time.Time) {
-	// Should never happen
-	if total <= 0 || cur < 1 || cur > total {
-		m.log.AuditErrf("invalid cur (%d) or total (%d)", cur, total)
+func (m *mailer) logStatus(to string, current, total int, start time.Time) {
+	// Should never happen.
+	if total <= 0 || current < 1 || current > total {
+		m.log.AuditErrf("Invalid current (%d) or total (%d)", current, total)
 	}
-	completion := (float32(cur) / float32(total)) * 100
+	completion := (float32(current) / float32(total)) * 100
 	now := m.clk.Now()
 	elapsed := now.Sub(start)
-	m.log.Infof("Sending to %q. Message %d of %d [%.2f%%]. Elapsed: %s",
-		to, cur, total, completion, elapsed)
+	m.log.Infof("Sending message (%d) of (%d) to address (%s) [%.2f%%] time elapsed (%s)",
+		current, total, to, completion, elapsed)
 }
 
-func sortAddresses(input emailToRecipientMap) []string {
+func sortAddresses(input addressToRecipientMap) []string {
 	var addresses []string
-	for k := range input {
-		addresses = append(addresses, k)
+	for address := range input {
+		addresses = append(addresses, address)
 	}
 	sort.Strings(addresses)
 	return addresses
@@ -108,122 +107,128 @@ func (m *mailer) run() error {
 		return err
 	}
 
-	m.log.Infof("Resolving %d destination addresses", len(m.destinations))
-	addressesToRecipients, err := m.resolveEmailAddresses()
+	totalRecipients := len(m.recipients)
+	m.log.Infof("Resolving addresses for (%d) recipients", totalRecipients)
+
+	addressToRecipient, err := m.resolveAddresses()
 	if err != nil {
 		return err
 	}
-	if len(addressesToRecipients) == 0 {
-		return fmt.Errorf("zero recipients after looking up addresses?")
+
+	totalAddresses := len(addressToRecipient)
+	if totalAddresses == 0 {
+		return errors.New("0 recipients remained after resolving addresses")
 	}
-	m.log.Infof("Resolved destination addresses. %d accounts became %d addresses.",
-		len(m.destinations), len(addressesToRecipients))
-	var biggest int
-	var biggestAddress string
-	for k, v := range addressesToRecipients {
-		if len(v) > biggest {
-			biggest = len(v)
-			biggestAddress = k
+
+	m.log.Infof("%d recipients were resolved to %d addresses", totalRecipients, totalAddresses)
+
+	var mostRecipients string
+	var mostRecipientsLen int
+	for k, v := range addressToRecipient {
+		if len(v) > mostRecipientsLen {
+			mostRecipientsLen = len(v)
+			mostRecipients = k
 		}
 	}
-	m.log.Infof("Most frequent address %q had %d associated lines", biggestAddress, biggest)
+
+	m.log.Infof("Address %q was associated with the most recipients (%d)",
+		mostRecipients, mostRecipientsLen)
 
 	err = m.mailer.Connect()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = m.mailer.Close()
-	}()
+
+	defer func() { _ = m.mailer.Close() }()
 
 	startTime := m.clk.Now()
-
-	sortedAddresses := sortAddresses(addressesToRecipients)
-	numAddresses := len(addressesToRecipients)
+	sortedAddresses := sortAddresses(addressToRecipient)
 
 	var sent int
 	for i, address := range sortedAddresses {
 		if !m.targetRange.includes(address) {
-			m.log.Debugf("skipping %q: out of target range")
+			m.log.Debugf("Address %q is outside of target range, skipping", address)
 			continue
 		}
+
 		if err := policy.ValidEmail(address); err != nil {
-			m.log.Infof("skipping %q: %s", address, err)
+			m.log.Infof("Skipping %q due to policy violation: %s", address, err)
 			continue
 		}
-		recipients := addressesToRecipients[address]
-		m.printStatus(address, i+1, numAddresses, startTime)
-		var mailBody bytes.Buffer
-		err = m.emailTemplate.Execute(&mailBody, recipients)
+
+		recipients := addressToRecipient[address]
+		m.logStatus(address, i+1, totalAddresses, startTime)
+
+		var messageBody strings.Builder
+		err = m.emailTemplate.Execute(&messageBody, recipients)
 		if err != nil {
 			return err
 		}
-		if mailBody.Len() == 0 {
-			return fmt.Errorf("email body was empty after interpolation.")
+
+		if messageBody.Len() == 0 {
+			return errors.New("message body was empty after interpolation")
 		}
-		err := m.mailer.SendMail([]string{address}, m.subject, mailBody.String())
+
+		err := m.mailer.SendMail([]string{address}, m.subject, messageBody.String())
 		if err != nil {
-			var recoverableSMTPErr bmail.RecoverableSMTPError
-			if errors.As(err, &recoverableSMTPErr) {
+			var badAddrErr bmail.BadAddressSMTPError
+			if errors.As(err, &badAddrErr) {
 				m.log.Errf("address %q was rejected by server: %s", address, err)
 				continue
 			}
-			return fmt.Errorf("sending mail %d of %d to %q: %s",
+			return fmt.Errorf("while sending mail (%d) of (%d) to address %q: %s",
 				i, len(sortedAddresses), address, err)
 		}
+
 		sent++
 		m.clk.Sleep(m.sleepInterval)
 	}
+
 	if sent == 0 {
-		return fmt.Errorf("sent zero messages. Check recipients and configured interval")
+		return errors.New("0 messages sent, check recipients or configured interval")
 	}
 	return nil
 }
 
-// resolveEmailAddresses looks up the id of each recipient to find that
-// account's email addresses, then adds that recipient to a map from address to
-// recipient struct.
-func (m *mailer) resolveEmailAddresses() (emailToRecipientMap, error) {
-	result := make(emailToRecipientMap, len(m.destinations))
-
-	for _, r := range m.destinations {
-		// Get the email address for the reg ID
-		emails, err := emailsForReg(r.id, m.dbMap)
+// resolveAddresses creates a mapping of email addresses to (a list of)
+// `recipient`s that resolve to that email address.
+func (m *mailer) resolveAddresses() (addressToRecipientMap, error) {
+	result := make(addressToRecipientMap, len(m.recipients))
+	for _, recipient := range m.recipients {
+		addresses, err := getAddressForID(recipient.id, m.dbMap)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, email := range emails {
-			parsedEmail, err := mail.ParseAddress(email)
+		for _, address := range addresses {
+			parsed, err := mail.ParseAddress(address)
 			if err != nil {
-				m.log.Errf("unparsable email for reg ID %d : %q", r.id, email)
+				m.log.Errf("Unparsable address %q, skipping ID (%d)", address, recipient.id)
 				continue
 			}
-			addr := parsedEmail.Address
-			result[addr] = append(result[addr], r)
+			result[parsed.Address] = append(result[parsed.Address], recipient)
 		}
 	}
 	return result, nil
 }
 
-// Since the only thing we use from gorp is the SelectOne method on the
-// gorp.DbMap object, we just define an interface with that method
-// instead of importing all of gorp. This facilitates mock implementations for
-// unit tests
+// dbSelector abstracts over a subset of methods from `gorp.DbMap` objects to
+// facilitate mocking in unit tests.
 type dbSelector interface {
 	SelectOne(holder interface{}, query string, args ...interface{}) error
 }
 
-// Finds the email addresses associated with a reg ID
-func emailsForReg(id int, dbMap dbSelector) ([]string, error) {
-	var contact contactJSON
-	err := dbMap.SelectOne(&contact,
-		`SELECT id, contact
+// getAddressForID queries the database for the email address associated with
+// the provided registration ID.
+func getAddressForID(id int64, dbMap dbSelector) ([]string, error) {
+	var result contactQueryResult
+	err := dbMap.SelectOne(&result,
+		`SELECT id,
+			contact
 		FROM registrations
-		WHERE contact != 'null' AND id = :id;`,
-		map[string]interface{}{
-			"id": id,
-		})
+		WHERE contact NOT IN ('[]', 'null')
+			AND id = :id;`,
+		map[string]interface{}{"id": id})
 	if err != nil {
 		if db.IsNoRows(err) {
 			return []string{}, nil
@@ -231,86 +236,130 @@ func emailsForReg(id int, dbMap dbSelector) ([]string, error) {
 		return nil, err
 	}
 
-	var contactFields []string
-	var addresses []string
-	err = json.Unmarshal(contact.Contact, &contactFields)
+	var contacts []string
+	err = json.Unmarshal(result.Contact, &contacts)
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range contactFields {
-		if strings.HasPrefix(entry, "mailto:") {
-			addresses = append(addresses, strings.TrimPrefix(entry, "mailto:"))
+
+	var addresses []string
+	for _, contact := range contacts {
+		if strings.HasPrefix(contact, "mailto:") {
+			addresses = append(addresses, strings.TrimPrefix(contact, "mailto:"))
 		}
 	}
 	return addresses, nil
 }
 
-// recipient represents one line in the input CSV, containing an account and
-// (optionally) some extra fields related to that account.
+// recipient represents a single record from the recipient list file.
 type recipient struct {
-	id    int
-	Extra map[string]string
+	id int64
+
+	// Data is exported so the contents can be referenced from message template.
+	Data map[string]string
 }
 
-// emailToRecipientMap maps from an email address to a list of recipients with
-// that email address.
-type emailToRecipientMap map[string][]recipient
+// addressToRecipientMap maps email addresses to a list of `recipient`s that
+// resolve to that email address.
+type addressToRecipientMap map[string][]recipient
 
-// readRecipientsList reads a CSV filename and parses that file into a list of
-// recipient structs. It puts any columns after the first into a per-recipient
-// map from column name -> value.
-func readRecipientsList(filename string) ([]recipient, error) {
+// readRecipientsList parses the contents of a recipient list file into a list
+// of `recipient` objects.
+func readRecipientsList(filename string, delimiter rune) ([]recipient, string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, err
-	}
-	reader := csv.NewReader(f)
-	record, err := reader.Read()
-	if err != nil {
-		return nil, err
-	}
-	if len(record) == 0 {
-		return nil, fmt.Errorf("no entries in CSV")
-	}
-	if record[0] != "id" {
-		return nil, fmt.Errorf("first field of CSV input must be an ID.")
-	}
-	var columnNames []string
-	for _, v := range record[1:] {
-		columnNames = append(columnNames, strings.TrimSpace(v))
+		return nil, "", err
 	}
 
-	results := []recipient{}
+	reader := csv.NewReader(f)
+	reader.Comma = delimiter
+
+	// Parse header.
+	record, err := reader.Read()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse header: %w", err)
+	}
+
+	if record[0] != "id" {
+		return nil, "", errors.New("header must begin with \"id\"")
+	}
+
+	// Collect the names of each header column after `id`.
+	var dataColumns []string
+	for _, v := range record[1:] {
+		dataColumns = append(dataColumns, strings.TrimSpace(v))
+		if len(v) == 0 {
+			return nil, "", errors.New("header contains an empty column")
+		}
+	}
+
+	var recordsWithEmptyColumns []int64
+	var recordsWithDuplicateIDs []int64
+	var probsBuff strings.Builder
+	stringProbs := func() string {
+		if len(recordsWithEmptyColumns) != 0 {
+			fmt.Fprintf(&probsBuff, "ID(s) %v contained empty columns and ",
+				recordsWithEmptyColumns)
+		}
+
+		if len(recordsWithDuplicateIDs) != 0 {
+			fmt.Fprintf(&probsBuff, "ID(s) %v were skipped as duplicates",
+				recordsWithDuplicateIDs)
+		}
+
+		if probsBuff.Len() == 0 {
+			return ""
+		}
+		return strings.TrimSuffix(probsBuff.String(), " and ")
+	}
+
+	// Parse records.
+	recipientIDs := make(map[int64]bool)
+	var recipients []recipient
 	for {
 		record, err := reader.Read()
-		if err == io.EOF {
-			if len(results) == 0 {
-				return nil, fmt.Errorf("no entries after the header in CSV")
+		if errors.Is(err, io.EOF) {
+			// Finished parsing the file.
+			if len(recipients) == 0 {
+				return nil, stringProbs(), errors.New("no records after header")
 			}
-			return results, nil
+			return recipients, stringProbs(), nil
+		} else if err != nil {
+			return nil, "", err
 		}
+
+		// Ensure the first column of each record can be parsed as a valid
+		// registration ID.
+		recordID := record[0]
+		id, err := strconv.ParseInt(recordID, 10, 64)
 		if err != nil {
-			return nil, err
+			return nil, "", fmt.Errorf(
+				"%q couldn't be parsed as a registration ID due to: %s", recordID, err)
 		}
-		if len(record) == 0 {
-			return nil, fmt.Errorf("empty line in CSV")
+
+		// Skip records that have the same ID as those read previously.
+		if recipientIDs[id] {
+			recordsWithDuplicateIDs = append(recordsWithDuplicateIDs, id)
+			continue
 		}
-		if len(record) != len(columnNames)+1 {
-			return nil, fmt.Errorf("Number of columns in CSV line didn't match header columns."+
-				" Got %d, expected %d. Line: %v", len(record), len(columnNames)+1, record)
-		}
-		id, err := strconv.Atoi(record[0])
-		if err != nil {
-			return nil, err
-		}
-		recip := recipient{
-			id:    id,
-			Extra: make(map[string]string),
-		}
+		recipientIDs[id] = true
+
+		// Collect the columns of data after `id` into a map.
+		var emptyColumn bool
+		data := make(map[string]string)
 		for i, v := range record[1:] {
-			recip.Extra[columnNames[i]] = v
+			if len(v) == 0 {
+				emptyColumn = true
+			}
+			data[dataColumns[i]] = v
 		}
-		results = append(results, recip)
+
+		// Only used for logging.
+		if emptyColumn {
+			recordsWithEmptyColumns = append(recordsWithEmptyColumns, id)
+		}
+
+		recipients = append(recipients, recipient{id, data})
 	}
 }
 
@@ -397,6 +446,7 @@ func main() {
 	from := flag.String("from", "", "From header for emails. Must be a bare email address.")
 	subject := flag.String("subject", "", "Subject of emails")
 	recipientListFile := flag.String("recipientList", "", "File containing a CSV list of registration IDs and extra info.")
+	parseAsTSV := flag.Bool("tsv", false, "Parse the recipient list file as a TSV.")
 	bodyFile := flag.String("body", "", "File containing the email body in Golang template format.")
 	dryRun := flag.Bool("dryRun", true, "Whether to do a dry run.")
 	sleep := flag.Duration("sleep", 500*time.Millisecond, "How long to sleep between emails.")
@@ -404,15 +454,6 @@ func main() {
 	end := flag.String("end", "\xFF", "Alphabetically highest email address (exclusive).")
 	reconnBase := flag.Duration("reconnectBase", 1*time.Second, "Base sleep duration between reconnect attempts")
 	reconnMax := flag.Duration("reconnectMax", 5*60*time.Second, "Max sleep duration between reconnect attempts after exponential backoff")
-	type config struct {
-		NotifyMailer struct {
-			DB cmd.DBConfig
-			cmd.PasswordConfig
-			cmd.SMTPConfig
-			Features map[string]bool
-		}
-		Syslog cmd.SyslogConfig
-	}
 	configFile := flag.String("config", "", "File containing a JSON config.")
 
 	flag.Usage = func() {
@@ -421,6 +462,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 
+	// Validate required args.
 	flag.Parse()
 	if *from == "" || *subject == "" || *bodyFile == "" || *configFile == "" ||
 		*recipientListFile == "" {
@@ -429,48 +471,75 @@ func main() {
 	}
 
 	configData, err := ioutil.ReadFile(*configFile)
-	cmd.FailOnError(err, fmt.Sprintf("Reading %q", *configFile))
+	cmd.FailOnError(err, "Couldn't load JSON config file")
+
+	type config struct {
+		NotifyMailer struct {
+			DB cmd.DBConfig
+			cmd.SMTPConfig
+		}
+		Syslog cmd.SyslogConfig
+	}
+
+	// Parse JSON config.
 	var cfg config
 	err = json.Unmarshal(configData, &cfg)
-	cmd.FailOnError(err, "Unmarshaling config")
-	err = features.Set(cfg.NotifyMailer.Features)
-	cmd.FailOnError(err, "Failed to set feature flags")
+	cmd.FailOnError(err, "Couldn't unmarshal JSON config file")
 
 	log := cmd.NewLogger(cfg.Syslog)
 	defer log.AuditPanic()
 
+	// Setup database client.
 	dbURL, err := cfg.NotifyMailer.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbSettings := sa.DbSettings{
-		MaxOpenConns: 10,
-	}
-	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
-	cmd.FailOnError(err, "Could not connect to database")
 
-	// Load email body
-	body, err := ioutil.ReadFile(*bodyFile)
-	cmd.FailOnError(err, fmt.Sprintf("Reading %q", *bodyFile))
-	template, err := template.New("email").Parse(string(body))
-	cmd.FailOnError(err, fmt.Sprintf("Parsing template %q", *bodyFile))
+	conf, err := mysql.ParseDSN(dbURL)
+	cmd.FailOnError(err, "Couldn't parse DB URL as DSN")
+
+	// Transaction isolation level READ UNCOMMITTED trades consistency for
+	// performance.
+	if len(conf.Params) == 0 {
+		conf.Params = make(map[string]string)
+	}
+	conf.Params["tx_isolation"] = "'READ-UNCOMMITTED'"
+
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    cfg.NotifyMailer.DB.MaxOpenConns,
+		MaxIdleConns:    cfg.NotifyMailer.DB.MaxIdleConns,
+		ConnMaxLifetime: cfg.NotifyMailer.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: cfg.NotifyMailer.DB.ConnMaxIdleTime.Duration,
+	}
+
+	dbMap, err := sa.NewDbMap(conf.FormatDSN(), dbSettings)
+	cmd.FailOnError(err, "Couldn't create database connection")
+
+	// Load and parse message body.
+	template, err := template.New("email").ParseFiles(*bodyFile)
+	cmd.FailOnError(err, "Couldn't parse message template")
 
 	address, err := mail.ParseAddress(*from)
-	cmd.FailOnError(err, fmt.Sprintf("Parsing %q", *from))
+	cmd.FailOnError(err, fmt.Sprintf("Couldn't parse %q to address", *from))
 
-	recipients, err := readRecipientsList(*recipientListFile)
-	cmd.FailOnError(err, fmt.Sprintf("Reading %q", *recipientListFile))
+	recipientListDelimiter := ','
+	if *parseAsTSV {
+		recipientListDelimiter = '\t'
+	}
+	recipients, probs, err := readRecipientsList(*recipientListFile, recipientListDelimiter)
+	cmd.FailOnError(err, "Couldn't populate recipients")
 
-	targetRange := interval{
-		start: *start,
-		end:   *end,
+	if probs != "" {
+		log.Infof("While reading the recipient list file %s", probs)
 	}
 
 	var mailClient bmail.Mailer
 	if *dryRun {
-		log.Infof("Doing a dry run.")
+		log.Infof("Starting %s in dry-run mode", cmd.VersionString())
 		mailClient = bmail.NewDryRun(*address, log)
 	} else {
+		log.Infof("Starting %s", cmd.VersionString())
 		smtpPassword, err := cfg.NotifyMailer.PasswordConfig.Pass()
-		cmd.FailOnError(err, "Failed to load SMTP password")
+		cmd.FailOnError(err, "Couldn't load SMTP password from file")
+
 		mailClient = bmail.New(
 			cfg.NotifyMailer.Server,
 			cfg.NotifyMailer.Port,
@@ -490,12 +559,17 @@ func main() {
 		dbMap:         dbMap,
 		mailer:        mailClient,
 		subject:       *subject,
-		destinations:  recipients,
+		recipients:    recipients,
 		emailTemplate: template,
-		targetRange:   targetRange,
+		targetRange: interval{
+			start: *start,
+			end:   *end,
+		},
 		sleepInterval: *sleep,
 	}
 
 	err = m.run()
-	cmd.FailOnError(err, "mailer.send returned error")
+	cmd.FailOnError(err, "Couldn't complete")
+
+	log.Info("Completed successfully")
 }

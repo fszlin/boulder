@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/akamai"
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
@@ -44,7 +45,11 @@ import (
 	"github.com/weppos/publicsuffix-go/publicsuffix"
 	"golang.org/x/crypto/ocsp"
 	grpc "google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"gopkg.in/square/go-jose.v2"
 )
+
+var errIncompleteGRPCRequest = errors.New("incomplete gRPC request message")
 
 type caaChecker interface {
 	IsCAAValid(
@@ -333,18 +338,47 @@ func (ra *RegistrationAuthorityImpl) checkRegistrationLimits(ctx context.Context
 }
 
 // NewRegistration constructs a new Registration from a request.
-func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, init core.Registration) (core.Registration, error) {
-	if err := ra.keyPolicy.GoodKey(ctx, init.Key.Key); err != nil {
-		return core.Registration{}, berrors.MalformedError("invalid public key: %s", err.Error())
+func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, request *corepb.Registration) (*corepb.Registration, error) {
+	// Error if the request is nil, there is no account key or IP address
+	if request == nil || len(request.Key) == 0 || len(request.InitialIP) == 0 {
+		return nil, errIncompleteGRPCRequest
 	}
-	if err := ra.checkRegistrationLimits(ctx, init.InitialIP); err != nil {
-		return core.Registration{}, err
+
+	// Convert key bytes to key
+	var key jose.JSONWebKey
+	if err := key.UnmarshalJSON(request.Key); err != nil {
+		return nil, berrors.InternalServerError("failed to unmarshal account key: %s", err.Error())
+	}
+	// Check if account key is acceptable for use
+	if err := ra.keyPolicy.GoodKey(ctx, key.Key); err != nil {
+		return nil, berrors.MalformedError("invalid public key: %s", err.Error())
+	}
+
+	// Convert IP from bytes
+	var ipAddr net.IP
+	if err := ipAddr.UnmarshalText(request.InitialIP); err != nil {
+		return nil, berrors.InternalServerError("failed to unmarshal ip address: %s", err.Error())
+	}
+
+	if err := ra.checkRegistrationLimits(ctx, ipAddr); err != nil {
+		return nil, err
+	}
+
+	if err := validateContactsPresent(request.Contact, request.ContactsPresent); err != nil {
+		return nil, err
 	}
 
 	reg := core.Registration{
-		Key:    init.Key,
+		Key:    &key,
 		Status: core.StatusValid,
 	}
+
+	// Convert request to core.Registration for merge and SA rpc
+	init, err := bgrpc.PbToRegistration(request)
+	if err != nil {
+		return nil, err
+	}
+
 	_ = mergeUpdate(&reg, init)
 
 	// This field isn't updatable by the end user, so it isn't copied by
@@ -352,17 +386,22 @@ func (ra *RegistrationAuthorityImpl) NewRegistration(ctx context.Context, init c
 	reg.InitialIP = init.InitialIP
 
 	if err := ra.validateContacts(ctx, reg.Contact); err != nil {
-		return core.Registration{}, err
+		return nil, err
 	}
 
 	// Store the authorization object, then return it
-	reg, err := ra.SA.NewRegistration(ctx, reg)
+	reg, err = ra.SA.NewRegistration(ctx, reg)
 	if err != nil {
-		return core.Registration{}, err
+		return nil, err
 	}
 
 	ra.newRegCounter.Inc()
-	return reg, nil
+	regPB, err := bgrpc.RegistrationToPB(reg)
+	if err != nil {
+		return nil, err
+	}
+
+	return regPB, nil
 }
 
 // validateContacts checks the provided list of contacts, returning an error if
@@ -1077,10 +1116,14 @@ func (ra *RegistrationAuthorityImpl) issueCertificate(
 		Requester:   int64(acctID),
 		RequestTime: ra.clk.Now(),
 	}
+	beeline.AddFieldToTrace(ctx, "issuance.id", logEvent.ID)
+	beeline.AddFieldToTrace(ctx, "order.id", oID)
+	beeline.AddFieldToTrace(ctx, "acct.id", acctID)
 	var result string
 	cert, err := ra.issueCertificateInner(ctx, req, acctID, oID, issuerNameID, &logEvent)
 	if err != nil {
 		logEvent.Error = err.Error()
+		beeline.AddFieldToTrace(ctx, "issuance.error", err)
 		result = "error"
 	} else {
 		result = "successful"
@@ -1129,7 +1172,9 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 
 	csr := req.CSR
 	logEvent.CommonName = csr.Subject.CommonName
+	beeline.AddFieldToTrace(ctx, "csr.cn", csr.Subject.CommonName)
 	logEvent.Names = csr.DNSNames
+	beeline.AddFieldToTrace(ctx, "csr.dnsnames", csr.DNSNames)
 
 	// Validate that authorization key is authorized for all domains in the CSR
 	names := make([]string, len(csr.DNSNames))
@@ -1242,9 +1287,13 @@ func (ra *RegistrationAuthorityImpl) issueCertificateInner(
 	}
 
 	logEvent.SerialNumber = core.SerialToString(parsedCertificate.SerialNumber)
+	beeline.AddFieldToTrace(ctx, "cert.serial", core.SerialToString(parsedCertificate.SerialNumber))
 	logEvent.CommonName = parsedCertificate.Subject.CommonName
+	beeline.AddFieldToTrace(ctx, "cert.cn", parsedCertificate.Subject.CommonName)
 	logEvent.NotBefore = parsedCertificate.NotBefore
+	beeline.AddFieldToTrace(ctx, "cert.not_before", parsedCertificate.NotBefore)
 	logEvent.NotAfter = parsedCertificate.NotAfter
+	beeline.AddFieldToTrace(ctx, "cert.not_after", parsedCertificate.NotAfter)
 
 	ra.newCertCounter.Inc()
 	res, err := bgrpc.PBToCert(cert)
@@ -1385,10 +1434,11 @@ func (ra *RegistrationAuthorityImpl) checkCertificatesPerFQDNSetLimit(ctx contex
 		return fmt.Errorf("checking duplicate certificate limit for %q: %s", names, err)
 	}
 	names = core.UniqueLowerNames(names)
-	if int(count) >= limit.GetThreshold(strings.Join(names, ","), regID) {
+	threshold := limit.GetThreshold(strings.Join(names, ","), regID)
+	if int(count) >= threshold {
 		return berrors.RateLimitError(
-			"too many certificates already issued for exact set of domains: %s",
-			strings.Join(names, ","),
+			"too many certificates (%d) already issued for this exact set of domains in the last %.0f hours: %s",
+			threshold, limit.Window.Duration.Hours(), strings.Join(names, ","),
 		)
 	}
 	return nil
@@ -1398,6 +1448,14 @@ func (ra *RegistrationAuthorityImpl) checkLimits(ctx context.Context, names []st
 	certNameLimits := ra.rlPolicies.CertificatesPerName()
 	if certNameLimits.Enabled() {
 		err := ra.checkCertificatesPerNameLimit(ctx, names, certNameLimits, regID)
+		if err != nil {
+			return err
+		}
+	}
+
+	fqdnFastLimits := ra.rlPolicies.CertificatesPerFQDNSetFast()
+	if fqdnFastLimits.Enabled() {
+		err := ra.checkCertificatesPerFQDNSetLimit(ctx, names, fqdnFastLimits, regID)
 		if err != nil {
 			return err
 		}
@@ -1416,28 +1474,54 @@ func (ra *RegistrationAuthorityImpl) checkLimits(ctx context.Context, names []st
 // UpdateRegistration updates an existing Registration with new values. Caller
 // is responsible for making sure that update.Key is only different from base.Key
 // if it is being called from the WFE key change endpoint.
-func (ra *RegistrationAuthorityImpl) UpdateRegistration(ctx context.Context, base core.Registration, update core.Registration) (core.Registration, error) {
-	if changed := mergeUpdate(&base, update); !changed {
+func (ra *RegistrationAuthorityImpl) UpdateRegistration(ctx context.Context, req *rapb.UpdateRegistrationRequest) (*corepb.Registration, error) {
+	// Error if the request is nil, there is no account key or IP address
+	if req.Base == nil || len(req.Base.Key) == 0 || len(req.Base.InitialIP) == 0 || req.Base.Id == 0 {
+		return nil, errIncompleteGRPCRequest
+	}
+
+	if err := validateContactsPresent(req.Base.Contact, req.Base.ContactsPresent); err != nil {
+		return nil, err
+	}
+
+	baseReg, err := bgrpc.PbToRegistration(req.Base)
+	if err != nil {
+		return nil, err
+	}
+
+	updateReg, err := bgrpc.PbToRegistration(req.Update)
+	if err != nil {
+		return nil, err
+	}
+
+	if changed := mergeUpdate(&baseReg, updateReg); !changed {
 		// If merging the update didn't actually change the base then our work is
 		// done, we can return before calling ra.SA.UpdateRegistration since there's
 		// nothing for the SA to do
-		return base, nil
+		regPb, err := bgrpc.RegistrationToPB(baseReg)
+		if err != nil {
+			return nil, err
+		}
+		return regPb, nil
 	}
 
-	err := ra.validateContacts(ctx, base.Contact)
-	if err != nil {
-		return core.Registration{}, err
+	if err := ra.validateContacts(ctx, baseReg.Contact); err != nil {
+		return nil, err
 	}
 
-	err = ra.SA.UpdateRegistration(ctx, base)
+	err = ra.SA.UpdateRegistration(ctx, baseReg)
 	if err != nil {
 		// berrors.InternalServerError since the user-data was validated before being
 		// passed to the SA.
 		err = berrors.InternalServerError("Could not update registration: %s", err)
-		return core.Registration{}, err
+		return nil, err
 	}
 
-	return base, nil
+	regPb, err := bgrpc.RegistrationToPB(baseReg)
+	if err != nil {
+		return nil, err
+	}
+	return regPb, nil
 }
 
 func contactsEqual(r *core.Registration, other core.Registration) bool {
@@ -1548,6 +1632,10 @@ func (ra *RegistrationAuthorityImpl) PerformValidation(
 
 	// Clock for start of PerformValidation.
 	vStart := ra.clk.Now()
+
+	if req.Authz == nil || req.Authz.Id == "" || req.Authz.Identifier == "" || req.Authz.Status == "" || req.Authz.Expires == 0 {
+		return nil, errIncompleteGRPCRequest
+	}
 
 	authz, err := bgrpc.PBToAuthz(req.Authz)
 	if err != nil {
@@ -1755,9 +1843,20 @@ func (ra *RegistrationAuthorityImpl) revokeCertificate(ctx context.Context, cert
 }
 
 // RevokeCertificateWithReg terminates trust in the certificate provided.
-func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, revocationCode revocation.Reason, regID int64) error {
+func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Context, req *rapb.RevokeCertificateWithRegRequest) (*emptypb.Empty, error) {
+	if req == nil || req.Cert == nil {
+		return nil, errIncompleteGRPCRequest
+	}
+
+	cert, err := x509.ParseCertificate(req.Cert)
+	if err != nil {
+		return nil, err
+	}
+
 	serialString := core.SerialToString(cert.SerialNumber)
-	err := ra.revokeCertificate(ctx, cert, revocationCode, regID, "API", "")
+	revocationCode := revocation.Reason(req.Code)
+
+	err = ra.revokeCertificate(ctx, *cert, revocationCode, req.RegID, "API", "")
 
 	state := "Failure"
 	defer func() {
@@ -1770,17 +1869,17 @@ func (ra *RegistrationAuthorityImpl) RevokeCertificateWithReg(ctx context.Contex
 		//   Error (if there was one)
 		ra.log.AuditInfof("%s, Request by registration ID: %d",
 			revokeEvent(state, serialString, cert.Subject.CommonName, cert.DNSNames, revocationCode),
-			regID)
+			req.RegID)
 	}()
 
 	if err != nil {
 		state = fmt.Sprintf("Failure -- %s", err)
-		return err
+		return nil, err
 	}
 
 	ra.revocationReasonCounter.WithLabelValues(revocation.ReasonToString[revocationCode]).Inc()
 	state = "Success"
-	return nil
+	return &emptypb.Empty{}, nil
 }
 
 // AdministrativelyRevokeCertificate terminates trust in the certificate provided and
@@ -1817,15 +1916,18 @@ func (ra *RegistrationAuthorityImpl) AdministrativelyRevokeCertificate(ctx conte
 }
 
 // DeactivateRegistration deactivates a valid registration
-func (ra *RegistrationAuthorityImpl) DeactivateRegistration(ctx context.Context, reg core.Registration) error {
-	if reg.Status != core.StatusValid {
-		return berrors.MalformedError("only valid registrations can be deactivated")
+func (ra *RegistrationAuthorityImpl) DeactivateRegistration(ctx context.Context, reg *corepb.Registration) (*emptypb.Empty, error) {
+	if reg == nil || reg.Id == 0 {
+		return nil, errIncompleteGRPCRequest
 	}
-	err := ra.SA.DeactivateRegistration(ctx, reg.ID)
+	if reg.Status != string(core.StatusValid) {
+		return nil, berrors.MalformedError("only valid registrations can be deactivated")
+	}
+	err := ra.SA.DeactivateRegistration(ctx, reg.Id)
 	if err != nil {
-		return berrors.InternalServerError(err.Error())
+		return nil, berrors.InternalServerError(err.Error())
 	}
-	return nil
+	return &emptypb.Empty{}, nil
 }
 
 // DeactivateAuthorization deactivates a currently valid authorization
@@ -1860,6 +1962,10 @@ func (ra *RegistrationAuthorityImpl) checkOrderNames(names []string) error {
 
 // NewOrder creates a new order object
 func (ra *RegistrationAuthorityImpl) NewOrder(ctx context.Context, req *rapb.NewOrderRequest) (*corepb.Order, error) {
+	if req == nil || req.RegistrationID == 0 {
+		return nil, errIncompleteGRPCRequest
+	}
+
 	order := &corepb.Order{
 		RegistrationID: req.RegistrationID,
 		Names:          core.UniqueLowerNames(req.Names),
@@ -2121,6 +2227,20 @@ func wildcardOverlap(dnsNames []string) error {
 			return berrors.MalformedError(
 				"Domain name %q is redundant with a wildcard domain in the same request. Remove one or the other from the certificate request.", name)
 		}
+	}
+	return nil
+}
+
+// validateContactsPresent will return an error if the contacts []string
+// len is greater than zero and the contactsPresent bool is false. We
+// don't care about any other cases. If the length of the contacts is zero
+// and contactsPresent is true, it seems like a mismatch but we have to
+// assume that the client is requesting to update the contacts field with
+// by removing the existing contacts value so we don't want to return an
+// error here.
+func validateContactsPresent(contacts []string, contactsPresent bool) error {
+	if len(contacts) > 0 && !contactsPresent {
+		return berrors.InternalServerError("account contacts present but contactsPresent false")
 	}
 	return nil
 }

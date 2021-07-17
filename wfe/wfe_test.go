@@ -43,6 +43,7 @@ import (
 	"github.com/letsencrypt/boulder/web"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/square/go-jose.v2"
 )
 
@@ -200,7 +201,7 @@ type MockRegistrationAuthority struct {
 	lastRevocationReason revocation.Reason
 }
 
-func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, reg core.Registration) (core.Registration, error) {
+func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, reg *corepb.Registration) (*corepb.Registration, error) {
 	return reg, nil
 }
 
@@ -214,21 +215,20 @@ func (ra *MockRegistrationAuthority) NewCertificate(ctx context.Context, req cor
 	return core.Certificate{}, nil
 }
 
-func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, reg core.Registration, updated core.Registration) (core.Registration, error) {
-	keysMatch, _ := core.PublicKeysEqual(reg.Key.Key, updated.Key.Key)
-	if !keysMatch {
-		reg.Key = updated.Key
+func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, req *rapb.UpdateRegistrationRequest) (*corepb.Registration, error) {
+	if !bytes.Equal(req.Base.Key, req.Update.Key) {
+		req.Base.Key = req.Update.Key
 	}
-	return reg, nil
+	return req.Base, nil
 }
 
 func (ra *MockRegistrationAuthority) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
 	return nil, nil
 }
 
-func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, reason revocation.Reason, reg int64) error {
-	ra.lastRevocationReason = reason
-	return nil
+func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, req *rapb.RevokeCertificateWithRegRequest) (*emptypb.Empty, error) {
+	ra.lastRevocationReason = revocation.Reason(req.Code)
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) AdministrativelyRevokeCertificate(ctx context.Context, cert x509.Certificate, reason revocation.Reason, user string) error {
@@ -243,8 +243,8 @@ func (ra *MockRegistrationAuthority) DeactivateAuthorization(ctx context.Context
 	return nil
 }
 
-func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ core.Registration) error {
-	return nil
+func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ *corepb.Registration) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) NewOrder(ctx context.Context, _ *rapb.NewOrderRequest) (*corepb.Order, error) {
@@ -2537,7 +2537,6 @@ func TestDeactivateRegistration(t *testing.T) {
 		  ],
 		  "agreement": "http://example.invalid/terms",
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2558,7 +2557,6 @@ func TestDeactivateRegistration(t *testing.T) {
 		  ],
 		  "agreement": "http://example.invalid/terms",
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2648,7 +2646,6 @@ func TestKeyRollover(t *testing.T) {
 		     ],
 		     "agreement": "http://example.invalid/terms",
 		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
 		     "status": "valid"
 		   }`,
 		},

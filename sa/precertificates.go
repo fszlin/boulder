@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
@@ -19,7 +21,7 @@ import (
 var errIncompleteRequest = errors.New("Incomplete gRPC request message")
 
 // AddSerial writes a record of a serial number generation to the DB.
-func (ssa *SQLStorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*corepb.Empty, error) {
+func (ssa *SQLStorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*emptypb.Empty, error) {
 	if core.IsAnyNilOrZero(req.Created, req.Expires, req.Serial, req.RegID) {
 		return nil, errIncompleteRequest
 	}
@@ -32,14 +34,14 @@ func (ssa *SQLStorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSeri
 	if err != nil {
 		return nil, err
 	}
-	return &corepb.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // AddPrecertificate writes a record of a precertificate generation to the DB.
 // Note: this is not idempotent: it does not protect against inserting the same
 // certificate multiple times. Calling code needs to first insert the cert's
 // serial into the Serials table to ensure uniqueness.
-func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*corepb.Empty, error) {
+func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*emptypb.Empty, error) {
 	if core.IsAnyNilOrZero(req.Der, req.Issued, req.RegID, req.IssuerID) {
 		return nil, errIncompleteRequest
 	}
@@ -59,6 +61,16 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 	}
 
 	_, overallError := db.WithTransaction(ctx, ssa.dbMap, func(txWithCtx db.Executor) (interface{}, error) {
+		// Select to see if precert exists
+		var row struct {
+			Count int64
+		}
+		if err := txWithCtx.SelectOne(&row, "SELECT count(1) as count FROM precertificates WHERE serial=?", serialHex); err != nil {
+			return nil, err
+		}
+		if row.Count > 0 {
+			return nil, berrors.DuplicateError("cannot add a duplicate cert")
+		}
 		if err := txWithCtx.Insert(preCertModel); err != nil {
 			return nil, err
 		}
@@ -117,7 +129,7 @@ func (ssa *SQLStorageAuthority) AddPrecertificate(ctx context.Context, req *sapb
 	if overallError != nil {
 		return nil, overallError
 	}
-	return &corepb.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // GetPrecertificate takes a serial number and returns the corresponding

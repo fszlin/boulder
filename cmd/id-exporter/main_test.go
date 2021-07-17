@@ -49,9 +49,9 @@ func TestFindIDs(t *testing.T) {
 
 	// Run findIDs - since no certificates have been added corresponding to
 	// the above registrations, no IDs should be found.
-	ids, err := testCtx.c.findIDs()
+	results, err := testCtx.c.findIDs()
 	test.AssertNotError(t, err, "findIDs() produced error")
-	test.AssertEquals(t, len(ids), 0)
+	test.AssertEquals(t, len(results), 0)
 
 	// Now add some certificates
 	testCtx.addCertificates(t)
@@ -61,84 +61,180 @@ func TestFindIDs(t *testing.T) {
 	// *not* be present since their certificate has already expired. Unlike
 	// previous versions of this test RegD is not filtered out for having a `tel:`
 	// contact field anymore - this is the duty of the notify-mailer.
-	ids, err = testCtx.c.findIDs()
+	results, err = testCtx.c.findIDs()
 	test.AssertNotError(t, err, "findIDs() produced error")
-	test.AssertEquals(t, len(ids), 3)
-	test.AssertEquals(t, ids[0].ID, regA.ID)
-	test.AssertEquals(t, ids[1].ID, regC.ID)
-	test.AssertEquals(t, ids[2].ID, regD.ID)
+	test.AssertEquals(t, len(results), 3)
+	for _, entry := range results {
+		switch entry.ID {
+		case regA.ID:
+		case regC.ID:
+		case regD.ID:
+		default:
+			t.Errorf("ID: %d not expected", entry.ID)
+		}
+	}
 
 	// Allow a 1 year grace period
 	testCtx.c.grace = 360 * 24 * time.Hour
-	ids, err = testCtx.c.findIDs()
+	results, err = testCtx.c.findIDs()
 	test.AssertNotError(t, err, "findIDs() produced error")
 	// Now all four registration should be returned, including RegB since its
 	// certificate expired within the grace period
-	test.AssertEquals(t, len(ids), 4)
-	test.AssertEquals(t, ids[0].ID, regA.ID)
-	test.AssertEquals(t, ids[1].ID, regB.ID)
-	test.AssertEquals(t, ids[2].ID, regC.ID)
-	test.AssertEquals(t, ids[3].ID, regD.ID)
+	for _, entry := range results {
+		switch entry.ID {
+		case regA.ID:
+		case regB.ID:
+		case regC.ID:
+		case regD.ID:
+		default:
+			t.Errorf("ID: %d not expected", entry.ID)
+		}
+	}
 }
 
-func TestFindIDsForDomains(t *testing.T) {
+func TestFindIDsWithExampleHostnames(t *testing.T) {
 	testCtx := setup(t)
 	defer testCtx.cleanUp()
 
 	// Add some test registrations
 	testCtx.addRegistrations(t)
 
-	// Run findIDsForDomains - since no certificates have been added corresponding to
-	// the above registrations, no IDs should be found.
-	ids, err := testCtx.c.findIDsForDomains([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
+	// Run findIDsWithExampleHostnames - since no certificates have been
+	// added corresponding to the above registrations, no IDs should be
+	// found.
+	results, err := testCtx.c.findIDsWithExampleHostnames()
 	test.AssertNotError(t, err, "findIDs() produced error")
-	test.AssertEquals(t, len(ids), 0)
+	test.AssertEquals(t, len(results), 0)
 
 	// Now add some certificates
 	testCtx.addCertificates(t)
 
-	ids, err = testCtx.c.findIDsForDomains([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
-	test.AssertNotError(t, err, "findIDsForDomains() failed")
-	test.AssertEquals(t, len(ids), 3)
-	test.AssertEquals(t, ids[0].ID, regA.ID)
-	test.AssertEquals(t, ids[1].ID, regC.ID)
-	test.AssertEquals(t, ids[2].ID, regD.ID)
-}
+	// Run findIDsWithExampleHostnames - since there are three
+	// registrations with unexpired certs we should get exactly three
+	// IDs back: RegA, RegC and RegD. RegB should *not* be present since
+	// their certificate has already expired.
+	results, err = testCtx.c.findIDsWithExampleHostnames()
+	test.AssertNotError(t, err, "findIDs() produced error")
+	test.AssertEquals(t, len(results), 3)
+	for _, entry := range results {
+		switch entry.ID {
+		case regA.ID:
+			test.AssertEquals(t, entry.Hostname, "example-a.com")
+		case regC.ID:
+			test.AssertEquals(t, entry.Hostname, "example-c.com")
+		case regD.ID:
+			test.AssertEquals(t, entry.Hostname, "example-d.com")
+		default:
+			t.Errorf("ID: %d not expected", entry.ID)
+		}
+	}
 
-func exampleIds() []id {
-	return []id{
-		{
-			ID: 1,
-		},
-		{
-			ID: 2,
-		},
-		{
-			ID: 3,
-		},
+	// Allow a 1 year grace period
+	testCtx.c.grace = 360 * 24 * time.Hour
+	results, err = testCtx.c.findIDsWithExampleHostnames()
+	test.AssertNotError(t, err, "findIDs() produced error")
+
+	// Now all four registrations should be returned, including RegB
+	// since it expired within the grace period
+	test.AssertEquals(t, len(results), 4)
+	for _, entry := range results {
+		switch entry.ID {
+		case regA.ID:
+			test.AssertEquals(t, entry.Hostname, "example-a.com")
+		case regB.ID:
+			test.AssertEquals(t, entry.Hostname, "example-b.com")
+		case regC.ID:
+			test.AssertEquals(t, entry.Hostname, "example-c.com")
+		case regD.ID:
+			test.AssertEquals(t, entry.Hostname, "example-d.com")
+		default:
+			t.Errorf("ID: %d not expected", entry.ID)
+		}
 	}
 }
 
-func TestWriteOutput(t *testing.T) {
-	expected := `[{"id":1},{"id":2},{"id":3}]`
+func TestFindIDsForHostnames(t *testing.T) {
+	testCtx := setup(t)
+	defer testCtx.cleanUp()
 
-	ids := exampleIds()
+	// Add some test registrations
+	testCtx.addRegistrations(t)
+
+	// Run findIDsForHostnames - since no certificates have been added corresponding to
+	// the above registrations, no IDs should be found.
+	results, err := testCtx.c.findIDsForHostnames([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
+	test.AssertNotError(t, err, "findIDs() produced error")
+	test.AssertEquals(t, len(results), 0)
+
+	// Now add some certificates
+	testCtx.addCertificates(t)
+
+	results, err = testCtx.c.findIDsForHostnames([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
+	test.AssertNotError(t, err, "findIDsForHostnames() failed")
+	test.AssertEquals(t, len(results), 3)
+	for _, entry := range results {
+		switch entry.ID {
+		case regA.ID:
+		case regC.ID:
+		case regD.ID:
+		default:
+			t.Errorf("ID: %d not expected", entry.ID)
+		}
+	}
+}
+
+func TestWriteToFile(t *testing.T) {
+	expected := `[{"id":1},{"id":2},{"id":3}]`
+	mockResults := idExporterResults{{ID: 1}, {ID: 2}, {ID: 3}}
 	dir := os.TempDir()
+
 	f, err := ioutil.TempFile(dir, "ids_test")
 	test.AssertNotError(t, err, "ioutil.TempFile produced an error")
 
-	// Writing the ids with no outFile should print to stdout
-	err = writeIDs(ids, "")
-	test.AssertNotError(t, err, "writeIDs with no outfile produced error")
-
-	// Writing the ids to an outFile should produce the correct results
-	err = writeIDs(ids, f.Name())
+	// Writing the result to an outFile should produce the correct results
+	err = mockResults.writeToFile(f.Name())
 	test.AssertNotError(t, err, fmt.Sprintf("writeIDs produced an error writing to %s", f.Name()))
 
 	contents, err := ioutil.ReadFile(f.Name())
 	test.AssertNotError(t, err, fmt.Sprintf("ioutil.ReadFile produced an error reading from %s", f.Name()))
 
 	test.AssertEquals(t, string(contents), expected+"\n")
+}
+
+func Test_unmarshalHostnames(t *testing.T) {
+	testDir := os.TempDir()
+	testFile, err := ioutil.TempFile(testDir, "ids_test")
+	test.AssertNotError(t, err, "ioutil.TempFile produced an error")
+
+	// Non-existent hostnamesFile
+	_, err = unmarshalHostnames("file_does_not_exist")
+	test.AssertError(t, err, "expected error for non-existent file")
+
+	// Empty hostnamesFile
+	err = ioutil.WriteFile(testFile.Name(), []byte(""), 0644)
+	test.AssertNotError(t, err, "ioutil.WriteFile produced an error")
+	_, err = unmarshalHostnames(testFile.Name())
+	test.AssertError(t, err, "expected error for file containing 0 entries")
+
+	// One hostname present in the hostnamesFile
+	err = ioutil.WriteFile(testFile.Name(), []byte("example-a.com"), 0644)
+	test.AssertNotError(t, err, "ioutil.WriteFile produced an error")
+	results, err := unmarshalHostnames(testFile.Name())
+	test.AssertNotError(t, err, "error when unmarshalling hostnamesFile with a single hostname")
+	test.AssertEquals(t, len(results), 1)
+
+	// Two hostnames present in the hostnamesFile
+	err = ioutil.WriteFile(testFile.Name(), []byte("example-a.com\nexample-b.com"), 0644)
+	test.AssertNotError(t, err, "ioutil.WriteFile produced an error")
+	results, err = unmarshalHostnames(testFile.Name())
+	test.AssertNotError(t, err, "error when unmarshalling hostnamesFile with a two hostnames")
+	test.AssertEquals(t, len(results), 2)
+
+	// Three hostnames present in the hostnamesFile but two are separated only by a space
+	err = ioutil.WriteFile(testFile.Name(), []byte("example-a.com\nexample-b.com example-c.com"), 0644)
+	test.AssertNotError(t, err, "ioutil.WriteFile produced an error")
+	_, err = unmarshalHostnames(testFile.Name())
+	test.AssertError(t, err, "error when unmarshalling hostnamesFile with three space separated domains")
 }
 
 type testCtx struct {

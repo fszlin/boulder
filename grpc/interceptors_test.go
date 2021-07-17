@@ -105,7 +105,9 @@ func TestFailFastFalse(t *testing.T) {
 
 // testServer is used to implement TestTimeouts, and will attempt to sleep for
 // the given amount of time (unless it hits a timeout or cancel).
-type testServer struct{}
+type testServer struct {
+	test_proto.UnimplementedChillerServer
+}
 
 // Chill implements ChillerServer.Chill
 func (s *testServer) Chill(ctx context.Context, in *test_proto.Time) (*test_proto.Time, error) {
@@ -238,6 +240,7 @@ func TestRequestTimeTagging(t *testing.T) {
 // This is used by TestInFlightRPCStat to test that the gauge for in-flight RPCs
 // is incremented and decremented as expected.
 type blockedServer struct {
+	test_proto.UnimplementedChillerServer
 	roadblock, received sync.WaitGroup
 }
 
@@ -331,4 +334,26 @@ func TestInFlightRPCStat(t *testing.T) {
 
 	// Check the gauge value again
 	test.AssertMetricWithLabelsEquals(t, ci.metrics.inFlightRPCs, labels, 0)
+}
+
+func TestNoCancelInterceptor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel2 := context.WithDeadline(ctx, time.Now().Add(time.Second))
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("oh no canceled")
+		case <-time.After(50 * time.Millisecond):
+		}
+		return nil, nil
+	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+		cancel2()
+	}()
+	_, err := NoCancelInterceptor(ctx, nil, nil, handler)
+	if err != nil {
+		t.Error(err)
+	}
 }

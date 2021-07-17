@@ -137,14 +137,16 @@ func TestAddRegistration(t *testing.T) {
 	dbReg, err := sa.GetRegistration(ctx, reg.ID)
 	test.AssertNotError(t, err, fmt.Sprintf("Couldn't get registration with ID %v", reg.ID))
 
+	createdAt := clk.Now()
 	expectedReg := core.Registration{
 		ID:        reg.ID,
 		Key:       jwk,
 		InitialIP: net.ParseIP("43.34.43.34"),
-		CreatedAt: clk.Now(),
+		CreatedAt: &createdAt,
 	}
 	test.AssertEquals(t, dbReg.ID, expectedReg.ID)
 	test.Assert(t, core.KeyDigestEquals(dbReg.Key, expectedReg.Key), "Stored key != expected")
+	test.AssertDeepEquals(t, expectedReg.CreatedAt, dbReg.CreatedAt)
 
 	newReg := core.Registration{
 		ID:        reg.ID,
@@ -231,6 +233,23 @@ func TestAddCertificate(t *testing.T) {
 	ocspResp := []byte{0, 0, 1}
 	_, err = sa.AddCertificate(ctx, certDER3, reg.ID, ocspResp, &issuedTime)
 	test.AssertNotError(t, err, "Couldn't add test-cert2.der")
+}
+
+func TestAddCertificateDuplicate(t *testing.T) {
+	sa, clk, cleanUp := initSA(t)
+	defer cleanUp()
+
+	reg := satest.CreateWorkingRegistration(t, sa)
+
+	_, testCert := test.ThrowAwayCert(t, 1)
+
+	issuedTime := clk.Now()
+	_, err := sa.AddCertificate(ctx, testCert.Raw, reg.ID, nil, &issuedTime)
+	test.AssertNotError(t, err, "Couldn't add test certificate")
+
+	_, err = sa.AddCertificate(ctx, testCert.Raw, reg.ID, nil, &issuedTime)
+	test.AssertDeepEquals(t, err, berrors.DuplicateError("cannot add a duplicate cert"))
+
 }
 
 func TestCountCertificatesByNames(t *testing.T) {
