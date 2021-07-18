@@ -31,7 +31,7 @@ func createSlot(label string) (string, error) {
 }
 
 func importSlot(path string, inSlot string, label string, id string) error {
-	err := exec.Command("softhsm2-util", "--import", path, "--slot", inSlot, "--label", label, "--id", id, "--pin", "1234").CombinedOutput()
+	err := exec.Command("softhsm2-util", "--import", path, "--slot", inSlot, "--label", label, "--id", id, "--pin", "1234").Run()
 
 	return err
 }
