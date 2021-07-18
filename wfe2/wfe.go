@@ -14,6 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"io"
+	"os"
+
 	"github.com/honeycombio/beeline-go"
 	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/jmhodges/clock"
@@ -65,6 +68,8 @@ const (
 	getAuthzPath     = getAPIPrefix + "authz-v3/"
 	getChallengePath = getAPIPrefix + "chall-v3/"
 	getCertPath      = getAPIPrefix + "cert/"
+
+	getRootCertPath = "/certes/root-cert/"
 )
 
 // WebFrontEndImpl provides all the logic for Boulder's web-facing interface,
@@ -395,10 +400,61 @@ func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
 	// meaning we can wind up returning 405 when we mean to return 404. See
 	// https://github.com/letsencrypt/boulder/issues/717
 	m.Handle("/", web.NewTopHandler(wfe.log, web.WFEHandlerFunc(wfe.Index)))
+
+	wfe.HandleFunc(m, getRootCertPath, wfe.RootCertificate, "GET")
+
 	return hnynethttp.WrapHandler(measured_http.New(m, wfe.clk, stats))
 }
 
 // Method implementations
+
+func (wfe *WebFrontEndImpl) RootCertificate(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
+
+	//First of check if Get is set in the URL
+	Filename := request.URL.Query().Get("file")
+	if Filename == "" {
+		//Get not set, send a 400 bad request
+		http.Error(response, "Get 'file' not specified in url.", 400)
+		return
+	}
+
+	FullPath := "/tmp/" + Filename
+	fmt.Println("Client requests: " + Filename)
+
+	//Check if file exists and open
+	Openfile, err := os.Open(FullPath)
+	defer Openfile.Close() //Close after function return
+	if err != nil {
+		//File not found, send 404
+		http.Error(response, "File not found.", 404)
+		return
+	}
+
+	//File is found, create and send the correct headers
+
+	//Get the Content-Type of the file
+	//Create a buffer to store the header of the file in
+	FileHeader := make([]byte, 512)
+	//Copy the headers into the FileHeader buffer
+	Openfile.Read(FileHeader)
+	//Get content type of file
+	FileContentType := http.DetectContentType(FileHeader)
+
+	//Get the file size
+	FileStat, _ := Openfile.Stat()                     //Get info from file
+	FileSize := strconv.FormatInt(FileStat.Size(), 10) //Get file size as a string
+
+	//Send the headers
+	response.Header().Set("Content-Disposition", "attachment; filename="+Filename)
+	response.Header().Set("Content-Type", FileContentType)
+	response.Header().Set("Content-Length", FileSize)
+
+	//Send the file
+	//We read 512 bytes from the file already, so we reset the offset back to 0
+	Openfile.Seek(0, 0)
+	io.Copy(response, Openfile) //'Copy' the file to the client
+	return
+}
 
 // Index serves a simple identification page. It is not part of the ACME spec.
 func (wfe *WebFrontEndImpl) Index(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
