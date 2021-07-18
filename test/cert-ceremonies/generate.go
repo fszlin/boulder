@@ -99,11 +99,11 @@ func main() {
 	cmd.FailOnError(err, "failed creating softhsm2 slot for root key")
 
 	// Generate the root signing keys and certificates
-	// err = genKey("test/cert-ceremonies/root-ceremony-rsa.yaml", rsaRootKeySlot)
-	err = importSlot("certes/root-cert-rsa.pem", rsaRootKeySlot, "root signing key (rsa)", "A1")
+	err = genKey("test/cert-ceremonies/root-ceremony-rsa.yaml", rsaRootKeySlot)
+	//err = importSlot("certes/root-cert-rsa.pem", rsaRootKeySlot, "root signing key (rsa)", "A1")
 	cmd.FailOnError(err, "failed to import RSA root key + root cert")
-	// err = genKey("test/cert-ceremonies/root-ceremony-ecdsa.yaml", ecdsaRootKeySlot)
-	err = importSlot("certes/root-cert-ecdsa.pem", ecdsaRootKeySlot, "root signing key (ecdsa)", "B1")
+	err = genKey("test/cert-ceremonies/root-ceremony-ecdsa.yaml", ecdsaRootKeySlot)
+	//err = importSlot("certes/root-cert-ecdsa.pem", ecdsaRootKeySlot, "root signing key (ecdsa)", "B1")
 	cmd.FailOnError(err, "failed to import ECDSA root key + root cert")
 
 	// Create SoftHSM slots for the intermediate signing keys
