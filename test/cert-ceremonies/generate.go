@@ -30,6 +30,12 @@ func createSlot(label string) (string, error) {
 	return string(matches[1]), nil
 }
 
+func importSlot(path string, inSlot string, label string, id string) error {
+	err := exec.Command("softhsm2-util", "--import", path, "--slot", inSlot, "--label", label, "--id", id, "--pin", "1234").CombinedOutput()
+
+	return err
+}
+
 // genKey is used to run a key ceremony with a given config, replacing SlotID in
 // the YAML with a specific slot ID.
 func genKey(path string, inSlot string) error {
@@ -86,11 +92,19 @@ func main() {
 		log.Fatalf("statting %q: %s", outputFile, err)
 	}
 
-	exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp/root-cert-ecdsa.pem").Run()
-	exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp/root-cert-rsa.pem").Run()
+	// Create SoftHSM slots for the root signing keys
+	rsaRootKeySlot, err := createSlot("root signing key (rsa)")
+	cmd.FailOnError(err, "failed creating softhsm2 slot for RSA root key")
+	ecdsaRootKeySlot, err := createSlot("root signing key (ecdsa)")
+	cmd.FailOnError(err, "failed creating softhsm2 slot for root key")
 
-	exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp/root-signing-pub-rsa.pem").Run()
-	exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp/root-signing-pub-ecdsa.pem").Run()
+	// Generate the root signing keys and certificates
+	// err = genKey("test/cert-ceremonies/root-ceremony-rsa.yaml", rsaRootKeySlot)
+	err = importSlot("certes/root-cert-rsa.pem", rsaRootKeySlot, "root signing key (rsa)", "A1")
+	cmd.FailOnError(err, "failed to import RSA root key + root cert")
+	// err = genKey("test/cert-ceremonies/root-ceremony-ecdsa.yaml", ecdsaRootKeySlot)
+	err = importSlot("certes/root-cert-ecdsa.pem", ecdsaRootKeySlot, "root signing key (ecdsa)", "B1")
+	cmd.FailOnError(err, "failed to import ECDSA root key + root cert")
 
 	// Create SoftHSM slots for the intermediate signing keys
 	rsaIntermediateKeySlot, err := createSlot("intermediate signing key (rsa)")
