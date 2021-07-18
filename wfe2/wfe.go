@@ -69,7 +69,7 @@ const (
 	getChallengePath = getAPIPrefix + "chall-v3/"
 	getCertPath      = getAPIPrefix + "cert/"
 
-	getRootCertPath = "certes/root-cert/"
+	getRootCertPath = "/certes/root-cert/"
 )
 
 // WebFrontEndImpl provides all the logic for Boulder's web-facing interface,
