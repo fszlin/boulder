@@ -417,7 +417,7 @@ func (wfe *WebFrontEndImpl) RootCertificate(ctx context.Context, logEvent *web.R
 		return
 	}
 
-	FullPath = "/tmp/" + Filename
+	FullPath := "/tmp/" + Filename
 	fmt.Println("Client requests: " + Filename)
 
 	//Check if file exists and open
