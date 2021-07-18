@@ -6,7 +6,7 @@ pkcs11:
     signing-key-label: root signing key (ecdsa)
 inputs:
     public-key-path: /tmp/intermediate-signing-pub-ecdsa.pem
-    issuer-certificate-path: /tmp/root-cert-ecdsa.pem
+    issuer-certificate-path: certes/root-cert-ecdsa.pem
 outputs:
     certificate-path: {{ .CertPath }}
 certificate-profile:

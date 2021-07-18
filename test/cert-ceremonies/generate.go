@@ -4,10 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"text/template"
+
+	"github.com/letsencrypt/boulder/cmd"
 )
 
 // createSlot initializes a SoftHSM slot and token. SoftHSM chooses the highest empty
@@ -71,16 +74,17 @@ func genCert(path string) error {
 }
 
 func main() {
-
-	exec.Command("cp", "certes/intermediate-cert-ecdsa-a.pem", "/tmp/intermediate-cert-ecdsa-a.pem").Run()
-	exec.Command("cp", "certes/intermediate-cert-ecdsa-b.pem", "/tmp/intermediate-cert-ecdsa-b.pem").Run()
-	exec.Command("cp", "certes/intermediate-cert-rsa-a.pem", "/tmp/intermediate-cert-rsa-a.pem").Run()
-	exec.Command("cp", "certes/intermediate-cert-rsa-b.pem", "/tmp/intermediate-cert-rsa-b.pem").Run()
-
-	exec.Command("cp", "certes/intermediate-ocsp-rsa.b64", "/tmp/intermediate-ocsp-rsa.b64").Run()
-
-	exec.Command("cp", "certes/intermediate-signing-pub-ecdsa.pem", "/tmp/intermediate-signing-pub-ecdsa.pem").Run()
-	exec.Command("cp", "certes/intermediate-signing-pub-rsa.pem", "/tmp/intermediate-signing-pub-rsa.pem").Run()
+	// If one of the output files already exists, assume this ran once
+	// already for the container and don't re-run.
+	outputFile := "/tmp/root-signing-pub-rsa.pem"
+	if loc, err := os.Stat(outputFile); err == nil && loc.Mode().IsRegular() {
+		fmt.Println("skipping certificate generation: already exists")
+		return
+	} else if err == nil && !loc.Mode().IsRegular() {
+		log.Fatalf("statting %q: not a regular file", outputFile)
+	} else if err != nil && !os.IsNotExist(err) {
+		log.Fatalf("statting %q: %s", outputFile, err)
+	}
 
 	exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp/root-cert-ecdsa.pem").Run()
 	exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp/root-cert-rsa.pem").Run()
@@ -88,90 +92,67 @@ func main() {
 	exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp/root-signing-pub-rsa.pem").Run()
 	exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp/root-signing-pub-ecdsa.pem").Run()
 
-	// // If one of the output files already exists, assume this ran once
-	// // already for the container and don't re-run.
-	// outputFile := "/tmp/root-signing-pub-rsa.pem"
-	// if loc, err := os.Stat(outputFile); err == nil && loc.Mode().IsRegular() {
-	// 	fmt.Println("skipping certificate generation: already exists")
-	// 	return
-	// } else if err == nil && !loc.Mode().IsRegular() {
-	// 	log.Fatalf("statting %q: not a regular file", outputFile)
-	// } else if err != nil && !os.IsNotExist(err) {
-	// 	log.Fatalf("statting %q: %s", outputFile, err)
-	// }
-	// // Create SoftHSM slots for the root signing keys
-	// rsaRootKeySlot, err := createSlot("root signing key (rsa)")
-	// cmd.FailOnError(err, "failed creating softhsm2 slot for RSA root key")
-	// ecdsaRootKeySlot, err := createSlot("root signing key (ecdsa)")
-	// cmd.FailOnError(err, "failed creating softhsm2 slot for root key")
+	// Create SoftHSM slots for the intermediate signing keys
+	rsaIntermediateKeySlot, err := createSlot("intermediate signing key (rsa)")
+	cmd.FailOnError(err, "failed to create softhsm2 slot for RSA intermediate key")
+	ecdsaIntermediateKeySlot, err := createSlot("intermediate signing key (ecdsa)")
+	cmd.FailOnError(err, "failed to create softhsm2 slot for ECDSA intermediate key")
 
-	// // Generate the root signing keys and certificates
-	// err = genKey("test/cert-ceremonies/root-ceremony-rsa.yaml", rsaRootKeySlot)
-	// cmd.FailOnError(err, "failed to generate RSA root key + root cert")
-	// err = genKey("test/cert-ceremonies/root-ceremony-ecdsa.yaml", ecdsaRootKeySlot)
-	// cmd.FailOnError(err, "failed to generate ECDSA root key + root cert")
+	// Generate the intermediate signing keys
+	err = genKey("test/cert-ceremonies/intermediate-key-ceremony-rsa.yaml", rsaIntermediateKeySlot)
+	cmd.FailOnError(err, "failed to generate RSA intermediate key")
+	err = genKey("test/cert-ceremonies/intermediate-key-ceremony-ecdsa.yaml", ecdsaIntermediateKeySlot)
+	cmd.FailOnError(err, "failed to generate ECDSA intermediate key")
 
-	// // Create SoftHSM slots for the intermediate signing keys
-	// rsaIntermediateKeySlot, err := createSlot("intermediate signing key (rsa)")
-	// cmd.FailOnError(err, "failed to create softhsm2 slot for RSA intermediate key")
-	// ecdsaIntermediateKeySlot, err := createSlot("intermediate signing key (ecdsa)")
-	// cmd.FailOnError(err, "failed to create softhsm2 slot for ECDSA intermediate key")
+	// Create the A intermediate ceremony config files with the root
+	// signing key slots and IDs
+	rsaTmpIntermediateA, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-rsa.yaml", map[string]string{
+		"SlotID":     rsaRootKeySlot,
+		"CertPath":   "/tmp/intermediate-cert-rsa-a.pem",
+		"CommonName": "CA intermediate (RSA) A",
+	})
+	cmd.FailOnError(err, "failed to rewrite RSA intermediate cert config with key ID")
+	ecdsaTmpIntermediateA, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-ecdsa.yaml", map[string]string{
+		"SlotID":     ecdsaRootKeySlot,
+		"CertPath":   "/tmp/intermediate-cert-ecdsa-a.pem",
+		"CommonName": "CA intermediate (ECDSA) A",
+	})
+	cmd.FailOnError(err, "failed to rewrite ECDSA intermediate cert config with key ID")
 
-	// // Generate the intermediate signing keys
-	// err = genKey("test/cert-ceremonies/intermediate-key-ceremony-rsa.yaml", rsaIntermediateKeySlot)
-	// cmd.FailOnError(err, "failed to generate RSA intermediate key")
-	// err = genKey("test/cert-ceremonies/intermediate-key-ceremony-ecdsa.yaml", ecdsaIntermediateKeySlot)
-	// cmd.FailOnError(err, "failed to generate ECDSA intermediate key")
+	// Create the A intermediate certificates
+	err = genCert(rsaTmpIntermediateA)
+	cmd.FailOnError(err, "failed to generate RSA intermediate cert")
+	err = genCert(ecdsaTmpIntermediateA)
+	cmd.FailOnError(err, "failed to generate ECDSA intermediate cert")
 
-	// // Create the A intermediate ceremony config files with the root
-	// // signing key slots and IDs
-	// rsaTmpIntermediateA, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-rsa.yaml", map[string]string{
-	// 	"SlotID":     rsaRootKeySlot,
-	// 	"CertPath":   "/tmp/intermediate-cert-rsa-a.pem",
-	// 	"CommonName": "CA intermediate (RSA) A",
-	// })
-	// cmd.FailOnError(err, "failed to rewrite RSA intermediate cert config with key ID")
-	// ecdsaTmpIntermediateA, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-ecdsa.yaml", map[string]string{
-	// 	"SlotID":     ecdsaRootKeySlot,
-	// 	"CertPath":   "/tmp/intermediate-cert-ecdsa-a.pem",
-	// 	"CommonName": "CA intermediate (ECDSA) A",
-	// })
-	// cmd.FailOnError(err, "failed to rewrite ECDSA intermediate cert config with key ID")
+	// Create the B intermediate ceremony config files with the root
+	// signing key slots and IDs
+	rsaTmpIntermediateB, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-rsa.yaml", map[string]string{
+		"SlotID":     rsaRootKeySlot,
+		"CertPath":   "/tmp/intermediate-cert-rsa-b.pem",
+		"CommonName": "CA intermediate (RSA) B",
+	})
+	cmd.FailOnError(err, "failed to rewrite RSA intermediate cert config with key ID")
+	ecdsaTmpIntermediateB, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-ecdsa.yaml", map[string]string{
+		"SlotID":     ecdsaRootKeySlot,
+		"CertPath":   "/tmp/intermediate-cert-ecdsa-b.pem",
+		"CommonName": "CA intermediate (ECDSA) B",
+	})
+	cmd.FailOnError(err, "failed to rewrite ECDSA intermediate cert config with key ID")
 
-	// // Create the A intermediate certificates
-	// err = genCert(rsaTmpIntermediateA)
-	// cmd.FailOnError(err, "failed to generate RSA intermediate cert")
-	// err = genCert(ecdsaTmpIntermediateA)
-	// cmd.FailOnError(err, "failed to generate ECDSA intermediate cert")
+	// Create the B intermediate certificates
+	err = genCert(rsaTmpIntermediateB)
+	cmd.FailOnError(err, "failed to generate RSA intermediate cert")
+	err = genCert(ecdsaTmpIntermediateB)
+	cmd.FailOnError(err, "failed to generate ECDSA intermediate cert")
 
-	// // Create the B intermediate ceremony config files with the root
-	// // signing key slots and IDs
-	// rsaTmpIntermediateB, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-rsa.yaml", map[string]string{
-	// 	"SlotID":     rsaRootKeySlot,
-	// 	"CertPath":   "/tmp/intermediate-cert-rsa-b.pem",
-	// 	"CommonName": "CA intermediate (RSA) B",
-	// })
-	// cmd.FailOnError(err, "failed to rewrite RSA intermediate cert config with key ID")
-	// ecdsaTmpIntermediateB, err := rewriteConfig("test/cert-ceremonies/intermediate-ceremony-ecdsa.yaml", map[string]string{
-	// 	"SlotID":     ecdsaRootKeySlot,
-	// 	"CertPath":   "/tmp/intermediate-cert-ecdsa-b.pem",
-	// 	"CommonName": "CA intermediate (ECDSA) B",
-	// })
-	// cmd.FailOnError(err, "failed to rewrite ECDSA intermediate cert config with key ID")
-
-	// // Create the B intermediate certificates
-	// err = genCert(rsaTmpIntermediateB)
-	// cmd.FailOnError(err, "failed to generate RSA intermediate cert")
-	// err = genCert(ecdsaTmpIntermediateB)
-	// cmd.FailOnError(err, "failed to generate ECDSA intermediate cert")
-
-	// // Rewrite OCSP configs and generate OCSP responses for the A intermediates
-	// rsaTmpOCSPConfig, err := rewriteConfig("test/cert-ceremonies/intermediate-ocsp-rsa.yaml", map[string]string{
-	// 	"SlotID": rsaRootKeySlot,
-	// })
-	// cmd.FailOnError(err, "failed to rewrite RSA intermediate OCSP config with key ID")
-	// err = genCert(rsaTmpOCSPConfig)
-	// cmd.FailOnError(err, "failed to generate RSA intermediate OCSP response")
-	// // We do not generate OCSP for the ECDSA intermediates, as our new issuers
-	// // only use CRLs, not OCSP.
+	// Rewrite OCSP configs and generate OCSP responses for the A intermediates
+	rsaTmpOCSPConfig, err := rewriteConfig("test/cert-ceremonies/intermediate-ocsp-rsa.yaml", map[string]string{
+		"SlotID": rsaRootKeySlot,
+	})
+	cmd.FailOnError(err, "failed to rewrite RSA intermediate OCSP config with key ID")
+	err = genCert(rsaTmpOCSPConfig)
+	cmd.FailOnError(err, "failed to generate RSA intermediate OCSP response")
+	// We do not generate OCSP for the ECDSA intermediates, as our new issuers
+	// only use CRLs, not OCSP.
 }
