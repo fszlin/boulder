@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"io"
 	"os"
 
 	"github.com/honeycombio/beeline-go"
