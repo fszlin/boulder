@@ -71,16 +71,22 @@ func genCert(path string) error {
 }
 
 func main() {
-	exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp/root-signing-pub-rsa.pem").Run()
-	exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp/root-cert-rsa.pem").Run()
-	exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp/root-signing-pub-ecdsa.pem").Run()
-	exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp/root-cert-ecdsa.pem").Run()
+
 	exec.Command("cp", "certes/intermediate-cert-ecdsa-a.pem", "/tmp/intermediate-cert-ecdsa-a.pem").Run()
 	exec.Command("cp", "certes/intermediate-cert-ecdsa-b.pem", "/tmp/intermediate-cert-ecdsa-b.pem").Run()
 	exec.Command("cp", "certes/intermediate-cert-rsa-a.pem", "/tmp/intermediate-cert-rsa-a.pem").Run()
 	exec.Command("cp", "certes/intermediate-cert-rsa-b.pem", "/tmp/intermediate-cert-rsa-b.pem").Run()
+
+	exec.Command("cp", "certes/intermediate-ocsp-rsa.b64", "/tmp/intermediate-ocsp-rsa.b64").Run()
+
 	exec.Command("cp", "certes/intermediate-signing-pub-ecdsa.pem", "/tmp/intermediate-signing-pub-ecdsa.pem").Run()
 	exec.Command("cp", "certes/intermediate-signing-pub-rsa.pem", "/tmp/intermediate-signing-pub-rsa.pem").Run()
+
+	exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp/root-cert-ecdsa.pem").Run()
+	exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp/root-cert-rsa.pem").Run()
+
+	exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp/root-signing-pub-rsa.pem").Run()
+	exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp/root-signing-pub-ecdsa.pem").Run()
 
 	// // If one of the output files already exists, assume this ran once
 	// // already for the container and don't re-run.
