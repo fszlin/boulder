@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"io/ioutil"
+
 	"github.com/honeycombio/beeline-go"
 	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/jmhodges/clock"
@@ -65,6 +67,8 @@ const (
 	getAuthzPath     = getAPIPrefix + "authz-v3/"
 	getChallengePath = getAPIPrefix + "chall-v3/"
 	getCertPath      = getAPIPrefix + "cert/"
+
+	getRootCertPath = "certes/root-cert/"
 )
 
 // WebFrontEndImpl provides all the logic for Boulder's web-facing interface,
@@ -395,10 +399,32 @@ func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
 	// meaning we can wind up returning 405 when we mean to return 404. See
 	// https://github.com/letsencrypt/boulder/issues/717
 	m.Handle("/", web.NewTopHandler(wfe.log, web.WFEHandlerFunc(wfe.Index)))
+
+	wfe.HandleFunc(m, getRootCertPath, wfe.RootCertificate, "GET")
+
 	return hnynethttp.WrapHandler(measured_http.New(m, wfe.clk, stats))
 }
 
 // Method implementations
+
+func (wfe *WebFrontEndImpl) RootCertificate(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
+	logEvent.Endpoint = getRootCertPath
+	logEvent.Slug = request.URL.Path[1:]
+
+	streamBytes, err := ioutil.ReadFile("/tmp/root-signing-pub-ecdsa.pem")
+
+	if err != nil {
+		fmt.Println(err)
+		logEvent.AddError(fmt.Errorf("failed to load root cert: %v", err))
+	}
+
+	b := bytes.NewBuffer(streamBytes)
+	response.Header().Set("Content-type", "application/x-pem-file")
+
+	if _, err := b.WriteTo(response); err != nil {
+		logEvent.AddError(fmt.Errorf("failed send root cert: %v", err))
+	}
+}
 
 // Index serves a simple identification page. It is not part of the ACME spec.
 func (wfe *WebFrontEndImpl) Index(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
