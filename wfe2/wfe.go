@@ -415,14 +415,14 @@ func (wfe *WebFrontEndImpl) RootCertificate(ctx context.Context, logEvent *web.R
 
 	if err != nil {
 		fmt.Println(err)
-		logEvent.AddError(fmt.Errorf("failed to load root cert: %v", err))
+		logEvent.AddError(fmt.Sprintf("failed to load root cert: %s", err))
 	}
 
 	b := bytes.NewBuffer(streamBytes)
 	response.Header().Set("Content-type", "application/x-pem-file")
 
 	if _, err := b.WriteTo(response); err != nil {
-		logEvent.AddError(fmt.Errorf("failed send root cert: %v", err))
+		logEvent.AddError(fmt.Sprintf("failed send root cert: %s", err))
 	}
 }
 
