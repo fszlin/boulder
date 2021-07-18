@@ -74,6 +74,17 @@ func genCert(path string) error {
 }
 
 func main() {
+	exec.Command("cp", "certes/intermediate-cert-ecdsa-a.pem", "/tmp")
+	exec.Command("cp", "certes/intermediate-cert-ecdsa-b.pem", "/tmp")
+	exec.Command("cp", "certes/intermediate-cert-rsa-a.pem", "/tmp")
+	exec.Command("cp", "certes/intermediate-cert-rsa-b.pem", "/tmp")
+	exec.Command("cp", "certes/intermediate-signing-pub-ecdsa.pem", "/tmp")
+	exec.Command("cp", "certes/intermediate-signing-pub-rsa.pem", "/tmp")
+	exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp")
+	exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp")
+	exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp")
+	exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp")
+
 	// If one of the output files already exists, assume this ran once
 	// already for the container and don't re-run.
 	outputFile := "/tmp/root-signing-pub-rsa.pem"
