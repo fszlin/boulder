@@ -93,10 +93,12 @@ func main() {
 
 	// Generate the root signing keys and certificates
 	//err = genKey("test/cert-ceremonies/root-ceremony-rsa.yaml", rsaRootKeySlot)
+	rewriteConfig("test/cert-ceremonies/root-ceremony-rsa.yaml", map[string]string{"SlotID": rsaRootKeySlot})
 	err = exec.Command("cp", "certes/root-signing-pub-rsa.pem", "/tmp/root-signing-pub-rsa.pem").Run()
 	err = exec.Command("cp", "certes/root-cert-rsa.pem", "/tmp/root-cert-rsa.pem").Run()
 	cmd.FailOnError(err, "failed to generate RSA root key + root cert")
 	//err = genKey("test/cert-ceremonies/root-ceremony-ecdsa.yaml", ecdsaRootKeySlot)
+	rewriteConfig("test/cert-ceremonies/root-ceremony-ecdsa.yaml", map[string]string{"SlotID": ecdsaRootKeySlot})
 	err = exec.Command("cp", "certes/root-signing-pub-ecdsa.pem", "/tmp/root-signing-pub-ecdsa.pem").Run()
 	err = exec.Command("cp", "certes/root-cert-ecdsa.pem", "/tmp/root-cert-ecdsa.pem").Run()
 	cmd.FailOnError(err, "failed to generate ECDSA root key + root cert")
