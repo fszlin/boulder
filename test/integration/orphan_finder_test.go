@@ -100,7 +100,7 @@ func makeFakeCert(precert bool) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	issuer, err := issuance.LoadCertificate("/tmp/intermediate-cert-rsa-a.pem")
+	issuer, err := issuance.LoadCertificate("certes/intermediate-cert-rsa-a.pem")
 	if err != nil {
 		return nil, err
 	}

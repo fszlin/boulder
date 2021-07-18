@@ -4,7 +4,9 @@
     "TLSListenAddress": "0.0.0.0:4431",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "allowOrigins": ["*"],
+    "allowOrigins": [
+      "*"
+    ],
     "shutdownStopTimeout": "10s",
     "subscriberAgreementURL": "https://boulder:4431/terms/v7",
     "debugAddr": ":8013",
@@ -41,20 +43,20 @@
     },
     "chains": [
       [
-        "/tmp/intermediate-cert-rsa-a.pem",
-        "/tmp/root-cert-rsa.pem"
+        "certes/intermediate-cert-rsa-a.pem",
+        "certes/root-cert-rsa.pem"
       ],
       [
-        "/tmp/intermediate-cert-rsa-b.pem",
-        "/tmp/root-cert-rsa.pem"
+        "certes/intermediate-cert-rsa-b.pem",
+        "certes/root-cert-rsa.pem"
       ],
       [
-        "/tmp/intermediate-cert-ecdsa-a.pem",
-        "/tmp/root-cert-ecdsa.pem"
+        "certes/intermediate-cert-ecdsa-a.pem",
+        "certes/root-cert-ecdsa.pem"
       ],
       [
-        "/tmp/intermediate-cert-ecdsa-b.pem",
-        "/tmp/root-cert-ecdsa.pem"
+        "certes/intermediate-cert-ecdsa-b.pem",
+        "certes/root-cert-ecdsa.pem"
       ]
     ],
     "staleTimeout": "5m",
@@ -65,13 +67,12 @@
       "PrecertificateRevocation": true
     }
   },
-
   "syslog": {
     "stdoutlevel": 4,
     "sysloglevel": 6
   },
   "beeline": {
-      "mute": true,
-      "dataset": "Test"
+    "mute": true,
+    "dataset": "Test"
   }
 }

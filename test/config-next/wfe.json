@@ -4,7 +4,9 @@
     "TLSListenAddress": "0.0.0.0:4430",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "allowOrigins": ["*"],
+    "allowOrigins": [
+      "*"
+    ],
     "shutdownStopTimeout": "10s",
     "subscriberAgreementURL": "http://boulder:4000/terms/v1",
     "debugAddr": ":8000",
@@ -38,20 +40,17 @@
         "timeout": "15s"
       }
     },
-    "features": {
-    }
+    "features": {}
   },
-
   "syslog": {
     "stdoutlevel": 4,
     "sysloglevel": 6
   },
   "beeline": {
-      "mute": true,
-      "dataset": "Test"
+    "mute": true,
+    "dataset": "Test"
   },
-
   "common": {
-    "issuerCert": "/tmp/intermediate-cert-rsa-a.pem"
+    "issuerCert": "certes/intermediate-cert-rsa-a.pem"
   }
 }

@@ -7,23 +7,24 @@
     "path": "/",
     "listenAddress": "0.0.0.0:4002",
     "issuerCerts": [
-      "/tmp/intermediate-cert-rsa-a.pem",
-      "/tmp/intermediate-cert-rsa-b.pem",
-      "/tmp/intermediate-cert-ecdsa-a.pem"
+      "certes/intermediate-cert-rsa-a.pem",
+      "certes/intermediate-cert-rsa-b.pem",
+      "certes/intermediate-cert-ecdsa-a.pem"
     ],
     "maxAge": "10s",
     "timeout": "4.9s",
     "shutdownStopTimeout": "10s",
     "debugAddr": ":8005",
-    "requiredSerialPrefixes": ["ff"]
+    "requiredSerialPrefixes": [
+      "ff"
+    ]
   },
-
   "syslog": {
-   "stdoutlevel": 6,
-   "sysloglevel": 6
- },
+    "stdoutlevel": 6,
+    "sysloglevel": 6
+  },
   "beeline": {
-      "mute": true,
-      "dataset": "Test"
+    "mute": true,
+    "dataset": "Test"
   }
 }

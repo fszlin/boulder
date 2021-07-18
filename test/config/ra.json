@@ -11,7 +11,7 @@
     "weakKeyFile": "test/example-weak-keys.json",
     "blockedKeyFile": "test/example-blocked-keys.yaml",
     "orderLifetime": "168h",
-    "issuerCertPath":  "/tmp/intermediate-cert-rsa-a.pem",
+    "issuerCertPath": "certes/intermediate-cert-rsa-a.pem",
     "tls": {
       "caCertFile": "test/grpc-creds/minica.pem",
       "certFile": "test/grpc-creds/ra.boulder/cert.pem",
@@ -110,7 +110,6 @@
       }
     ]
   },
-
   "pa": {
     "challenges": {
       "http-01": true,
@@ -118,13 +117,12 @@
       "tls-alpn-01": true
     }
   },
-
   "syslog": {
     "stdoutlevel": 6,
     "sysloglevel": 6
   },
   "beeline": {
-      "mute": true,
-      "dataset": "Test"
+    "mute": true,
+    "dataset": "Test"
   }
 }
