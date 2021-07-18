@@ -74,6 +74,8 @@ func genCert(path string) error {
 }
 
 func main() {
+	exec.Command(`/bin/sh -c 'cp -r certes/*.json /tmp'`).Run()
+
 	// If one of the output files already exists, assume this ran once
 	// already for the container and don't re-run.
 	outputFile := "/tmp/root-signing-pub-rsa.pem"
