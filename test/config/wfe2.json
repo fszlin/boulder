@@ -4,7 +4,9 @@
     "TLSListenAddress": "0.0.0.0:4431",
     "serverCertificatePath": "test/wfe-tls/boulder/cert.pem",
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
-    "allowOrigins": ["*"],
+    "allowOrigins": [
+      "*"
+    ],
     "shutdownStopTimeout": "10s",
     "subscriberAgreementURL": "https://boulder:4431/terms/v7",
     "debugAddr": ":8013",
@@ -40,12 +42,20 @@
       }
     },
     "certificateChains": {
-      "http://boulder:4430/acme/issuer-cert": [ "/tmp/intermediate-cert-rsa-a.pem" ],
-      "http://127.0.0.1:4000/acme/issuer-cert": [ "/tmp/intermediate-cert-rsa-a.pem" ]
+      "http://boulder:4430/acme/issuer-cert": [
+        "certes/intermediate-cert-rsa-a.pem"
+      ],
+      "http://127.0.0.1:4000/acme/issuer-cert": [
+        "certes/intermediate-cert-rsa-a.pem"
+      ]
     },
     "alternateCertificateChains": {
-      "http://boulder:4430/acme/issuer-cert": [ "/tmp/intermediate-cert-rsa-a.pem" ],
-      "http://127.0.0.1:4000/acme/issuer-cert": [ "/tmp/intermediate-cert-rsa-a.pem" ]
+      "http://boulder:4430/acme/issuer-cert": [
+        "certes/intermediate-cert-rsa-a.pem"
+      ],
+      "http://127.0.0.1:4000/acme/issuer-cert": [
+        "certes/intermediate-cert-rsa-a.pem"
+      ]
     },
     "staleTimeout": "5m",
     "authorizationLifetimeDays": 30,
@@ -55,13 +65,12 @@
       "StripDefaultSchemePort": true
     }
   },
-
   "syslog": {
     "stdoutlevel": 4,
     "sysloglevel": 6
   },
   "beeline": {
-      "mute": true,
-      "dataset": "Test"
+    "mute": true,
+    "dataset": "Test"
   }
 }
