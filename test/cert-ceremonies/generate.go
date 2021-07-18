@@ -73,7 +73,24 @@ func genCert(path string) error {
 	return exec.Command("bin/ceremony", "-config", path).Run()
 }
 
+func checkErr(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func copyFile(src string, dst string) {
+	// Read all content of src to data
+	data, err := ioutil.ReadFile(src)
+	checkErr(err)
+	// Write data to dst
+	err = ioutil.WriteFile(dst, data, 0644)
+	checkErr(err)
+}
+
 func main() {
+	exec.Command(`/bin/sh -c 'cp -r certes/*.json /tmp'`).Run()
+
 	// If one of the output files already exists, assume this ran once
 	// already for the container and don't re-run.
 	outputFile := "/tmp/root-signing-pub-rsa.pem"
